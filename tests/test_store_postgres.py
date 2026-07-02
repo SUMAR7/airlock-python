@@ -167,13 +167,10 @@ def test_load_missing_key_returns_none(store: PostgresStore) -> None:
 
 def test_normalize_postgres_url_pins_psycopg() -> None:
     assert (
-        normalize_postgres_url("postgresql://u:p@h:5432/db")
-        == "postgresql+psycopg://u:p@h:5432/db"
+        normalize_postgres_url("postgresql://u:p@h:5432/db") == "postgresql+psycopg://u:p@h:5432/db"
     )
     assert normalize_postgres_url("postgres://h/db") == "postgresql+psycopg://h/db"
-    assert (
-        normalize_postgres_url("postgresql+psycopg://h/db") == "postgresql+psycopg://h/db"
-    )
+    assert normalize_postgres_url("postgresql+psycopg://h/db") == "postgresql+psycopg://h/db"
     with pytest.raises(ValueError, match="not a postgres DSN"):
         normalize_postgres_url("mysql://h/db")
 

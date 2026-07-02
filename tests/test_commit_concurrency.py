@@ -52,8 +52,7 @@ def _scenario2_worker(
             with effects_engine.connect() as conn:
                 conn.execute(
                     text(
-                        "INSERT INTO effects_log (idempotency_key, worker_pid)"
-                        " VALUES (:key, :pid)"
+                        "INSERT INTO effects_log (idempotency_key, worker_pid) VALUES (:key, :pid)"
                     ),
                     {"key": KEY, "pid": os.getpid()},
                 )
@@ -74,9 +73,7 @@ def _scenario2_worker(
             wait_timeout=DEADLINE,
             poll_interval=0.02,
         )
-        results.put(
-            {"pid": os.getpid(), "state": outcome.state.value, "result": outcome.result}
-        )
+        results.put({"pid": os.getpid(), "state": outcome.state.value, "result": outcome.result})
     except Exception as exc:
         results.put({"pid": os.getpid(), "error": repr(exc)})
     finally:
@@ -144,12 +141,16 @@ def test_scenario_2_eight_processes_one_effect(
     # Exactly one side effect, exactly one ledger row, epoch untouched.
     assert effects.count(KEY) == 1
     with db.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT idempotency_key, state, attempts, result_json, committed_at"
-                " FROM commit_records"
+        rows = (
+            conn.execute(
+                text(
+                    "SELECT idempotency_key, state, attempts, result_json, committed_at"
+                    " FROM commit_records"
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
     assert len(rows) == 1
     row = rows[0]
     assert row["idempotency_key"] == KEY

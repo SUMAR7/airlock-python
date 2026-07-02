@@ -52,10 +52,7 @@ def test_guarantee_check_matches_guarantee_enum(db: Engine) -> None:
 def test_inflight_partial_index_matches_in_flight_states(db: Engine) -> None:
     with db.connect() as conn:
         indexdef = conn.execute(
-            text(
-                "SELECT indexdef FROM pg_indexes"
-                " WHERE indexname = 'commit_records_inflight_idx'"
-            )
+            text("SELECT indexdef FROM pg_indexes WHERE indexname = 'commit_records_inflight_idx'")
         ).scalar_one_or_none()
     assert indexdef is not None, "in-flight partial index is missing"
     assert _quoted_values(str(indexdef)) == [state.value for state in IN_FLIGHT_LEDGER_STATES]

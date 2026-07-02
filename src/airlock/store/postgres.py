@@ -150,17 +150,21 @@ class PostgresStore:
         downstream_key: str | None,
     ) -> Claim:
         with self._engine.begin() as conn:
-            inserted = conn.execute(
-                _CLAIM_SQL,
-                {
-                    "key": key,
-                    "action_type": action_type,
-                    "guarantee": guarantee.value,
-                    "args_json": json.dumps(dict(args_json)),
-                    "downstream_key": downstream_key,
-                    "now": self._now_fn(),
-                },
-            ).mappings().first()
+            inserted = (
+                conn.execute(
+                    _CLAIM_SQL,
+                    {
+                        "key": key,
+                        "action_type": action_type,
+                        "guarantee": guarantee.value,
+                        "args_json": json.dumps(dict(args_json)),
+                        "downstream_key": downstream_key,
+                        "now": self._now_fn(),
+                    },
+                )
+                .mappings()
+                .first()
+            )
             if inserted is not None:
                 return Claim(won=True, record=_row_to_record(inserted))
             # ON CONFLICT DO NOTHING waited out any in-flight competing insert,
@@ -225,7 +229,9 @@ class PostgresStore:
         return None if row is None else _row_to_record(row)
 
 
-def _row_to_record(row: Mapping[str, Any]) -> CommitRecord:
+def _row_to_record(row: Mapping[Any, Any]) -> CommitRecord:
+    # Accepts sqlalchemy's RowMapping (keyed by str | SQL expression) — we only
+    # ever index by column-name strings.
     return CommitRecord(
         id=row["id"],
         idempotency_key=row["idempotency_key"],

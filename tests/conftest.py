@@ -100,10 +100,7 @@ def bump_epoch(engine: Engine, key: str) -> None:
     """Simulate an external takeover: bump the ownership epoch (attempts)."""
     with engine.begin() as conn:
         rowcount = conn.execute(
-            text(
-                "UPDATE commit_records SET attempts = attempts + 1"
-                " WHERE idempotency_key = :key"
-            ),
+            text("UPDATE commit_records SET attempts = attempts + 1 WHERE idempotency_key = :key"),
             {"key": key},
         ).rowcount
     assert rowcount == 1, f"no row to bump for {key!r}"

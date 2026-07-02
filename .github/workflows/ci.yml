@@ -9,6 +9,41 @@ permissions:
   contents: read
 
 jobs:
+  # PLAN.md section 3.1: "a CI test imports `airlock` with extras uninstalled
+  # to enforce the import-light core". This job is the environment where a
+  # stray module-level sqlalchemy/httpx import in ANY base module fails hard —
+  # the postgres job below can never catch that, because extras are installed
+  # there.
+  core-import-light:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync dependencies (dev group, NO extras)
+        run: uv sync --locked
+
+      - name: Assert extras are really absent
+        run: |
+          if uv run python -c "import sqlalchemy" 2>/dev/null; then
+            echo "sqlalchemy is installed — this job must run without extras"; exit 1
+          fi
+          if uv run python -c "import httpx" 2>/dev/null; then
+            echo "httpx is installed — this job must run without extras"; exit 1
+          fi
+
+      - name: Import-light guard + package-surface tests (core deps only)
+        run: uv run pytest tests/test_scaffold.py
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -42,8 +77,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Sync dependencies (dev group, no extras)
-        run: uv sync --locked
+      # The postgres extra is installed so the ledger suite runs against the
+      # postgres:16 service; the extras-UNINSTALLED enforcement of the
+      # import-light core lives in the core-import-light job above.
+      - name: Sync dependencies (dev group + postgres extra)
+        run: uv sync --locked --extra postgres
 
       - name: Lint
         run: uv run ruff check .
@@ -56,3 +94,13 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+      # P1.1 DoD: scenarios 1-2 deterministic under REPEATED runs — a race
+      # that fails ~1-in-10 runs must not survive single-run CI until P1.4's
+      # 20-consecutive-runs gate lands.
+      - name: Concurrency suite x10
+        run: |
+          for i in $(seq 1 10); do
+            echo "--- concurrency run $i/10"
+            uv run pytest -m concurrency || exit 1
+          done

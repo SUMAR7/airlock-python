@@ -89,7 +89,9 @@ def commit_once(
             epoch-fenced mid-flight and the takeover's resolution did not
             land in time.
         Exception: whatever ``execute`` raised, after ``error_json`` is
-            recorded; the row stays ``executing`` for the reconciler.
+            recorded; the row stays ``executing`` for the reconciler. If the
+            evidence write itself fails, the original exception still
+            propagates, with the secondary failure attached as a note.
     """
     if wait_timeout <= 0:
         raise ValueError(f"wait_timeout must be > 0, got {wait_timeout!r}")
@@ -133,7 +135,18 @@ def commit_once(
         # 'executing' with the error recorded; the P1.3 reconciler resolves
         # it by verification. A fenced record_error is fine to ignore — the
         # takeover already owns the evidence trail.
-        store.record_error(key, epoch, {"type": type(exc).__name__, "message": str(exc)})
+        try:
+            store.record_error(key, epoch, {"type": type(exc).__name__, "message": str(exc)})
+        except Exception as record_exc:
+            # The evidence write itself failed (e.g. the ledger connection
+            # dropped at exactly the wrong moment). The caller must still see
+            # what the TOOL did — an infrastructure error from Airlock would
+            # be the wrong signal — so attach the secondary failure as a note
+            # and re-raise the original execute exception.
+            exc.add_note(
+                f"airlock: recording error_json on the ledger row failed ({record_exc!r}); "
+                "the row stays 'executing' for the reconciler (P1.3)"
+            )
         raise
 
     # Step 6 — finalize committed (audit append joins this transaction in P2.2).

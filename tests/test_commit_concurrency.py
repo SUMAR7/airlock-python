@@ -3,26 +3,33 @@
 Eight multiprocessing *spawn* workers, each with its own DB connections,
 released simultaneously by a Barrier against ONE idempotency key. The
 winner's effect is gated on a multiprocessing.Event so the losers provably
-arrive while the row is in flight. Exactly one side effect (ground truth:
+arrive while the row is in flight: every worker reports its claim outcome the
+instant the claim resolves, and the parent releases the winner only after all
+eight claim reports are in — so the seven losers deterministically lost to a
+NON-terminal (in-flight) row, exercising scenario 2's wait path rather than
+scenario 1's terminal-duplicate path. Exactly one side effect (ground truth:
 ``effects_log`` written on a separate autocommit connection); all eight calls
 return the identical committed result.
 
-Synchronization is Barrier/Event/direct DB assertions only — no time.sleep.
+Synchronization is Barrier/Event/Queue/direct DB assertions only — no
+time.sleep.
 """
 
 from __future__ import annotations
 
 import multiprocessing
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from pydantic import JsonValue
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from airlock.commit import commit_once
 from airlock.store.postgres import PostgresStore, normalize_postgres_url
-from airlock.types import Guarantee, LedgerState
+from airlock.types import IN_FLIGHT_LEDGER_STATES, Claim, Guarantee, LedgerState
 from tests.conftest import EffectsLog
 
 if TYPE_CHECKING:
@@ -34,15 +41,41 @@ KEY = "scenario-2-one-key"
 DEADLINE = 60.0  # hard deadline for every wait; a healthy run takes well under a second
 
 
+class _ClaimReportingStore(PostgresStore):
+    """PostgresStore that reports each claim outcome the instant it resolves.
+
+    The parent holds the winner gated until all eight reports are in, which
+    pins that every loser lost its claim against an IN-FLIGHT row — the
+    contention scenario 2 exists to prove, not sequential duplicate handling.
+    """
+
+    def __init__(self, dsn: str, reports: Queue[dict[str, Any]]) -> None:
+        super().__init__(dsn)
+        self._reports = reports
+
+    def claim(
+        self,
+        key: str,
+        action_type: str,
+        guarantee: Guarantee,
+        args_json: Mapping[str, JsonValue],
+        downstream_key: str | None,
+    ) -> Claim:
+        claim = super().claim(key, action_type, guarantee, args_json, downstream_key)
+        self._reports.put({"pid": os.getpid(), "won": claim.won, "state": claim.record.state.value})
+        return claim
+
+
 def _scenario2_worker(
     dsn: str,
     barrier: Barrier,
     winner_inside: Event,
     release: Event,
+    claim_reports: Queue[dict[str, Any]],
     results: Queue[dict[str, Any]],
 ) -> None:
     """One competing client process. Runs in a spawn child."""
-    store = PostgresStore(dsn)
+    store = _ClaimReportingStore(dsn, claim_reports)
     effects_engine = create_engine(normalize_postgres_url(dsn), isolation_level="AUTOCOMMIT")
     try:
 
@@ -57,8 +90,9 @@ def _scenario2_worker(
                     {"key": KEY, "pid": os.getpid()},
                 )
             winner_inside.set()
-            # Gate: hold the winner mid-effect so the losers demonstrably
-            # observe an in-flight row. Timeout is a failsafe, not timing.
+            # Gate: hold the winner mid-effect until the parent has collected
+            # every claim report and finished its mid-flight assertions.
+            # Timeout is a failsafe, not timing.
             release.wait(timeout=DEADLINE)
             return {"winner_pid": os.getpid()}
 
@@ -89,22 +123,36 @@ def test_scenario_2_eight_processes_one_effect(
     barrier = ctx.Barrier(WORKERS)
     winner_inside = ctx.Event()
     release = ctx.Event()
+    claim_reports_queue: Queue[dict[str, Any]] = ctx.Queue()
     results_queue: Queue[dict[str, Any]] = ctx.Queue()
 
     processes = [
         ctx.Process(
             target=_scenario2_worker,
-            args=(database_url, barrier, winner_inside, release, results_queue),
+            args=(
+                database_url,
+                barrier,
+                winner_inside,
+                release,
+                claim_reports_queue,
+                results_queue,
+            ),
             daemon=True,
         )
         for _ in range(WORKERS)
     ]
     results: list[dict[str, Any]] = []
+    claim_reports: list[dict[str, Any]] = []
     try:
         for process in processes:
             process.start()
 
         assert winner_inside.wait(timeout=DEADLINE), "no worker ever reached its effect"
+
+        # Every claim resolves while the winner is still gated — collecting
+        # all 8 reports BEFORE release makes the losers-lost-to-in-flight
+        # assertion below deterministic.
+        claim_reports = [claim_reports_queue.get(timeout=DEADLINE) for _ in range(WORKERS)]
 
         # Mid-flight, while the winner is gated: the executing marker and the
         # single effect are already durable and visible to a fresh connection.
@@ -137,6 +185,17 @@ def test_scenario_2_eight_processes_one_effect(
     assert all(entry["result"] == first_result for entry in results)
     worker_pids = {entry["pid"] for entry in results}
     assert first_result["winner_pid"] in worker_pids
+
+    # Exactly one worker won the claim; the seven losers all lost against an
+    # IN-FLIGHT row ('pending' or 'executing'), never a terminal one — they
+    # exercised the scenario-2 wait path, not scenario-1 duplicate handling.
+    winners = [entry for entry in claim_reports if entry["won"]]
+    losers = [entry for entry in claim_reports if not entry["won"]]
+    assert len(winners) == 1, f"claim reports: {claim_reports}"
+    assert winners[0]["pid"] == first_result["winner_pid"]
+    assert len(losers) == WORKERS - 1
+    in_flight = {state.value for state in IN_FLIGHT_LEDGER_STATES}
+    assert all(entry["state"] in in_flight for entry in losers), f"claim reports: {claim_reports}"
 
     # Exactly one side effect, exactly one ledger row, epoch untouched.
     assert effects.count(KEY) == 1

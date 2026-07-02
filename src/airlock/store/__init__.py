@@ -77,9 +77,17 @@ class Store(Protocol):
     ) -> bool:
         """CAS to a terminal state ``WHERE attempts = epoch``, ONE transaction.
 
-        Allowed transitions: ``executing -> committed`` (sets ``committed_at``)
-        and ``pending|executing -> aborted|failed|unknown``. Returns ``False``
-        when fenced — the reconciler owns resolution; never override.
+        Allowed transitions (PLAN.md 3.2 semantics — the state machine makes
+        false claims unrepresentable, PLAN.md section 10 point 1):
+
+        - ``executing -> committed`` (sets ``committed_at``)
+        - ``pending|executing -> aborted``
+        - ``executing -> failed|unknown`` — both are statements about an
+          executed effect, so they are refused from ``pending``, which
+          provably never started its effect.
+
+        Returns ``False`` when fenced — the reconciler owns resolution; never
+        override.
 
         ``audit`` is a documented no-op seam in P1.1: the parameter is
         accepted but nothing is persisted. P2.2 adds the hash-chained audit

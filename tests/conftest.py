@@ -7,19 +7,26 @@ Schema is created once per session; ``commit_records`` and the test-only
 Side-effect ground truth (PLAN.md section 7): ``effects_log`` rows written on
 a SEPARATE autocommit connection — an effect is counted the instant it
 happens, independent of any ledger transaction.
+
+Import discipline: sqlalchemy (the ``postgres`` extra) is imported lazily
+inside fixtures/helpers, never at module level — the core CI job runs the
+scaffold tests with extras UNINSTALLED (PLAN.md section 3.1) and this conftest
+must still be collectable there.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
 
-from airlock.store._schema import ensure_schema
-from airlock.store.postgres import PostgresStore, normalize_postgres_url
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from sqlalchemy.engine import Engine
+
+    from airlock.store.postgres import PostgresStore
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/airlock_test")
 
@@ -41,6 +48,11 @@ def database_url() -> str:
 @pytest.fixture(scope="session")
 def schema_engine(database_url: str) -> Iterator[Engine]:
     """Session-wide engine; creates the ledger schema plus effects_log once."""
+    from sqlalchemy import create_engine, text
+
+    from airlock.store._schema import ensure_schema
+    from airlock.store.postgres import normalize_postgres_url
+
     engine = create_engine(normalize_postgres_url(database_url))
     ensure_schema(engine)
     with engine.begin() as conn:
@@ -52,6 +64,8 @@ def schema_engine(database_url: str) -> Iterator[Engine]:
 @pytest.fixture
 def db(schema_engine: Engine) -> Engine:
     """Truncates ledger + effects tables before each test; returns the engine."""
+    from sqlalchemy import text
+
     with schema_engine.begin() as conn:
         conn.execute(text("TRUNCATE commit_records, effects_log RESTART IDENTITY"))
     return schema_engine
@@ -59,6 +73,8 @@ def db(schema_engine: Engine) -> Engine:
 
 @pytest.fixture
 def store(db: Engine, database_url: str) -> Iterator[PostgresStore]:
+    from airlock.store.postgres import PostgresStore
+
     pg_store = PostgresStore(database_url)
     yield pg_store
     pg_store.close()
@@ -71,6 +87,8 @@ class EffectsLog:
         self._engine = engine
 
     def log(self, key: str) -> None:
+        from sqlalchemy import text
+
         with self._engine.connect() as conn:
             conn.execute(
                 text(
@@ -81,6 +99,8 @@ class EffectsLog:
             )
 
     def count(self, key: str) -> int:
+        from sqlalchemy import text
+
         with self._engine.connect() as conn:
             found = conn.execute(
                 text("SELECT count(*) FROM effects_log WHERE idempotency_key = :key"),
@@ -91,6 +111,10 @@ class EffectsLog:
 
 @pytest.fixture
 def effects(db: Engine, database_url: str) -> Iterator[EffectsLog]:
+    from sqlalchemy import create_engine
+
+    from airlock.store.postgres import normalize_postgres_url
+
     engine = create_engine(normalize_postgres_url(database_url), isolation_level="AUTOCOMMIT")
     yield EffectsLog(engine)
     engine.dispose()
@@ -98,6 +122,8 @@ def effects(db: Engine, database_url: str) -> Iterator[EffectsLog]:
 
 def bump_epoch(engine: Engine, key: str) -> None:
     """Simulate an external takeover: bump the ownership epoch (attempts)."""
+    from sqlalchemy import text
+
     with engine.begin() as conn:
         rowcount = conn.execute(
             text("UPDATE commit_records SET attempts = attempts + 1 WHERE idempotency_key = :key"),

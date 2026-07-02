@@ -135,6 +135,44 @@ def test_execute_raise_leaves_durable_executing_row(
     assert row.committed_at is None
 
 
+def test_execute_exception_survives_failed_evidence_write(database_url: str, db: Engine) -> None:
+    """If the evidence write itself raises (ledger connection drops at exactly
+    the moment the tool blew up), the TOOL's original exception must still
+    propagate — an infrastructure error from Airlock would be the wrong signal
+    for the caller — and the row stays 'executing' for the reconciler."""
+
+    class EvidenceWriteBoom(PostgresStore):
+        def record_error(self, key: str, epoch: int, error_json: JsonValue) -> bool:
+            raise ConnectionError("ledger connection dropped during evidence write")
+
+    key = "k-evidence-boom"
+    store = EvidenceWriteBoom(database_url)
+
+    def execute(downstream_key: str | None) -> None:
+        raise RuntimeError("downstream exploded")
+
+    try:
+        with pytest.raises(RuntimeError, match="downstream exploded") as excinfo:
+            commit_once(
+                store,
+                key=key,
+                action_type="refund.create",
+                execute=execute,
+                guarantee=Guarantee.NONE,
+                args_json=ARGS,
+            )
+        # The secondary failure is attached as a note, not raised in its place.
+        notes = getattr(excinfo.value, "__notes__", [])
+        assert any("error_json" in note for note in notes), notes
+
+        loaded = store.load(key)
+        assert loaded is not None
+        assert loaded.state is LedgerState.EXECUTING  # honest: status unknown
+        assert loaded.error_json is None  # the evidence write never landed
+    finally:
+        store.close()
+
+
 def test_precondition_violation_finalizes_aborted(
     store: PostgresStore, effects: EffectsLog
 ) -> None:

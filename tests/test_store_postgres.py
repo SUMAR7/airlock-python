@@ -11,6 +11,7 @@ import sys
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from airlock.store import from_url
@@ -120,6 +121,68 @@ def test_finalize_abort_from_pending(store: PostgresStore) -> None:
     assert loaded is not None
     assert loaded.state is LedgerState.ABORTED
     assert loaded.committed_at is None
+
+
+@pytest.mark.parametrize("target", [LedgerState.FAILED, LedgerState.UNKNOWN])
+def test_finalize_failed_and_unknown_fenced_from_pending(
+    store: PostgresStore, target: LedgerState
+) -> None:
+    """'failed' (executed, confirmed no effect) and 'unknown' (may have
+    executed) are both false statements about a pending row, which provably
+    never started its effect (PLAN 10 point 1) — the state machine refuses
+    them: rowcount 0, row untouched."""
+    key = f"k-pending-{target.value}"
+    store.claim(key, "a.b", Guarantee.NONE, {}, None)
+    assert not store.finalize(key, 1, target, None, None)
+    loaded = store.load(key)
+    assert loaded is not None
+    assert loaded.state is LedgerState.PENDING  # untouched
+    assert loaded.result_json is None
+    assert loaded.committed_at is None
+
+
+@pytest.mark.parametrize("target", [LedgerState.ABORTED, LedgerState.FAILED, LedgerState.UNKNOWN])
+def test_finalize_non_committed_targets_from_executing(
+    store: PostgresStore, target: LedgerState
+) -> None:
+    """From 'executing' the P1.3 recovery table lands aborted/failed/unknown."""
+    key = f"k-exec-{target.value}"
+    store.claim(key, "a.b", Guarantee.NONE, {}, None)
+    assert store.mark_executing(key, 1)
+    assert store.finalize(key, 1, target, None, None)
+    loaded = store.load(key)
+    assert loaded is not None
+    assert loaded.state is target
+    assert loaded.committed_at is None
+
+
+def test_engine_pins_read_committed_despite_hostile_default(database_url: str) -> None:
+    """ADR-1 puts the ledger in the customer's Postgres, where
+    default_transaction_isolation is theirs. claim()'s loser read-back relies
+    on READ COMMITTED per-statement snapshots, so the store pins the level on
+    the engine instead of inheriting the cluster GUC."""
+    separator = "&" if "?" in database_url else "?"
+    hostile_url = (
+        f"{database_url}{separator}options=-c%20default_transaction_isolation%3Dserializable"
+    )
+
+    # Control: an unpinned engine on this DSN really does inherit SERIALIZABLE.
+    unpinned = create_engine(normalize_postgres_url(hostile_url))
+    try:
+        with unpinned.connect() as conn:
+            inherited = conn.execute(text("SHOW transaction_isolation")).scalar_one()
+        assert inherited == "serializable"
+    finally:
+        unpinned.dispose()
+
+    # The store's engine overrides the hostile default on every connection.
+    pinned_store = PostgresStore(hostile_url)
+    try:
+        with pinned_store._engine.connect() as conn:
+            pinned = conn.execute(text("SHOW transaction_isolation")).scalar_one()
+        assert pinned == "read committed"
+    finally:
+        pinned_store.close()
 
 
 def test_finalize_rejects_non_terminal_target(store: PostgresStore) -> None:

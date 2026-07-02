@@ -1,9 +1,13 @@
 """Package-surface tests: metadata, the import-light guard, lazy re-exports.
 
-The import-light guard (PLAN.md section 3.1) asserts extras' modules are not
-IMPORTED by the base package — regardless of whether they are installed. As of
-P1.1 it also covers the ledger modules: sqlalchemy loads only inside
-``airlock.store.postgres``, which is imported lazily by ``from_url``.
+The import-light guard (PLAN.md section 3.1) is enforced in an environment
+with extras UNINSTALLED: the core CI job syncs without extras and runs this
+module, so a stray module-level ``import sqlalchemy`` anywhere in the base
+package fails hard — including in modules the sys.modules assertion below
+does not list. The postgres CI job runs it again with extras installed to pin
+that the base package still does not IMPORT them. As of P1.1 the guard covers
+the ledger modules: sqlalchemy loads only inside ``airlock.store.postgres``,
+which is imported lazily by ``from_url``.
 """
 
 from __future__ import annotations

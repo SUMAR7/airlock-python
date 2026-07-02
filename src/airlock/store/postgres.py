@@ -113,11 +113,26 @@ def _finalize_sql(from_states: tuple[LedgerState, ...]) -> Any:
     )
 
 
-# committed is only reachable from executing (the marker committed before the
-# effect ran); the other terminal states may also abort a pending row that
-# provably never started its effect (PLAN.md 4.1 step 2).
-_FINALIZE_COMMITTED_SQL = _finalize_sql((LedgerState.EXECUTING,))
-_FINALIZE_OTHER_SQL = _finalize_sql(IN_FLIGHT_LEDGER_STATES)
+# Legal finalize transitions per target state (PLAN.md 3.2 semantics; the
+# honest state machine makes false claims unrepresentable, PLAN.md 10 point 1):
+#
+# - committed: only from executing — the marker committed before the effect ran.
+# - aborted:   from pending (precondition abort before the mark, PLAN.md 4.1
+#              step 2) or executing (the P1.3 probe-absent recovery path).
+# - failed:    only from executing. "Executed and confirmed not to have taken
+#              effect" is a false statement about a pending row, which provably
+#              never started its effect.
+# - unknown:   only from executing — same argument; a pending row is never
+#              "may have executed".
+_FINALIZE_FROM_STATES: dict[LedgerState, tuple[LedgerState, ...]] = {
+    LedgerState.COMMITTED: (LedgerState.EXECUTING,),
+    LedgerState.ABORTED: IN_FLIGHT_LEDGER_STATES,
+    LedgerState.FAILED: (LedgerState.EXECUTING,),
+    LedgerState.UNKNOWN: (LedgerState.EXECUTING,),
+}
+_FINALIZE_SQL: dict[LedgerState, Any] = {
+    target: _finalize_sql(from_states) for target, from_states in _FINALIZE_FROM_STATES.items()
+}
 
 
 class PostgresStore:
@@ -128,7 +143,16 @@ class PostgresStore:
     """
 
     def __init__(self, url: str, *, now_fn: Callable[[], datetime] = _utcnow) -> None:
-        self._engine = create_engine(normalize_postgres_url(url))
+        # READ COMMITTED is pinned, never inherited: ADR-1 puts the ledger in
+        # the CUSTOMER'S Postgres, where default_transaction_isolation is
+        # theirs. claim()'s loser read-back runs in the same transaction as
+        # the conflicting INSERT and relies on each statement taking a fresh
+        # snapshot — under an inherited REPEATABLE READ/SERIALIZABLE default
+        # the loser's snapshot predates the winner's commit, the read-back
+        # comes back empty, and SPEC section 5 scenario 2 breaks (and under
+        # SERIALIZABLE the guarded CAS UPDATEs can additionally raise
+        # serialization failures after the effect ran).
+        self._engine = create_engine(normalize_postgres_url(url), isolation_level="READ COMMITTED")
         self._now_fn = now_fn
 
     def ensure_schema(self) -> None:
@@ -168,7 +192,8 @@ class PostgresStore:
             if inserted is not None:
                 return Claim(won=True, record=_row_to_record(inserted))
             # ON CONFLICT DO NOTHING waited out any in-flight competing insert,
-            # so under READ COMMITTED this statement sees the committed winner.
+            # and the engine pins READ COMMITTED (see __init__), so this
+            # statement takes a fresh snapshot that sees the committed winner.
             existing = conn.execute(_LOAD_SQL, {"key": key}).mappings().first()
         if existing is None:
             raise AirlockError(
@@ -204,7 +229,7 @@ class PostgresStore:
         if state not in TERMINAL_LEDGER_STATES:
             raise ValueError(f"finalize target must be a terminal state, got {state!r}")
         committed = state is LedgerState.COMMITTED
-        sql = _FINALIZE_COMMITTED_SQL if committed else _FINALIZE_OTHER_SQL
+        sql = _FINALIZE_SQL[state]
         with self._engine.begin() as conn:
             rowcount = conn.execute(
                 sql,

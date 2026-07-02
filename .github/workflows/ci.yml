@@ -42,8 +42,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Sync dependencies (dev group, no extras)
-        run: uv sync --locked
+      # The postgres extra is installed so the ledger suite runs against the
+      # postgres:16 service; the import-light guard still passes because it
+      # asserts extras are not IMPORTED by the base package, not uninstalled.
+      - name: Sync dependencies (dev group + postgres extra)
+        run: uv sync --locked --extra postgres
 
       - name: Lint
         run: uv run ruff check .

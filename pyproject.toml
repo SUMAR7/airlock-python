@@ -60,3 +60,6 @@ warn_unreachable = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "concurrency: multi-process barrier tests hammering one idempotency key (SPEC section 9)",
+]

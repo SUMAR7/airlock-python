@@ -29,8 +29,11 @@ def test_base_import_is_light() -> None:
     code = (
         "import sys\n"
         "import airlock\n"
+        "import airlock._canonical\n"
         "import airlock.commit\n"
+        "import airlock.effects\n"
         "import airlock.errors\n"
+        "import airlock.idempotency\n"
         "import airlock.store\n"
         "import airlock.store._schema\n"
         "import airlock.types\n"
@@ -48,14 +51,41 @@ def test_base_import_is_light() -> None:
 
 def test_lazy_public_surface() -> None:
     """PEP 562 re-exports resolve to the real objects."""
+    from airlock._canonical import CANON_VERSION, canonical_bytes, canonical_json, decimal_string
     from airlock.commit import commit_once
-    from airlock.errors import AirlockError, CommitWaitTimeout
+    from airlock.effects import Effect
+    from airlock.errors import (
+        AirlockError,
+        AtMostOnceWarning,
+        CanonicalizationError,
+        CommitWaitTimeout,
+        VerificationUnknown,
+    )
+    from airlock.idempotency import build_arg_map, derive_key, namespace_user_key
     from airlock.store import Store, from_url
-    from airlock.types import Claim, CommitOutcome, CommitRecord, Guarantee, LedgerState
+    from airlock.types import (
+        Claim,
+        CommitOutcome,
+        CommitRecord,
+        Guarantee,
+        LedgerState,
+        Verification,
+    )
 
+    assert airlock.CANON_VERSION is CANON_VERSION
+    assert airlock.canonical_bytes is canonical_bytes
+    assert airlock.canonical_json is canonical_json
+    assert airlock.decimal_string is decimal_string
     assert airlock.commit_once is commit_once
+    assert airlock.Effect is Effect
     assert airlock.AirlockError is AirlockError
+    assert airlock.AtMostOnceWarning is AtMostOnceWarning
+    assert airlock.CanonicalizationError is CanonicalizationError
     assert airlock.CommitWaitTimeout is CommitWaitTimeout
+    assert airlock.VerificationUnknown is VerificationUnknown
+    assert airlock.build_arg_map is build_arg_map
+    assert airlock.derive_key is derive_key
+    assert airlock.namespace_user_key is namespace_user_key
     assert airlock.Store is Store
     assert airlock.from_url is from_url
     assert airlock.Claim is Claim
@@ -63,6 +93,7 @@ def test_lazy_public_surface() -> None:
     assert airlock.CommitRecord is CommitRecord
     assert airlock.Guarantee is Guarantee
     assert airlock.LedgerState is LedgerState
+    assert airlock.Verification is Verification
 
 
 def test_unknown_attribute_raises() -> None:

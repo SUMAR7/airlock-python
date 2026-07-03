@@ -28,8 +28,9 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from airlock.commit import commit_once
+from airlock.effects import Effect
 from airlock.store.postgres import PostgresStore, normalize_postgres_url
-from airlock.types import IN_FLIGHT_LEDGER_STATES, Claim, Guarantee, LedgerState
+from airlock.types import IN_FLIGHT_LEDGER_STATES, Claim, Guarantee, LedgerState, Verification
 from tests.conftest import EffectsLog
 
 if TYPE_CHECKING:
@@ -39,6 +40,11 @@ if TYPE_CHECKING:
 WORKERS = 8
 KEY = "scenario-2-one-key"
 DEADLINE = 60.0  # hard deadline for every wait; a healthy run takes well under a second
+
+
+def _probe_present(**_: object) -> tuple[Verification, None]:
+    """Post-verify probe (module-level: spawn children must pickle by name)."""
+    return Verification.PRESENT, None
 
 
 class _ClaimReportingStore(PostgresStore):
@@ -102,7 +108,7 @@ def _scenario2_worker(
             key=KEY,
             action_type="test.concurrent_effect",
             execute=execute,
-            guarantee=Guarantee.VERIFIABLE,
+            effect=Effect(verify=_probe_present),
             args_json={"n": 1},
             wait_timeout=DEADLINE,
             poll_interval=0.02,

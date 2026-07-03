@@ -128,8 +128,7 @@ def decimal_string(amount: Decimal) -> str:
     """
     if not isinstance(amount, Decimal):
         raise CanonicalizationError(
-            f"decimal_string() takes a decimal.Decimal, got {type(amount).__name__}. "
-            + _MONEY_HINT
+            f"decimal_string() takes a decimal.Decimal, got {type(amount).__name__}. " + _MONEY_HINT
         )
     if not amount.is_finite():
         raise CanonicalizationError(

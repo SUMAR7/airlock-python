@@ -20,6 +20,7 @@ __all__ = [
     "AtMostOnceWarning",
     "CanonicalizationError",
     "CommitWaitTimeout",
+    "ExecuteTimeout",
     "VerificationUnknown",
 ]
 
@@ -69,6 +70,36 @@ class CommitWaitTimeout(AirlockError):
         super().__init__(message)
         self.key = key
         self.last_state = last_state
+
+
+class ExecuteTimeout(AirlockError):
+    """``execute`` ran past its ``execute_timeout`` and was ABANDONED.
+
+    PLAN.md 4.1 step 4 / 10 point 2: an owner's ``execute`` must abort strictly
+    before a row becomes recover-eligible (``execute_timeout < reconcile_after``),
+    so a reconciler can never probe a row while its original owner is still
+    legitimately mid-execute — the residual double-execute the epoch fence exists
+    to close. When ``execute`` exceeds ``execute_timeout``, ``commit_once`` stops
+    waiting on it, records the timeout in ``error_json``, leaves the row
+    ``executing`` for the verification-first reconciler, and raises this.
+
+    The abandoned work may still be running in the background: Python cannot
+    forcibly kill a synchronous call. That is safe — the owner is fenced. If the
+    slow ``execute`` eventually lands its effect, the owner's epoch has been (or
+    will be) bumped by the reconciler, so its ``finalize`` matches zero rows
+    (``WHERE attempts = epoch``), and the effect is reconciled once via the
+    probe / downstream dedup. The caller must NOT retry: the ledger holds the
+    claim.
+
+    Attributes:
+        key: the idempotency key whose ``execute`` was abandoned.
+        timeout: the ``execute_timeout`` that was exceeded.
+    """
+
+    def __init__(self, message: str, *, key: str, timeout: float) -> None:
+        super().__init__(message)
+        self.key = key
+        self.timeout = timeout
 
 
 class VerificationUnknown(AirlockError):

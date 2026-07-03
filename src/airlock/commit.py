@@ -10,10 +10,25 @@ reductions:
 - **Key is caller-supplied.** ``airlock.idempotency.derive_key`` exists
   (P1.2), but wiring it to a function signature is the ``@guard`` decorator's
   job (P2.1) — ``commit_once`` stays the primitive that takes the final key.
-- **No reconciliation.** A loser waiting on an in-flight row that never
-  terminates raises ``CommitWaitTimeout`` naming the P1.3 reconciler — it
-  NEVER re-executes. Blind re-execution of an in-flight action is the exact
-  double-commit this library exists to prevent.
+
+Inline-targeted recovery (PLAN.md 4.2, the PRIMARY zero-setup model): when a
+loser hits a stale in-flight row that has crossed ``reconcile_after``, it does
+NOT just poll and raise — it runs targeted verify-first reconciliation for that
+one key (:func:`airlock.reconcile.reconcile_key`) and returns the recovered
+terminal outcome. It STILL never blind-re-executes: ``reconcile_key`` bumps the
+epoch (fencing the stranded owner), probes/verifies, and only re-executes on a
+proven-absent / effect-free row with preconditions re-validated. Without
+``reconcile_after`` set, a loser polls and raises ``CommitWaitTimeout`` as in
+P1.1 — the operator recovers via the CLI/startup sweep instead.
+
+Execute is time-bounded (PLAN.md 4.1 step 4 / 10 point 2): when
+``execute_timeout`` is set, ``execute`` runs under a hard deadline that must be
+``< reconcile_after``. If it overruns, the owner ABANDONS the call — records the
+timeout, leaves the row ``executing`` for the reconciler, and raises
+``ExecuteTimeout`` — so an owner is provably out of ``execute`` before its row
+becomes recover-eligible. That closes the residual double-execute the epoch
+fence exists to bound (a reconciler must never probe a row while its owner is
+still legitimately mid-execute).
 
 Failure honesty (the shared principle behind three paths that all leave the
 row ``executing`` for the P1.3 reconciler):
@@ -36,9 +51,12 @@ per process, the ``none`` guarantee is stamped durably on the ledger row, and
 from __future__ import annotations
 
 import json
+import threading
 import time
 import warnings
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from pydantic import JsonValue
@@ -49,15 +67,47 @@ from airlock.errors import (
     AirlockError,
     AtMostOnceWarning,
     CommitWaitTimeout,
+    ExecuteTimeout,
     VerificationUnknown,
 )
+from airlock.reconcile import OnAbsent, ReconcileAction, reconcile_key
+from airlock.registry import Registry
 from airlock.store import Store
 from airlock.types import CommitOutcome, CommitRecord, Guarantee, LedgerState, Verification
 
 __all__ = ["commit_once"]
 
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 #: Action types already warned about at-most-once degradation (per process).
 _at_most_once_warned: set[str] = set()
+
+
+@dataclass(frozen=True)
+class _LoserContext:
+    """Everything a losing/fenced ``commit_once`` call needs to recover inline.
+
+    A loser (scenario 2) or a fenced owner does not hold the row, but it DOES
+    hold this action type's recovery wiring — the same ``effect`` / ``execute``
+    / ``preconditions`` the winner passed. When the in-flight row it is waiting
+    on crosses ``reconcile_after``, the loser runs targeted verify-first
+    reconciliation for that one key (:func:`airlock.reconcile.reconcile_key`)
+    using a one-off :class:`~airlock.registry.Registry` built from that wiring
+    (never the process-wide registry — the loser must recover THIS action, with
+    the wiring it was called with, with zero operator setup). When
+    ``reconcile_after`` is ``None`` the loser keeps the P1.1 poll-then-raise
+    behavior.
+    """
+
+    action_type: str
+    registry: Registry
+    reconcile_after: timedelta | None
+    on_absent: OnAbsent
+    execute_timeout: timedelta | None
+    now_fn: Callable[[], datetime]
 
 
 def commit_once(
@@ -72,6 +122,10 @@ def commit_once(
     wait: bool = True,
     wait_timeout: float = 30.0,
     poll_interval: float = 0.05,
+    reconcile_after: timedelta | None = None,
+    execute_timeout: timedelta | None = None,
+    on_absent: OnAbsent = OnAbsent.ABORT,
+    now_fn: Callable[[], datetime] = _utcnow,
 ) -> CommitOutcome:
     """Execute ``execute(downstream_key)`` at most once per ``key``.
 
@@ -106,12 +160,42 @@ def commit_once(
             key's provenance.
         wait: when this call loses to an in-flight row, whether to poll for
             the winner's terminal outcome. ``False`` raises
-            ``CommitWaitTimeout`` immediately.
-        wait_timeout: seconds a loser polls before raising
-            ``CommitWaitTimeout`` (P1.1 stand-in for ``reconcile_after``:
-            P1.3 runs targeted reconciliation here instead of raising).
+            ``CommitWaitTimeout`` immediately (unless the row is already stale
+            past ``reconcile_after`` — then inline reconciliation runs first).
+        wait_timeout: seconds a loser polls before giving up on a NON-stale
+            in-flight row. If the row is (or becomes) stale past
+            ``reconcile_after``, the loser reconciles it inline instead of
+            polling to exhaustion.
         poll_interval: seconds between loser polls (implementation detail,
             not test timing).
+        reconcile_after: the reconcile timeout (== the reconciler's
+            ``older_than``). When set, a loser whose in-flight row has crossed
+            this staleness threshold runs targeted verify-first reconciliation
+            for ``key`` (:func:`airlock.reconcile.reconcile_key`) and returns
+            the recovered terminal outcome — the PRIMARY inline recovery model
+            (PLAN.md 4.2). It NEVER blind-re-executes: reconciliation bumps the
+            epoch, probes/verifies, and only re-executes a proven-absent /
+            effect-free row with preconditions re-validated. ``None`` keeps the
+            P1.1 behavior (a stale loser raises ``CommitWaitTimeout``; recover
+            via the CLI/startup sweep).
+        execute_timeout: hard deadline for ``execute``. When set it MUST be
+            ``< reconcile_after`` (PLAN.md 4.1 step 4 / 10 point 2: an owner
+            must be provably out of ``execute`` before its row is
+            recover-eligible, or a reconciler could probe a live owner's row
+            and double-execute a verify-only effect). If ``execute`` overruns,
+            the owner ABANDONS it — records the timeout, leaves the row
+            ``executing`` for the reconciler, and raises ``ExecuteTimeout``.
+            Python cannot forcibly kill the abandoned call; that is safe,
+            because the owner is fenced (a later ``finalize`` matches zero rows
+            once the reconciler bumps the epoch) and the effect, if it lands,
+            is reconciled once. ``None`` runs ``execute`` unbounded (the P1.1
+            behavior; only safe when no reconciler runs against these rows).
+        on_absent: forwarded to inline :func:`~airlock.reconcile.reconcile_key`
+            — whether a loser's reconciliation retries or aborts a
+            provably-absent / effect-free row (default ``ABORT``, fail safe).
+        now_fn: the clock used to timestamp inline reconciliation evidence and
+            (via the store) compute staleness; share it with the store's
+            ``now_fn`` so the loser's staleness view matches the ledger's.
 
     Returns:
         The terminal :class:`~airlock.types.CommitOutcome` for ``key``. A
@@ -134,10 +218,14 @@ def commit_once(
             itself failed) — the honest non-answer. The row stays
             ``executing`` with the evidence recorded; the P1.3 reconciler
             (``python -m airlock reconcile``) resolves it. Do not retry.
-        CommitWaitTimeout: lost to an in-flight row that did not reach a
-            terminal state in time (or ``wait=False``), or this call was
-            epoch-fenced mid-flight and the takeover's resolution did not
-            land in time.
+        CommitWaitTimeout: lost to a NON-stale in-flight row that did not reach
+            a terminal state in time (or ``wait=False`` and no
+            ``reconcile_after`` recovery applied), or this call was epoch-fenced
+            mid-flight and the takeover's resolution did not land in time.
+        ExecuteTimeout: ``execute`` overran ``execute_timeout`` and was
+            abandoned; the row stays ``executing`` for the reconciler.
+        ValueError: ``execute_timeout`` is set without ``reconcile_after``, or
+            is not strictly less than it (the enforced ordering, PLAN.md 4.1).
         Exception: whatever ``execute`` raised, after ``error_json`` is
             recorded; the row stays ``executing`` for the reconciler. If the
             evidence write itself fails, the original exception still
@@ -147,6 +235,26 @@ def commit_once(
         raise ValueError(f"wait_timeout must be > 0, got {wait_timeout!r}")
     if poll_interval <= 0:
         raise ValueError(f"poll_interval must be > 0, got {poll_interval!r}")
+    if execute_timeout is not None:
+        if execute_timeout <= timedelta(0):
+            raise ValueError(f"execute_timeout must be positive, got {execute_timeout!r}")
+        # PLAN.md 4.1 step 4 / 10 point 2: the timeout is meaningful ONLY
+        # relative to the reconcile timeout — an owner must abandon execute
+        # strictly before its row is recover-eligible. Refuse the pair that
+        # would let a reconciler probe a still-executing owner's row.
+        if reconcile_after is None:
+            raise ValueError(
+                "execute_timeout requires reconcile_after: the timeout exists to keep an "
+                "owner out of execute BEFORE its row is recover-eligible, which is "
+                "meaningless without the reconcile timeout it must be less than "
+                "(PLAN.md 4.1 step 4)."
+            )
+        if execute_timeout >= reconcile_after:
+            raise ValueError(
+                "execute_timeout must be < reconcile_after so an owner is provably out of "
+                f"execute before recovery (PLAN.md 4.1): got execute_timeout={execute_timeout!r}, "
+                f"reconcile_after={reconcile_after!r}."
+            )
 
     # args_json is persisted as canonical JSON at claim time (PLAN 4.2/5.1)
     # and rehydrated by the P1.3 reconciler for verify/preconditions/retry, so
@@ -167,6 +275,19 @@ def commit_once(
     downstream_key = effect.downstream_key_for(key)
     if guarantee is Guarantee.NONE:
         _warn_at_most_once(action_type)
+
+    # The inline-recovery wiring for every losing/fenced path below. A one-off
+    # registry from THIS call's effect/execute/preconditions (never the
+    # process-wide registry) so a loser recovers exactly this action with zero
+    # operator setup (PLAN.md 4.2, the primary inline-targeted model).
+    loser_ctx = _LoserContext(
+        action_type=action_type,
+        registry=_single_action_registry(action_type, effect, execute, preconditions),
+        reconcile_after=reconcile_after,
+        on_absent=on_absent,
+        execute_timeout=execute_timeout,
+        now_fn=now_fn,
+    )
 
     # Step 1 — claim, committed in its own transaction before anything runs.
     claim = store.claim(key, action_type, guarantee, args_json, downstream_key)
@@ -189,7 +310,12 @@ def commit_once(
             return _outcome_from(claim.record)
         # Scenario 2: another caller is in flight; wait for its outcome.
         return _await_terminal(
-            store, key, wait=wait, wait_timeout=wait_timeout, poll_interval=poll_interval
+            store,
+            key,
+            wait=wait,
+            wait_timeout=wait_timeout,
+            poll_interval=poll_interval,
+            ctx=loser_ctx,
         )
 
     epoch = claim.record.attempts  # our ownership epoch (PLAN.md section 4.2)
@@ -200,19 +326,46 @@ def commit_once(
             return CommitOutcome(key=key, state=LedgerState.ABORTED, guarantee=guarantee)
         # Fenced: a takeover owns the row now; treat as a lost claim.
         return _await_terminal(
-            store, key, wait=wait, wait_timeout=wait_timeout, poll_interval=poll_interval
+            store,
+            key,
+            wait=wait,
+            wait_timeout=wait_timeout,
+            poll_interval=poll_interval,
+            ctx=loser_ctx,
         )
 
     # Step 3 — durable executing marker, committed BEFORE the effect runs.
     if not store.mark_executing(key, epoch):
         # Fenced: ownership moved on. Treat as a lost claim — do NOT execute.
         return _await_terminal(
-            store, key, wait=wait, wait_timeout=wait_timeout, poll_interval=poll_interval
+            store,
+            key,
+            wait=wait,
+            wait_timeout=wait_timeout,
+            poll_interval=poll_interval,
+            ctx=loser_ctx,
         )
 
-    # Step 4 — the side effect.
+    # Step 4 — the side effect, bounded by execute_timeout (PLAN.md 4.1 step 4).
     try:
-        result = execute(downstream_key)
+        result = _run_execute(execute, downstream_key, execute_timeout, key=key)
+    except ExecuteTimeout as timeout_exc:
+        # Overran the window: ABANDON the call so this owner is out of execute
+        # before its row is recover-eligible. The row stays 'executing'; the
+        # reconciler bumps the epoch (fencing this owner) and resolves by
+        # verification. Record the timeout as evidence (best-effort, fenced-safe).
+        try:
+            store.record_error(
+                key,
+                epoch,
+                {"type": "ExecuteTimeout", "message": str(timeout_exc), "phase": "execute"},
+            )
+        except Exception as record_exc:
+            timeout_exc.add_note(
+                f"airlock: recording the execute-timeout on the ledger row failed "
+                f"({record_exc!r}); the row stays 'executing' for the reconciler (P1.3)"
+            )
+        raise
     except Exception as exc:
         # Honest failure: the effect's status is unknown, so the row stays
         # 'executing' with the error recorded; the P1.3 reconciler resolves
@@ -244,6 +397,7 @@ def commit_once(
             wait=wait,
             wait_timeout=wait_timeout,
             poll_interval=poll_interval,
+            ctx=loser_ctx,
         )
         if verify_outcome is not None:
             return verify_outcome
@@ -257,8 +411,100 @@ def commit_once(
     # Fenced: a takeover owns resolution — never override it. Report whatever
     # the ledger converges to.
     return _await_terminal(
-        store, key, wait=wait, wait_timeout=wait_timeout, poll_interval=poll_interval
+        store, key, wait=wait, wait_timeout=wait_timeout, poll_interval=poll_interval, ctx=loser_ctx
     )
+
+
+def _single_action_registry(
+    action_type: str,
+    effect: Effect,
+    execute: Callable[[str | None], JsonValue],
+    preconditions: Callable[[], bool] | None,
+) -> Registry:
+    """A one-off registry holding exactly this call's recovery wiring.
+
+    The reconciler invokes registered callables with the rehydrated arg_map
+    splatted as kwargs — ``execute(downstream_key, **arg_map)`` and
+    ``preconditions(**arg_map)`` (see :mod:`airlock.registry`). ``commit_once``'s
+    ``execute``/``preconditions`` take no arg_map (``execute(downstream_key)``,
+    ``preconditions()``), so they are ADAPTED to swallow the extra kwargs. This
+    keeps the primitive's signature unchanged while letting a loser reconcile
+    inline through the same code path the CLI/startup sweep use.
+    """
+    registry = Registry()
+
+    def _execute_adapter(downstream_key: str | None, **_arg_map: JsonValue) -> JsonValue:
+        return execute(downstream_key)
+
+    _preconditions_adapter: Callable[..., bool] | None
+    if preconditions is None:
+        _preconditions_adapter = None
+    else:
+
+        def _preconditions_adapter(**_arg_map: JsonValue) -> bool:
+            return preconditions()
+
+    registry.register(action_type, effect, _execute_adapter, _preconditions_adapter)
+    return registry
+
+
+def _run_execute(
+    execute: Callable[[str | None], JsonValue],
+    downstream_key: str | None,
+    execute_timeout: timedelta | None,
+    *,
+    key: str,
+) -> JsonValue:
+    """Run ``execute(downstream_key)``, abandoning it past ``execute_timeout``.
+
+    ``execute_timeout=None`` runs it inline, unbounded (the P1.1 behavior). With
+    a timeout, ``execute`` runs in a DAEMON worker thread and the owner waits at
+    most ``execute_timeout`` for it: on overrun we raise :class:`ExecuteTimeout`
+    and LET GO of the thread — Python cannot forcibly interrupt a synchronous
+    call, so the point of the timeout is that the OWNER stops waiting, not that
+    the work stops. That is exactly what the epoch fence needs: the owner returns
+    control before ``reconcile_after``, and any effect the abandoned thread later
+    lands is reconciled once (the owner is fenced out of ``finalize``).
+
+    A DAEMON thread is essential: a still-running abandoned ``execute`` must not
+    block interpreter exit (``concurrent.futures`` would, via its atexit join —
+    which is why this uses a raw ``threading.Thread``, not a pool).
+    ``execute``'s own exception is re-raised unchanged so the caller's existing
+    error path is untouched; if both a result and an exception are possible only
+    one is ever set (the worker sets exactly one before signalling ``done``).
+    """
+    if execute_timeout is None:
+        return execute(downstream_key)
+
+    result: list[JsonValue] = []
+    error: list[BaseException] = []
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            value = execute(downstream_key)
+        except BaseException as exc:  # propagated verbatim to the owner below
+            error.append(exc)
+        else:
+            result.append(value)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_worker, name=f"airlock-execute-{key}", daemon=True)
+    thread.start()
+    if not done.wait(timeout=execute_timeout.total_seconds()):
+        # Abandoned: the owner stops waiting; the daemon thread runs on.
+        raise ExecuteTimeout(
+            f"execute for key {key!r} overran execute_timeout "
+            f"({execute_timeout.total_seconds()}s) and was abandoned; the row stays "
+            "'executing' for the verification-first reconciler (P1.3: python -m airlock "
+            "reconcile). The owner is fenced — do NOT retry.",
+            key=key,
+            timeout=execute_timeout.total_seconds(),
+        )
+    if error:
+        raise error[0]
+    return result[0]
 
 
 def _warn_at_most_once(action_type: str) -> None:
@@ -301,6 +547,7 @@ def _post_verify(
     wait: bool,
     wait_timeout: float,
     poll_interval: float,
+    ctx: _LoserContext,
 ) -> CommitOutcome | None:
     """Run the probe after a successful execute; ``None`` means proceed.
 
@@ -349,7 +596,7 @@ def _post_verify(
             )
         # Fenced: a takeover owns resolution.
         return _await_terminal(
-            store, key, wait=wait, wait_timeout=wait_timeout, poll_interval=poll_interval
+            store, key, wait=wait, wait_timeout=wait_timeout, poll_interval=poll_interval, ctx=ctx
         )
 
     # unknown — the honest non-answer (PLAN.md 4.1 step 5).
@@ -417,15 +664,28 @@ def _await_terminal(
     wait: bool,
     wait_timeout: float,
     poll_interval: float,
+    ctx: _LoserContext,
 ) -> CommitOutcome:
-    """Poll the ledger until ``key`` is terminal, or give up loudly.
+    """Resolve an in-flight row this call does not own: reconcile inline if it is
+    stale (PLAN.md 4.2 inline-targeted), else poll for the owner, else give up.
 
-    Giving up NEVER re-executes: a stale in-flight row is resolved only by
-    the verification-first reconciler (P1.3).
+    Order per check: terminal? return it. Stale past ``reconcile_after``? run
+    targeted verify-first reconciliation for ``key`` and return the recovered
+    outcome — NEVER a blind re-execute (``reconcile_key`` bumps the epoch,
+    probes/verifies, retries only a proven-absent / effect-free row with
+    preconditions re-validated). Otherwise poll; if it goes stale mid-wait,
+    reconcile then. Giving up (``reconcile_after`` unset, or wait exhausted on a
+    non-stale row) raises ``CommitWaitTimeout`` — recover via the CLI/startup
+    sweep.
     """
     record = _load_required(store, key)
     if record.state.is_terminal:
         return _outcome_from(record)
+
+    recovered = _try_inline_reconcile(store, key, ctx)
+    if recovered is not None:
+        return recovered
+
     if not wait:
         raise CommitWaitTimeout(
             f"commit for key {key!r} is in flight (state={record.state.value!r}) and "
@@ -441,6 +701,9 @@ def _await_terminal(
         record = _load_required(store, key)
         if record.state.is_terminal:
             return _outcome_from(record)
+        recovered = _try_inline_reconcile(store, key, ctx)
+        if recovered is not None:
+            return recovered
     raise CommitWaitTimeout(
         f"commit for key {key!r} was still in flight (state={record.state.value!r}) after "
         f"waiting {wait_timeout}s. The row is stale: resolve it with the verification-first "
@@ -449,6 +712,53 @@ def _await_terminal(
         key=key,
         last_state=record.state,
     )
+
+
+def _try_inline_reconcile(store: Store, key: str, ctx: _LoserContext) -> CommitOutcome | None:
+    """Reconcile ``key`` inline IF it is a stale in-flight row (PLAN.md 4.2).
+
+    Returns the recovered terminal :class:`CommitOutcome`, or ``None`` when
+    inline reconciliation does not apply (no ``reconcile_after`` configured; the
+    row is not stale yet; another actor took it over; or reconciliation left the
+    row non-terminal — escalated/left executing, which the poll loop keeps
+    waiting on). It NEVER re-executes blindly: it delegates to
+    :func:`airlock.reconcile.reconcile_key`, whose staleness gate (the store's
+    ``bump_epoch`` re-checks the cutoff) is the single source of truth for "is
+    this row actually recover-eligible" — so a not-yet-stale row is skipped
+    (``bump_epoch`` returns ``None``) and this returns ``None``.
+    """
+    if ctx.reconcile_after is None:
+        return None
+    action = reconcile_key(
+        store,
+        key,
+        older_than=ctx.reconcile_after,
+        on_absent=ctx.on_absent,
+        execute_timeout=ctx.execute_timeout,
+        now_fn=ctx.now_fn,
+        registry=ctx.registry,
+    )
+    if action is None:
+        return None
+    # reconcile_key ran; read back the (possibly now-terminal) row and report it.
+    # A non-terminal outcome (escalated / left executing) means recovery could
+    # not resolve it this pass — return None so the caller keeps polling/raises,
+    # exactly as before, rather than fabricate a terminal outcome.
+    record = store.load(key)
+    if record is None or not record.state.is_terminal:
+        return _reconcile_action_note(action)
+    return _outcome_from(record)
+
+
+def _reconcile_action_note(action: ReconcileAction) -> CommitOutcome | None:
+    """A reconcile pass that did not reach terminal: keep waiting (return None).
+
+    Kept as a seam so the intent is explicit — an ``escalated`` / left-executing
+    reconcile outcome is not a terminal ``CommitOutcome``; the loser must not
+    invent one, it polls on (or ultimately raises ``CommitWaitTimeout``).
+    """
+    _ = action
+    return None
 
 
 def _load_required(store: Store, key: str) -> CommitRecord:

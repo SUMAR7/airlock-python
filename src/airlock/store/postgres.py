@@ -18,6 +18,10 @@ side effect:
                      extend with the hash-chained audit append (same
                      signature, same transaction).
 - ``load``           plain read.
+- ``stale_inflight`` (P1.3) FOR UPDATE SKIP LOCKED scan of stale in-flight
+                     rows for the reconciler.
+- ``bump_epoch``     (P1.3) the takeover fence: atomically bump the epoch of a
+                     still-stale in-flight row, returning the new epoch.
 
 Lost races are detected by guarded-UPDATE rowcount (the epoch fence), never
 by SELECT-then-UPDATE.
@@ -27,7 +31,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import JsonValue
@@ -91,13 +95,61 @@ _MARK_EXECUTING_SQL = text(
     pending=LedgerState.PENDING.value,
 )
 
+# The in-flight state list is GENERATED from IN_FLIGHT_LEDGER_STATES (the
+# single vocabulary source, PLAN.md 10 point 5) — never retyped — so the scan,
+# the takeover fence, and record_error can never diverge from the partial index
+# or the DDL.
+_IN_FLIGHT_STATE_LIST = ", ".join(f"'{state.value}'" for state in IN_FLIGHT_LEDGER_STATES)
+
+# record_error writes error_json only (never state), epoch-guarded, on any
+# IN-FLIGHT row — pending OR executing. commit_once always calls it after the
+# executing mark (state=executing), but the reconciler records recovery
+# evidence on the PENDING abort path BEFORE the pending->aborted finalize: the
+# row is still pending then, so a state='executing'-only guard would silently
+# drop that evidence (the ledger must keep the reconciled/aborted reason). It
+# is refused on terminal rows so a fenced/late writer cannot scribble on a
+# resolved row (I5).
 _RECORD_ERROR_SQL = text(
-    """
+    f"""
     UPDATE commit_records
        SET error_json = CAST(:error_json AS JSONB)
-     WHERE idempotency_key = :key AND state = :executing AND attempts = :epoch
+     WHERE idempotency_key = :key
+       AND state IN ({_IN_FLIGHT_STATE_LIST})
+       AND attempts = :epoch
     """
-).bindparams(executing=LedgerState.EXECUTING.value)
+)
+
+# The stale-in-flight scan (PLAN.md 4.2). Ordered by last_attempt_at so the
+# oldest stale rows recover first; SKIP LOCKED so two reconcilers never contend
+# on the same row (the partial index commit_records_inflight_idx supports the
+# WHERE + ORDER BY). The lock is released when the reading txn commits — the
+# reconciler takes durable ownership via bump_epoch, not by holding this lock.
+_STALE_INFLIGHT_SQL = text(
+    f"""
+    SELECT * FROM commit_records
+     WHERE state IN ({_IN_FLIGHT_STATE_LIST})
+       AND last_attempt_at < :cutoff
+     ORDER BY last_attempt_at
+     FOR UPDATE SKIP LOCKED
+    """
+)
+
+# The takeover fence (PLAN.md 4.2 / 10 point 2). Bump the epoch and refresh
+# last_attempt_at ONLY while the row is still in-flight AND still stale — the
+# staleness re-check inside the atomic UPDATE closes the window where a slow
+# owner re-touched the row (or another reconciler already bumped it) between
+# the stale_inflight read and this write. RETURNING the new epoch; rowcount 0
+# (no row returned) => already terminal or no longer stale => caller skips.
+_BUMP_EPOCH_SQL = text(
+    f"""
+    UPDATE commit_records
+       SET attempts = attempts + 1, last_attempt_at = :now
+     WHERE idempotency_key = :key
+       AND state IN ({_IN_FLIGHT_STATE_LIST})
+       AND last_attempt_at < :cutoff
+    RETURNING attempts
+    """
+)
 
 
 def _finalize_sql(from_states: tuple[LedgerState, ...]) -> Any:
@@ -252,6 +304,26 @@ class PostgresStore:
         with self._engine.begin() as conn:
             row = conn.execute(_LOAD_SQL, {"key": key}).mappings().first()
         return None if row is None else _row_to_record(row)
+
+    def stale_inflight(self, older_than: timedelta) -> list[CommitRecord]:
+        cutoff = self._now_fn() - older_than
+        # The FOR UPDATE SKIP LOCKED lock lives only for this short read
+        # transaction: we materialize the rows and commit, releasing the locks.
+        # Durable ownership is taken separately by bump_epoch (the epoch fence),
+        # so the reconciler never holds a row lock across its verification I/O —
+        # a long probe cannot pin the row against a second reconciler pass.
+        with self._engine.begin() as conn:
+            rows = conn.execute(_STALE_INFLIGHT_SQL, {"cutoff": cutoff}).mappings().all()
+        return [_row_to_record(row) for row in rows]
+
+    def bump_epoch(self, key: str, older_than: timedelta) -> int | None:
+        now = self._now_fn()
+        cutoff = now - older_than
+        with self._engine.begin() as conn:
+            new_epoch = conn.execute(
+                _BUMP_EPOCH_SQL, {"key": key, "now": now, "cutoff": cutoff}
+            ).scalar_one_or_none()
+        return None if new_epoch is None else int(new_epoch)
 
 
 def _row_to_record(row: Mapping[Any, Any]) -> CommitRecord:

@@ -8,7 +8,7 @@ leaves the row untouched.
 from __future__ import annotations
 
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -17,7 +17,7 @@ from sqlalchemy.engine import Engine
 from airlock.store import from_url
 from airlock.store.postgres import PostgresStore, normalize_postgres_url
 from airlock.types import Guarantee, LedgerState
-from tests.conftest import bump_epoch
+from tests.conftest import FakeClock, bump_epoch
 
 ARGS = {"amount": "12.50", "currency": "EUR"}
 
@@ -224,6 +224,30 @@ def test_record_error_fenced_by_epoch_bump(store: PostgresStore, db: Engine) -> 
     assert loaded.error_json is None
 
 
+def test_record_error_lands_on_a_pending_row(store: PostgresStore) -> None:
+    """The reconciler records the 'aborted' recovery reason BEFORE the
+    pending->aborted finalize, so record_error must land on a PENDING row (it
+    only writes error_json, never state) — an executing-only guard would
+    silently drop that evidence."""
+    store.claim("k-err-pending", "a.b", Guarantee.NONE, {}, None)
+    assert store.record_error("k-err-pending", 1, {"reconciled": "aborted"})
+    loaded = store.load("k-err-pending")
+    assert loaded is not None
+    assert loaded.state is LedgerState.PENDING  # state unchanged
+    assert loaded.error_json == {"reconciled": "aborted"}
+
+
+def test_record_error_refused_on_terminal_row(store: PostgresStore) -> None:
+    """A resolved row is immutable (I5): a late/fenced record_error is refused."""
+    store.claim("k-err-terminal", "a.b", Guarantee.NONE, {}, None)
+    assert store.mark_executing("k-err-terminal", 1)
+    assert store.finalize("k-err-terminal", 1, LedgerState.COMMITTED, {"ok": True}, None)
+    assert not store.record_error("k-err-terminal", 1, {"late": "write"})
+    loaded = store.load("k-err-terminal")
+    assert loaded is not None
+    assert loaded.error_json is None
+
+
 def test_load_missing_key_returns_none(store: PostgresStore) -> None:
     assert store.load("never-claimed") is None
 
@@ -260,3 +284,90 @@ def test_from_url_missing_extra_is_actionable(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setitem(sys.modules, "sqlalchemy", None)  # makes `import sqlalchemy` raise
     with pytest.raises(ImportError, match=r"airlock\[postgres\]"):
         from_url("postgresql://localhost/airlock_test")
+
+
+# ---------------------------------------------------------------------------
+# stale_inflight + bump_epoch (P1.3 reconciler store surface)
+# ---------------------------------------------------------------------------
+
+
+def test_stale_inflight_only_returns_rows_past_the_cutoff(
+    clock_store: PostgresStore, fake_clock: FakeClock
+) -> None:
+    """The staleness trigger (SPEC section 5): only in-flight rows whose
+    last_attempt_at is older than now - older_than are returned; fresh in-flight
+    and terminal rows are invisible."""
+    clock_store.claim("k-stale", "a.b", Guarantee.VERIFIABLE, {}, None)
+    assert clock_store.mark_executing("k-stale", 1)
+    clock_store.claim("k-pending", "a.b", Guarantee.NONE, {}, None)
+    clock_store.claim("k-terminal", "a.b", Guarantee.NONE, {}, None)
+    assert clock_store.mark_executing("k-terminal", 1)
+    assert clock_store.finalize("k-terminal", 1, LedgerState.COMMITTED, {"ok": True}, None)
+
+    # Nothing is stale yet.
+    assert clock_store.stale_inflight(timedelta(seconds=60)) == []
+
+    fake_clock.advance(120)  # both in-flight rows cross the cutoff
+    stale = clock_store.stale_inflight(timedelta(seconds=60))
+    keys = {record.idempotency_key for record in stale}
+    assert keys == {"k-stale", "k-pending"}  # terminal excluded
+
+
+def test_stale_inflight_orders_oldest_first(
+    clock_store: PostgresStore, fake_clock: FakeClock
+) -> None:
+    """Ordered by last_attempt_at so the oldest stale rows recover first."""
+    clock_store.claim("k-old", "a.b", Guarantee.NONE, {}, None)
+    fake_clock.advance(10)
+    clock_store.claim("k-new", "a.b", Guarantee.NONE, {}, None)
+    fake_clock.advance(120)
+    stale = clock_store.stale_inflight(timedelta(seconds=60))
+    assert [record.idempotency_key for record in stale] == ["k-old", "k-new"]
+
+
+def test_bump_epoch_returns_new_epoch_only_while_still_stale_inflight(
+    clock_store: PostgresStore, fake_clock: FakeClock
+) -> None:
+    """bump_epoch is the takeover fence: atomically bump attempts + refresh
+    last_attempt_at, returning the NEW epoch, ONLY while the row is still
+    in-flight AND still stale. Terminal or refreshed -> None."""
+    clock_store.claim("k-bump", "a.b", Guarantee.NONE, {}, None)
+    assert clock_store.mark_executing("k-bump", 1)
+    fake_clock.advance(120)
+
+    # Still stale-in-flight -> new epoch.
+    assert clock_store.bump_epoch("k-bump", timedelta(seconds=60)) == 2
+    loaded = clock_store.load("k-bump")
+    assert loaded is not None
+    assert loaded.attempts == 2
+    assert loaded.last_attempt_at == fake_clock()  # refreshed to now
+
+    # Immediately re-bumping: last_attempt_at == now, so no longer stale -> None.
+    assert clock_store.bump_epoch("k-bump", timedelta(seconds=60)) is None
+
+    # Terminal -> None.
+    fake_clock.advance(120)
+    assert clock_store.finalize("k-bump", 2, LedgerState.COMMITTED, {"ok": True}, None)
+    assert clock_store.bump_epoch("k-bump", timedelta(seconds=60)) is None
+
+
+def test_bump_epoch_fences_the_original_owner(
+    clock_store: PostgresStore, fake_clock: FakeClock
+) -> None:
+    """After bump_epoch the original owner (epoch 1) is fenced: its
+    mark_executing/finalize/record_error all carry WHERE attempts=1 and now
+    match zero rows — it can no longer execute or finalize (PLAN 10 point 2)."""
+    clock_store.claim("k-fenced", "a.b", Guarantee.NONE, {}, None)
+    assert clock_store.mark_executing("k-fenced", 1)
+    fake_clock.advance(120)
+    new_epoch = clock_store.bump_epoch("k-fenced", timedelta(seconds=60))
+    assert new_epoch == 2
+
+    # The original owner at epoch 1 is now fenced on every guarded write.
+    assert not clock_store.finalize("k-fenced", 1, LedgerState.COMMITTED, {"ok": True}, None)
+    assert not clock_store.record_error("k-fenced", 1, {"late": True})
+    # The reconciler at epoch 2 owns resolution.
+    assert clock_store.finalize("k-fenced", 2, LedgerState.COMMITTED, {"won": True}, None)
+    loaded = clock_store.load("k-fenced")
+    assert loaded is not None
+    assert loaded.result_json == {"won": True}

@@ -3,7 +3,7 @@
 Usage::
 
     python -m airlock reconcile --store $DATABASE_URL --import mymodule \
-        [--older-than SECONDS] [--on-absent retry|abort]
+        --execute-timeout SECONDS [--older-than SECONDS] [--on-absent retry|abort]
 
 ``--import`` loads the integrator's module(s) so their
 :func:`airlock.registry.register` calls run BEFORE the sweep — the reconciler
@@ -11,10 +11,17 @@ needs each ``action_type``'s effect/execute/preconditions to recover its rows
 (a row whose action_type is unregistered is left untouched, counted
 ``unregistered``). ``--store`` is a Postgres DSN dispatched through
 :func:`airlock.store.from_url`. ``--older-than`` is the reconcile timeout in
-seconds (the row must be stale by this much); it must exceed the integrator's
-execute timeout (PLAN.md 4.1: ``execute_timeout < reconcile_after``), a bound
-the library asserts via :class:`airlock.reconcile.ExecuteWindow` but the CLI
-cannot know the execute timeout, so it only documents it here.
+seconds (the row must be stale by this much).
+
+``--execute-timeout`` is REQUIRED and load-bearing (PLAN.md 4.1 step 4 / 10
+point 2): it is the operator's assertion of the longest an owner's ``execute``
+can run. The reconciler REFUSES to run unless ``--older-than`` strictly exceeds
+it (validated via :class:`airlock.reconcile.ExecuteWindow` before any scan), so
+a reconciler can never probe a row while its original owner might still be
+legitimately mid-execute — the residual double-execute the epoch fence exists to
+close. The CLI cannot infer this bound, so the operator must state it; a
+misconfigured pair (``--older-than <= --execute-timeout``) exits non-zero
+without touching a single row.
 
 This is a one-shot sweep — the operator schedules it (cron, k8s CronJob). It
 is NOT a daemon: an always-on background loop is explicitly out of P1.3 scope.
@@ -31,7 +38,7 @@ import sys
 from collections.abc import Sequence
 from datetime import timedelta
 
-from airlock.reconcile import OnAbsent, ReconcileReport, reconcile
+from airlock.reconcile import ExecuteWindow, OnAbsent, ReconcileReport, reconcile
 from airlock.store import from_url
 
 __all__ = ["main"]
@@ -78,8 +85,21 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help=(
             "Recover rows whose last attempt is older than this many seconds (the reconcile "
-            "timeout; default 300). MUST exceed your execute timeout (PLAN.md 4.1: "
-            "execute_timeout < reconcile_after)."
+            "timeout; default 300). MUST strictly exceed --execute-timeout (PLAN.md 4.1: "
+            "execute_timeout < reconcile_after); the reconciler refuses to run otherwise."
+        ),
+    )
+    rec.add_argument(
+        "--execute-timeout",
+        type=float,
+        required=True,
+        metavar="SECONDS",
+        help=(
+            "REQUIRED: the longest an owner's execute can run, in seconds (PLAN.md 4.1 step 4). "
+            "--older-than MUST strictly exceed it, or the reconciler refuses to run — this is "
+            "what guarantees an owner is out of execute before its row is recover-eligible, so "
+            "the reconciler never probes a live owner's row (the residual double-execute the "
+            "epoch fence closes)."
         ),
     )
     rec.add_argument(
@@ -109,6 +129,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.older_than <= 0:
         parser.error(f"--older-than must be positive, got {args.older_than}")
+    if args.execute_timeout <= 0:
+        parser.error(f"--execute-timeout must be positive, got {args.execute_timeout}")
+
+    older_than = timedelta(seconds=args.older_than)
+    execute_timeout = timedelta(seconds=args.execute_timeout)
+    # Refuse a misconfigured window BEFORE importing modules / opening the store
+    # / scanning a single row (PLAN.md 4.1: execute_timeout < reconcile_after).
+    # ExecuteWindow.__post_init__ raises ValueError on older_than <= execute_timeout.
+    try:
+        ExecuteWindow(execute_timeout=execute_timeout, reconcile_after=older_than)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     for module_name in args.imports:
         try:
@@ -124,8 +156,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         report = reconcile(
             store,
-            older_than=timedelta(seconds=args.older_than),
+            older_than=older_than,
             on_absent=OnAbsent(args.on_absent),
+            execute_timeout=execute_timeout,
         )
     finally:
         close = getattr(store, "close", None)

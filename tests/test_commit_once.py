@@ -7,6 +7,10 @@ timing; where these tests need "later", they drive the ledger directly.
 
 from __future__ import annotations
 
+import threading
+from datetime import timedelta
+from typing import Any
+
 import pytest
 from pydantic import JsonValue
 from sqlalchemy import create_engine, text
@@ -14,10 +18,11 @@ from sqlalchemy.engine import Engine
 
 from airlock.commit import commit_once
 from airlock.effects import Effect
-from airlock.errors import CommitWaitTimeout
+from airlock.errors import CommitWaitTimeout, ExecuteTimeout
+from airlock.reconcile import OnAbsent
 from airlock.store.postgres import PostgresStore, normalize_postgres_url
 from airlock.types import Guarantee, LedgerState, Verification
-from tests.conftest import EffectsLog, bump_epoch
+from tests.conftest import EffectsLog, FakeClock, bump_epoch
 
 ARGS = {"invoice": "inv_42", "amount": "12.50"}
 
@@ -399,3 +404,192 @@ def test_rejects_nonpositive_timeouts(store: PostgresStore) -> None:
                 args_json={},
                 **kwargs,  # type: ignore[arg-type]
             )
+
+
+# ---------------------------------------------------------------------------
+# execute_timeout — the enforced execute-window bound (PLAN.md 4.1 step 4 / 10.2).
+# ---------------------------------------------------------------------------
+
+
+def test_execute_timeout_requires_reconcile_after(store: PostgresStore) -> None:
+    """execute_timeout is meaningless without the reconcile timeout it must be
+    less than (PLAN.md 4.1): passing it alone is refused before anything runs."""
+    with pytest.raises(ValueError, match="requires reconcile_after"):
+        commit_once(
+            store,
+            key="k-et-noreconc",
+            action_type="a.b",
+            execute=lambda dk: pytest.fail("must not execute"),
+            effect=VERIFIABLE_EFFECT,
+            args_json=ARGS,
+            execute_timeout=timedelta(seconds=10),
+        )
+
+
+def test_execute_timeout_must_be_less_than_reconcile_after(store: PostgresStore) -> None:
+    """The enforced ordering execute_timeout < reconcile_after: an equal or
+    larger execute_timeout is refused (an owner could still be executing when its
+    row is recover-eligible — the double-execute the window closes)."""
+    for et in (timedelta(seconds=60), timedelta(seconds=90)):
+        with pytest.raises(ValueError, match="execute_timeout must be < reconcile_after"):
+            commit_once(
+                store,
+                key="k-et-order",
+                action_type="a.b",
+                execute=lambda dk: pytest.fail("must not execute"),
+                effect=VERIFIABLE_EFFECT,
+                args_json=ARGS,
+                reconcile_after=timedelta(seconds=60),
+                execute_timeout=et,
+            )
+
+
+def test_execute_timeout_abandons_and_leaves_row_executing(
+    clock_store: PostgresStore, db: Engine, effects: EffectsLog
+) -> None:
+    """A slow execute that overruns execute_timeout is ABANDONED: commit_once
+    raises ExecuteTimeout, records the timeout as evidence, and leaves the row
+    'executing' for the reconciler (PLAN.md 4.1 step 4). The owner is out of
+    execute before its row is recover-eligible."""
+    key = "k-et-abandon"
+    release = threading.Event()
+    entered = threading.Event()
+
+    def execute(downstream_key: str | None) -> JsonValue:
+        entered.set()
+        release.wait()  # never set within the window -> deterministic overrun
+        return {"late": True}
+
+    with pytest.raises(ExecuteTimeout) as excinfo:
+        commit_once(
+            clock_store,
+            key=key,
+            action_type="refund.create",
+            execute=execute,
+            effect=VERIFIABLE_EFFECT,
+            args_json=ARGS,
+            reconcile_after=timedelta(seconds=60),
+            execute_timeout=timedelta(seconds=0.2),
+        )
+    assert excinfo.value.key == key
+    assert entered.is_set()  # execute really started
+    row = store_load_row(db, key)
+    assert row.state == LedgerState.EXECUTING.value  # left for the reconciler
+    assert row.committed_at is None
+    assert row.error_json["type"] == "ExecuteTimeout"
+    release.set()  # let the abandoned daemon thread unwind
+
+
+# ---------------------------------------------------------------------------
+# Inline-targeted recovery — a loser on a STALE row reconciles inline (PLAN 4.2).
+# ---------------------------------------------------------------------------
+
+
+def test_loser_on_stale_row_reconciles_inline_and_returns_recovered_outcome(
+    clock_store: PostgresStore, fake_clock: FakeClock, db: Engine, effects: EffectsLog
+) -> None:
+    """The PRIMARY inline-targeted model (PLAN.md 4.2): a commit_once loser that
+    hits a stale in-flight row runs targeted verify-first reconciliation for that
+    key and RETURNS the recovered terminal outcome — never blind-re-executing,
+    never just raising CommitWaitTimeout. Here the pre-crash effect landed and
+    the probe confirms PRESENT, so the loser recovers 'committed' inline."""
+    key = "k-inline-present"
+    action_type = "refund.create"
+    # A crashed owner left the row executing at epoch 1 with the effect applied.
+    clock_store.claim(key, action_type, Guarantee.VERIFIABLE, ARGS, None)
+    assert clock_store.mark_executing(key, 1)
+    effects.log(key)  # the effect happened before the (simulated) crash
+    fake_clock.advance(120)  # the row is now stale past reconcile_after
+
+    def verify(**_: Any) -> tuple[Verification, dict[str, str]]:
+        return Verification.PRESENT, {"refund_id": "re_recovered"}
+
+    outcome = commit_once(
+        clock_store,
+        key=key,
+        action_type=action_type,
+        execute=lambda dk: pytest.fail("verify-present recovery must NOT re-execute"),
+        effect=Effect(verify=verify),
+        args_json=ARGS,
+        reconcile_after=timedelta(seconds=60),
+        now_fn=fake_clock,
+        wait=False,
+    )
+    # The loser returns the RECOVERED terminal outcome, not a timeout.
+    assert outcome.state is LedgerState.COMMITTED
+    assert outcome.result == {"refund_id": "re_recovered"}
+    assert effects.count(key) == 1  # never re-executed
+    row = store_load_row(db, key)
+    assert row.state == LedgerState.COMMITTED.value
+    assert row.attempts == 2  # recovered under the reconciler's bumped epoch
+
+
+def test_loser_on_stale_pending_row_retries_inline_exactly_once(
+    clock_store: PostgresStore, fake_clock: FakeClock, db: Engine, effects: EffectsLog
+) -> None:
+    """A loser on a stale PENDING row (provably effect-free) with on_absent=RETRY
+    re-runs the execute path inline exactly once and returns 'committed' — the
+    inline path drives recovery, not just verification."""
+    key = "k-inline-pending-retry"
+    action_type = "refund.create"
+    clock_store.claim(key, action_type, Guarantee.VERIFIABLE, ARGS, None)  # stays pending
+    fake_clock.advance(120)
+
+    def execute(downstream_key: str | None) -> JsonValue:
+        effects.log(key)
+        return {"refund_id": "re_inline"}
+
+    outcome = commit_once(
+        clock_store,
+        key=key,
+        action_type=action_type,
+        execute=execute,
+        effect=VERIFIABLE_EFFECT,
+        args_json=ARGS,
+        reconcile_after=timedelta(seconds=60),
+        on_absent=OnAbsent.RETRY,
+        now_fn=fake_clock,
+        wait=False,
+    )
+    assert outcome.state is LedgerState.COMMITTED
+    assert effects.count(key) == 1  # executed once, during inline recovery
+    assert store_load_row(db, key).attempts > 1
+
+
+def test_loser_without_reconcile_after_still_times_out(
+    clock_store: PostgresStore, fake_clock: FakeClock, effects: EffectsLog
+) -> None:
+    """Without reconcile_after the P1.1 behavior is unchanged: a loser on a stale
+    row does NOT reconcile inline — it raises CommitWaitTimeout (recover via the
+    CLI/startup sweep). The dead-param regression the review flagged is closed by
+    the positive tests above; this pins that opting OUT still works."""
+    key = "k-inline-optout"
+    action_type = "refund.create"
+    clock_store.claim(key, action_type, Guarantee.VERIFIABLE, ARGS, None)
+    assert clock_store.mark_executing(key, 1)
+    fake_clock.advance(120)
+
+    with pytest.raises(CommitWaitTimeout):
+        commit_once(
+            clock_store,
+            key=key,
+            action_type=action_type,
+            execute=lambda dk: pytest.fail("must not execute"),
+            effect=VERIFIABLE_EFFECT,
+            args_json=ARGS,
+            now_fn=fake_clock,
+            wait=False,  # no reconcile_after -> no inline recovery
+        )
+    assert effects.count(key) == 0
+
+
+def store_load_row(db: Engine, key: str) -> Any:
+    """Read a commit_records row from a fresh connection (durability check)."""
+    with db.connect() as conn:
+        return conn.execute(
+            text(
+                "SELECT state, attempts, result_json, error_json, committed_at"
+                " FROM commit_records WHERE idempotency_key = :key"
+            ),
+            {"key": key},
+        ).one()

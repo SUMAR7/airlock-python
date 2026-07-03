@@ -28,8 +28,15 @@ is bumped and the original owner is fenced: its ``mark_executing`` /
 so it can no longer execute or finalize (PLAN.md section 10 point 2). The
 residual race — the reconciler probes ``absent`` while a slow owner is
 mid-execute — is bounded by the enforced ``execute_timeout < reconcile_after``
-ordering (PLAN.md 4.1; :data:`ExecuteWindow` documents and checks it) and
-covered by the named slow-owner race test.
+ordering (PLAN.md 4.1): :func:`reconcile` / :func:`reconcile_key` take an
+``execute_timeout`` and validate it ``< older_than`` via :class:`ExecuteWindow`
+BEFORE scanning (a misconfigured window is refused with ``ValueError``, never
+run), and ``commit_once`` bounds each owner's ``execute`` by the same timeout so
+an owner is provably out of ``execute`` before its row is recover-eligible. Both
+halves are covered by the named slow-owner race test
+(``tests/test_reconcile_race.py``, ``@pytest.mark.race``): a live owner blocked
+inside ``execute`` while a reconciler bumps the epoch and retries yields exactly
+one effect, and the fenced owner's ``finalize`` matches zero rows.
 
 **The recovery table (PLAN.md 4.2), dispatched on (state, guarantee):**
 
@@ -217,11 +224,29 @@ class ExecuteWindow:
             )
 
 
+def _enforce_execute_window(older_than: timedelta, execute_timeout: timedelta | None) -> None:
+    """Assert ``execute_timeout < older_than`` before scanning (PLAN.md 4.1/10.2).
+
+    This is the runtime enforcement of the residual-race mitigation: a
+    reconciler must never scan (and therefore never probe/retry) a row while its
+    original owner might still be legitimately mid-execute. Constructing an
+    :class:`ExecuteWindow` runs its ``__post_init__`` ordering check, which
+    raises ``ValueError`` on a misconfigured (``older_than <= execute_timeout``)
+    pair — so a bad configuration is refused BEFORE any recovery I/O, never after
+    a wrong retry. ``execute_timeout=None`` means the caller has not supplied the
+    bound (e.g. an in-process sweep whose owners it controls); the check is
+    skipped, exactly as before this parameter existed.
+    """
+    if execute_timeout is not None:
+        ExecuteWindow(execute_timeout=execute_timeout, reconcile_after=older_than)
+
+
 def reconcile(
     store: Any,
     *,
     older_than: timedelta,
     on_absent: OnAbsent = OnAbsent.ABORT,
+    execute_timeout: timedelta | None = None,
     now_fn: Callable[[], datetime] = _utcnow,
     registry: Registry | None = None,
 ) -> ReconcileReport:
@@ -241,12 +266,18 @@ def reconcile(
         older_than: the reconcile timeout == ``reconcile_after``. A row is
             recoverable only once its ``last_attempt_at`` is older than
             ``now_fn() - older_than`` (SPEC.md section 5: the ONLY recovery
-            trigger). Enforce ``execute_timeout < older_than`` via
-            :class:`ExecuteWindow`.
+            trigger).
         on_absent: :class:`OnAbsent` — retry or abort a provably-absent /
             effect-free row. Default ``ABORT`` (fail safe: recovery that
             cannot prove the world unchanged should not re-execute; the
             operator opts INTO retry).
+        execute_timeout: the owner's execute timeout. When given, it is
+            validated ``execute_timeout < older_than`` via
+            :class:`ExecuteWindow` BEFORE the scan (PLAN.md 4.1/10.2: a
+            misconfigured window that lets a reconciler probe a live owner's
+            row is refused with ``ValueError``, never silently run). ``None``
+            skips the check (the caller vouches for the ordering — e.g. a
+            controlled in-process sweep).
         now_fn: the fake/real clock, shared with the store. Used to timestamp
             escalation/recovery evidence.
         registry: the :class:`Registry` mapping ``action_type`` to its
@@ -256,7 +287,12 @@ def reconcile(
     Returns:
         A :class:`ReconcileReport` — counts per :class:`Outcome` plus the
         per-key :class:`ReconcileAction` list.
+
+    Raises:
+        ValueError: ``execute_timeout`` is given and is not strictly less than
+            ``older_than`` (the enforced ordering, PLAN.md 4.1).
     """
+    _enforce_execute_window(older_than, execute_timeout)
     reg = registry if registry is not None else default_registry
     report = ReconcileReport()
     for record in store.stale_inflight(older_than):
@@ -278,6 +314,7 @@ def reconcile_key(
     *,
     older_than: timedelta,
     on_absent: OnAbsent = OnAbsent.ABORT,
+    execute_timeout: timedelta | None = None,
     now_fn: Callable[[], datetime] = _utcnow,
     registry: Registry | None = None,
 ) -> ReconcileAction | None:
@@ -289,7 +326,16 @@ def reconcile_key(
     and can return the recovered outcome. Returns the :class:`ReconcileAction`,
     or ``None`` if the row is absent / no longer stale-in-flight / already
     taken over (``bump_epoch`` returns ``None``).
+
+    ``execute_timeout`` is enforced ``< older_than`` exactly as in
+    :func:`reconcile` (PLAN.md 4.1): the same window bound holds whether the
+    reconciler sweeps or a ``commit_once`` loser targets one key.
+
+    Raises:
+        ValueError: ``execute_timeout`` is given and is not strictly less than
+            ``older_than``.
     """
+    _enforce_execute_window(older_than, execute_timeout)
     reg = registry if registry is not None else default_registry
     record = store.load(key)
     if record is None or record.state not in _IN_FLIGHT:
@@ -312,6 +358,7 @@ def reconcile_on_startup(
     *,
     older_than: timedelta,
     on_absent: OnAbsent = OnAbsent.ABORT,
+    execute_timeout: timedelta | None = None,
     now_fn: Callable[[], datetime] = _utcnow,
     registry: Registry | None = None,
 ) -> ReconcileReport:
@@ -321,9 +368,15 @@ def reconcile_on_startup(
     stranded by the previous process's crash. It is exactly one
     :func:`reconcile` pass — NOT a daemon, NOT a background thread (both out of
     P1.3 scope). Callers who want continuous recovery run the CLI on a cron.
+    ``execute_timeout`` is forwarded and enforced as in :func:`reconcile`.
     """
     return reconcile(
-        store, older_than=older_than, on_absent=on_absent, now_fn=now_fn, registry=registry
+        store,
+        older_than=older_than,
+        on_absent=on_absent,
+        execute_timeout=execute_timeout,
+        now_fn=now_fn,
+        registry=registry,
     )
 
 

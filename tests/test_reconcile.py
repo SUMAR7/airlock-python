@@ -21,7 +21,7 @@ import pytest
 from pydantic import JsonValue
 
 from airlock.effects import Effect
-from airlock.reconcile import ExecuteWindow, OnAbsent, Outcome, reconcile
+from airlock.reconcile import ExecuteWindow, OnAbsent, Outcome, reconcile, reconcile_key
 from airlock.registry import Registry
 from airlock.types import Guarantee, LedgerState, Verification
 from tests.conftest import EffectsLog, FakeClock, read_row
@@ -81,6 +81,47 @@ def test_execute_window_enforces_ordering() -> None:
         ExecuteWindow(execute_timeout=timedelta(seconds=90), reconcile_after=timedelta(seconds=60))
     with pytest.raises(ValueError, match="positive"):
         ExecuteWindow(execute_timeout=timedelta(0), reconcile_after=timedelta(seconds=60))
+
+
+def test_reconcile_refuses_misconfigured_execute_window(
+    clock_store: PostgresStore, fake_clock: FakeClock, db: Engine
+) -> None:
+    """The ExecuteWindow ordering is enforced in the RUNTIME path, not just the
+    dataclass: reconcile()/reconcile_key() given an execute_timeout that is not
+    strictly less than older_than raise ValueError BEFORE scanning a single row
+    (PLAN.md 4.1/10.2 — an operator who sets --older-than <= their execute
+    timeout gets a refusal, never a reconciler that probes live in-flight rows).
+    """
+    reg = Registry()
+    reg.register(ACTION, Effect(verify=lambda **_: (Verification.PRESENT, None)), _never)
+    # Seed a stale row that WOULD be recovered if the window check did not fire.
+    _seed_crashed(
+        clock_store, "k-badwin", state=LedgerState.EXECUTING, guarantee=Guarantee.VERIFIABLE
+    )
+    fake_clock.advance(120)
+
+    for exec_to in (timedelta(seconds=60), timedelta(seconds=90)):  # == and > older_than
+        with pytest.raises(ValueError, match="reconcile_after"):
+            reconcile(
+                clock_store,
+                older_than=OLDER_THAN,
+                execute_timeout=exec_to,
+                now_fn=fake_clock,
+                registry=reg,
+            )
+        with pytest.raises(ValueError, match="reconcile_after"):
+            reconcile_key(
+                clock_store,
+                "k-badwin",
+                older_than=OLDER_THAN,
+                execute_timeout=exec_to,
+                now_fn=fake_clock,
+                registry=reg,
+            )
+    # The row is untouched: the refusal happened before any recovery I/O
+    # (_never would have raised if execute ran; the probe never ran either).
+    assert read_row(db, "k-badwin").state == LedgerState.EXECUTING.value
+    assert read_row(db, "k-badwin").attempts == 1  # epoch NOT bumped
 
 
 # ---------------------------------------------------------------------------

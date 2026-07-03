@@ -104,3 +104,14 @@ jobs:
             echo "--- concurrency run $i/10"
             uv run pytest -m concurrency || exit 1
           done
+
+      # P1.3 DoD: the slow-owner-vs-reconciler epoch-fence race test must pass
+      # under REPEATED runs — an intermittent failure here is a live P0 race
+      # (SPEC section 9). The determinism gate PLAN.md 7 requires runs the
+      # race-marked tests, not just concurrency.
+      - name: Race suite x10
+        run: |
+          for i in $(seq 1 10); do
+            echo "--- race run $i/10"
+            uv run pytest -m race || exit 1
+          done

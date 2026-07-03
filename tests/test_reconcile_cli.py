@@ -70,6 +70,8 @@ def test_cli_reconciles_a_stale_row_present_probe_commits(
             "tests._cli_integrator",
             "--older-than",
             "60",
+            "--execute-timeout",
+            "10",
         ]
     )
     assert exit_code == 0
@@ -81,24 +83,87 @@ def test_cli_reconciles_a_stale_row_present_probe_commits(
 def test_cli_no_stale_rows_reports_nothing_to_do(
     store: PostgresStore, db: Engine, database_url: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    exit_code = main(["reconcile", "--store", database_url, "--import", "tests._cli_integrator"])
+    exit_code = main(
+        [
+            "reconcile",
+            "--store",
+            database_url,
+            "--import",
+            "tests._cli_integrator",
+            "--execute-timeout",
+            "10",
+        ]
+    )
     assert exit_code == 0
     assert "no stale in-flight rows" in capsys.readouterr().out
 
 
 def test_cli_rejects_nonpositive_older_than(database_url: str) -> None:
     with pytest.raises(SystemExit):
-        main(["reconcile", "--store", database_url, "--older-than", "0"])
+        main(["reconcile", "--store", database_url, "--older-than", "0", "--execute-timeout", "10"])
+
+
+def test_cli_requires_execute_timeout(database_url: str) -> None:
+    """PLAN.md 4.1: the CLI cannot infer the execute timeout, so it REFUSES to
+    run without the operator supplying it — the bound it validates --older-than
+    against (finding #6: 'make the CLI refuse to run without an
+    operator-supplied execute-timeout')."""
+    with pytest.raises(SystemExit):
+        main(["reconcile", "--store", database_url, "--import", "tests._cli_integrator"])
+
+
+def test_cli_refuses_older_than_not_exceeding_execute_timeout(
+    database_url: str,
+) -> None:
+    """--older-than MUST strictly exceed --execute-timeout, or the reconciler
+    refuses to run (PLAN.md 4.1: execute_timeout < reconcile_after) — a
+    misconfigured window that would let the reconciler probe a live owner's row
+    exits non-zero WITHOUT scanning."""
+    for older, exec_to in [("10", "10"), ("10", "30")]:
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    "reconcile",
+                    "--store",
+                    database_url,
+                    "--import",
+                    "tests._cli_integrator",
+                    "--older-than",
+                    older,
+                    "--execute-timeout",
+                    exec_to,
+                ]
+            )
 
 
 def test_cli_reports_bad_import(database_url: str) -> None:
     with pytest.raises(SystemExit):
-        main(["reconcile", "--store", database_url, "--import", "does.not.exist"])
+        main(
+            [
+                "reconcile",
+                "--store",
+                database_url,
+                "--import",
+                "does.not.exist",
+                "--execute-timeout",
+                "10",
+            ]
+        )
 
 
 def test_cli_reports_bad_store_dsn() -> None:
     with pytest.raises(SystemExit):
-        main(["reconcile", "--store", "not-a-dsn", "--import", "tests._cli_integrator"])
+        main(
+            [
+                "reconcile",
+                "--store",
+                "not-a-dsn",
+                "--import",
+                "tests._cli_integrator",
+                "--execute-timeout",
+                "10",
+            ]
+        )
 
 
 def test_cli_requires_a_subcommand() -> None:

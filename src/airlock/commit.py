@@ -39,6 +39,7 @@ import json
 import time
 import warnings
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from pydantic import JsonValue
@@ -51,10 +52,16 @@ from airlock.errors import (
     CommitWaitTimeout,
     VerificationUnknown,
 )
+from airlock.reconcile import OnAbsent, reconcile_key
+from airlock.registry import Registry
 from airlock.store import Store
 from airlock.types import CommitOutcome, CommitRecord, Guarantee, LedgerState, Verification
 
 __all__ = ["commit_once"]
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 #: Action types already warned about at-most-once degradation (per process).
 _at_most_once_warned: set[str] = set()
@@ -72,6 +79,9 @@ def commit_once(
     wait: bool = True,
     wait_timeout: float = 30.0,
     poll_interval: float = 0.05,
+    reconcile_after: timedelta | None = None,
+    on_absent: OnAbsent = OnAbsent.ABORT,
+    now_fn: Callable[[], datetime] = _utcnow,
 ) -> CommitOutcome:
     """Execute ``execute(downstream_key)`` at most once per ``key``.
 

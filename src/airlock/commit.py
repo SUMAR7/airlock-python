@@ -52,8 +52,7 @@ from airlock.errors import (
     CommitWaitTimeout,
     VerificationUnknown,
 )
-from airlock.reconcile import OnAbsent, reconcile_key
-from airlock.registry import Registry
+from airlock.reconcile import OnAbsent
 from airlock.store import Store
 from airlock.types import CommitOutcome, CommitRecord, Guarantee, LedgerState, Verification
 
@@ -62,6 +61,7 @@ __all__ = ["commit_once"]
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
 
 #: Action types already warned about at-most-once degradation (per process).
 _at_most_once_warned: set[str] = set()

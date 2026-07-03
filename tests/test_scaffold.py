@@ -97,5 +97,5 @@ def test_lazy_public_surface() -> None:
 
 
 def test_unknown_attribute_raises() -> None:
-    with pytest.raises(AttributeError, match="no attribute 'reconcile'"):
-        _ = airlock.reconcile
+    with pytest.raises(AttributeError, match="no attribute 'does_not_exist'"):
+        _ = airlock.does_not_exist

@@ -95,12 +95,12 @@ def test_fresh_inflight_row_is_not_reconciled(
     trigger. A row that is NOT yet stale is invisible to the sweep."""
     reg = Registry()
     reg.register(ACTION, Effect(verify=lambda **_: (Verification.PRESENT, None)), _never)
-    _seed_crashed(clock_store, "k-fresh", state=LedgerState.EXECUTING, guarantee=Guarantee.VERIFIABLE)
+    _seed_crashed(
+        clock_store, "k-fresh", state=LedgerState.EXECUTING, guarantee=Guarantee.VERIFIABLE
+    )
 
     fake_clock.advance(30)  # not yet past the 60s timeout
-    report = reconcile(
-        clock_store, older_than=OLDER_THAN, now_fn=fake_clock, registry=reg
-    )
+    report = reconcile(clock_store, older_than=OLDER_THAN, now_fn=fake_clock, registry=reg)
     assert report.total == 0
     assert read_row(db, "k-fresh").state == LedgerState.EXECUTING.value  # untouched
 
@@ -133,7 +133,8 @@ def test_scenario_3_executing_verifiable_present_recovers_committed(
     assert report.count(Outcome.COMMITTED) == 1
     action = report.actions[0]
     assert action.outcome is Outcome.COMMITTED
-    assert action.evidence["reconciled"] == "committed"  # type: ignore[index]
+    assert isinstance(action.evidence, dict)
+    assert action.evidence["reconciled"] == "committed"
 
     assert effects.count(key) == 1  # STILL one effect — never re-executed
     row = read_row(db, key)
@@ -171,7 +172,11 @@ def test_scenario_4_pending_retry_executes_exactly_once(
     fake_clock.advance(120)
 
     report = reconcile(
-        clock_store, older_than=OLDER_THAN, on_absent=OnAbsent.RETRY, now_fn=fake_clock, registry=reg
+        clock_store,
+        older_than=OLDER_THAN,
+        on_absent=OnAbsent.RETRY,
+        now_fn=fake_clock,
+        registry=reg,
     )
     assert report.count(Outcome.RETRIED_COMMITTED) == 1
     assert effects.count(key) == 1  # exactly one effect
@@ -194,7 +199,11 @@ def test_scenario_4_pending_abort_executes_zero_times(
     fake_clock.advance(120)
 
     report = reconcile(
-        clock_store, older_than=OLDER_THAN, on_absent=OnAbsent.ABORT, now_fn=fake_clock, registry=reg
+        clock_store,
+        older_than=OLDER_THAN,
+        on_absent=OnAbsent.ABORT,
+        now_fn=fake_clock,
+        registry=reg,
     )
     assert report.count(Outcome.ABORTED) == 1
     assert effects.count(key) == 0
@@ -226,7 +235,11 @@ def test_scenario_4_executing_absent_probe_retry_gives_one_effect(
     fake_clock.advance(120)
 
     report = reconcile(
-        clock_store, older_than=OLDER_THAN, on_absent=OnAbsent.RETRY, now_fn=fake_clock, registry=reg
+        clock_store,
+        older_than=OLDER_THAN,
+        on_absent=OnAbsent.RETRY,
+        now_fn=fake_clock,
+        registry=reg,
     )
     assert report.count(Outcome.RETRIED_COMMITTED) == 1
     assert effects.count(key) == 1  # ran once during recovery
@@ -245,7 +258,11 @@ def test_scenario_4_executing_absent_probe_abort_gives_zero_effects(
     fake_clock.advance(120)
 
     report = reconcile(
-        clock_store, older_than=OLDER_THAN, on_absent=OnAbsent.ABORT, now_fn=fake_clock, registry=reg
+        clock_store,
+        older_than=OLDER_THAN,
+        on_absent=OnAbsent.ABORT,
+        now_fn=fake_clock,
+        registry=reg,
     )
     assert report.count(Outcome.ABORTED) == 1
     assert effects.count(key) == 0
@@ -461,7 +478,11 @@ def test_preconditions_changed_on_retry_aborts_zero_effects(
     fake_clock.advance(120)
 
     report = reconcile(
-        clock_store, older_than=OLDER_THAN, on_absent=OnAbsent.RETRY, now_fn=fake_clock, registry=reg
+        clock_store,
+        older_than=OLDER_THAN,
+        on_absent=OnAbsent.RETRY,
+        now_fn=fake_clock,
+        registry=reg,
     )
     assert report.count(Outcome.ABORTED) == 1
     assert effects.count(key) == 0
@@ -514,7 +535,11 @@ def test_reexecute_that_raises_escalates_and_leaves_executing(
     fake_clock.advance(120)
 
     report = reconcile(
-        clock_store, older_than=OLDER_THAN, on_absent=OnAbsent.RETRY, now_fn=fake_clock, registry=reg
+        clock_store,
+        older_than=OLDER_THAN,
+        on_absent=OnAbsent.RETRY,
+        now_fn=fake_clock,
+        registry=reg,
     )
     assert report.count(Outcome.ESCALATED) == 1
     row = read_row(db, key)
@@ -540,13 +565,19 @@ def test_reexecute_post_verify_absent_lands_failed(
         return {"claimed": True}
 
     reg = Registry()
-    reg.register(ACTION, Effect(verify=lambda **_: (Verification.ABSENT, {"found": "nothing"})), execute)
+    reg.register(
+        ACTION, Effect(verify=lambda **_: (Verification.ABSENT, {"found": "nothing"})), execute
+    )
 
     _seed_crashed(clock_store, key, state=LedgerState.PENDING, guarantee=Guarantee.VERIFIABLE)
     fake_clock.advance(120)
 
     report = reconcile(
-        clock_store, older_than=OLDER_THAN, on_absent=OnAbsent.RETRY, now_fn=fake_clock, registry=reg
+        clock_store,
+        older_than=OLDER_THAN,
+        on_absent=OnAbsent.RETRY,
+        now_fn=fake_clock,
+        registry=reg,
     )
     assert report.count(Outcome.FAILED) == 1
     row = read_row(db, key)
@@ -615,7 +646,11 @@ def test_batch_mixed_rows_each_recovered_once(
 
     fake_clock.advance(120)
     report = reconcile(
-        clock_store, older_than=OLDER_THAN, on_absent=OnAbsent.ABORT, now_fn=fake_clock, registry=reg
+        clock_store,
+        older_than=OLDER_THAN,
+        on_absent=OnAbsent.ABORT,
+        now_fn=fake_clock,
+        registry=reg,
     )
     assert report.count(Outcome.COMMITTED) == 1
     assert report.count(Outcome.UNKNOWN) == 1

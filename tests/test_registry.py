@@ -24,7 +24,7 @@ def _execute(downstream_key: str | None, **_: Any) -> JsonValue:
 
 def test_register_and_get_roundtrips() -> None:
     reg = Registry()
-    effect = Effect(verify=lambda **_: None)  # type: ignore[arg-type,return-value]
+    effect = Effect(verify=lambda **_: None)  # type: ignore[arg-type]
     preconditions = lambda **_: True  # noqa: E731
     reg.register("act.one", effect, _execute, preconditions)
     got = reg.get("act.one")
@@ -53,7 +53,7 @@ def test_reregister_different_raises() -> None:
     reg = Registry()
     reg.register("act.conflict", Effect(key_param="idempotency_key"), _execute)
     with pytest.raises(ValueError, match="already registered with a different"):
-        reg.register("act.conflict", Effect(verify=lambda **_: None), _execute)  # type: ignore[arg-type,return-value]
+        reg.register("act.conflict", Effect(verify=lambda **_: None), _execute)  # type: ignore[arg-type]
 
 
 def test_empty_action_type_rejected() -> None:

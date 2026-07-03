@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -176,7 +176,11 @@ def test_scenario_3_crash_leaves_executing_then_probe_present_recovers(
 
 @pytest.mark.crash
 def test_scenario_4_crash_before_effect_leaves_pending(
-    db: Engine, database_url: str, effects: EffectsLog, clock_store: PostgresStore, fake_clock: FakeClock
+    db: Engine,
+    database_url: str,
+    effects: EffectsLog,
+    clock_store: PostgresStore,
+    fake_clock: FakeClock,
 ) -> None:
     """crashpoint after_claim: the row is durably 'pending' with ZERO effects
     (the executing marker commits before the effect, so pending is provably

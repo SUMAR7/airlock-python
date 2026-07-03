@@ -7,9 +7,9 @@ constraints match them. Never retype these value lists anywhere else —
 divergence between the API, the DDL, and (later) the event schema was the
 single biggest failure mode found in design review.
 
-P1.1 defines only the types the commit ledger needs. Later phases add the
-rest of the section 3.2 table (Decision, PauseStatus, Reversibility,
-BlastRadius, Money, Verification) to this same module.
+P1.1 defined the commit-ledger types; P1.2 adds ``Verification`` (the probe
+vocabulary). Later phases add the rest of the section 3.2 table (Decision,
+PauseStatus, Reversibility, BlastRadius, Money) to this same module.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ __all__ = [
     "CommitRecord",
     "Guarantee",
     "LedgerState",
+    "Verification",
 ]
 
 
@@ -40,6 +41,24 @@ class Guarantee(StrEnum):
     DOWNSTREAM_IDEMPOTENT = "downstream_idempotent"
     VERIFIABLE = "verifiable"
     NONE = "none"
+
+
+class Verification(StrEnum):
+    """Answer of a post-verify / reconciliation probe: "did this effect happen?"
+
+    - ``present`` — the effect provably took place downstream.
+    - ``absent``  — the effect provably did NOT take place.
+    - ``unknown`` — the probe cannot prove either way; the honest non-answer.
+      The row is never blind-retried on ``unknown`` (ADR-2).
+
+    Used by ``Effect.verify`` (P1.2) and the reconciler's recovery table
+    (P1.3, PLAN.md section 4.2). P2.2's ``action_event.v1`` ``post_verify``
+    field maps onto this vocabulary; single-source enum rules apply.
+    """
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
 
 
 class LedgerState(StrEnum):
@@ -128,11 +147,17 @@ class CommitOutcome(BaseModel):
     ``state`` is always one of ``TERMINAL_LEDGER_STATES``. Duplicate calls for
     the same key receive the identical outcome recorded by whichever call won
     the claim (SPEC.md section 5, rows 1-2).
+
+    ``guarantee`` is the ADR-2 guarantee the action ran under, read back from
+    the ledger row — ``none`` means the action operated at-most-once and the
+    caller is being told so (SPEC.md section 5, scenario 7: the degradation is
+    caller-visible, never hidden).
     """
 
     model_config = ConfigDict(frozen=True)
 
     key: str
     state: LedgerState
+    guarantee: Guarantee
     result: JsonValue = None
     error: JsonValue = None

@@ -13,12 +13,27 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from airlock.commit import commit_once
+from airlock.effects import Effect
 from airlock.errors import CommitWaitTimeout
 from airlock.store.postgres import PostgresStore, normalize_postgres_url
-from airlock.types import Guarantee, LedgerState
+from airlock.types import Guarantee, LedgerState, Verification
 from tests.conftest import EffectsLog, bump_epoch
 
 ARGS = {"invoice": "inv_42", "amount": "12.50"}
+
+
+def _probe_present(**_: object) -> tuple[Verification, None]:
+    """A probe that always confirms the effect (guarantee: verifiable)."""
+    return Verification.PRESENT, None
+
+
+#: A verifiable effect whose probe always answers `present` — the P1.2 stand-in
+#: for the P1.1 tests that stamped Guarantee.VERIFIABLE without a probe.
+VERIFIABLE_EFFECT = Effect(verify=_probe_present)
+
+#: Neither idempotent nor verifiable — at-most-once mode (warned once per
+#: action_type per process; these tests reuse shared action types on purpose).
+OPAQUE_EFFECT = Effect()
 
 
 def _ledger_row_count(db: Engine) -> int:
@@ -46,7 +61,7 @@ def test_scenario_1_sequential_duplicate_returns_first_result(
         key=key,
         action_type="refund.create",
         execute=execute,
-        guarantee=Guarantee.VERIFIABLE,
+        effect=VERIFIABLE_EFFECT,
         args_json=ARGS,
     )
     second = commit_once(
@@ -54,34 +69,38 @@ def test_scenario_1_sequential_duplicate_returns_first_result(
         key=key,
         action_type="refund.create",
         execute=execute,
-        guarantee=Guarantee.VERIFIABLE,
+        effect=VERIFIABLE_EFFECT,
         args_json=ARGS,
     )
 
     assert first.state is LedgerState.COMMITTED
     assert first.result == {"refund_id": 1}
+    assert first.guarantee is Guarantee.VERIFIABLE
     assert second.state is LedgerState.COMMITTED
     assert second.result == first.result
+    assert second.guarantee is Guarantee.VERIFIABLE
     assert calls == 1
     assert effects.count(key) == 1
     assert _ledger_row_count(db) == 1
 
 
-def test_downstream_key_is_plumbed_verbatim(store: PostgresStore, db: Engine) -> None:
-    """P1.2 seam: downstream_key reaches execute() and the ledger row, underived."""
+def test_downstream_key_defaults_to_ledger_key(store: PostgresStore, db: Engine) -> None:
+    """PLAN 3.4: with key_param set and no map_key, the downstream key IS the
+    ledger key — execute receives it and the row stores it."""
     outcome = commit_once(
         store,
         key="k-downstream",
         action_type="refund.create",
         execute=lambda downstream_key: {"got": downstream_key},
-        guarantee=Guarantee.DOWNSTREAM_IDEMPOTENT,
+        effect=Effect(key_param="idempotency_key"),
         args_json=ARGS,
-        downstream_key="stripe-idem-123",
     )
-    assert outcome.result == {"got": "stripe-idem-123"}
+    assert outcome.result == {"got": "k-downstream"}
+    assert outcome.guarantee is Guarantee.DOWNSTREAM_IDEMPOTENT
     loaded = store.load("k-downstream")
     assert loaded is not None
-    assert loaded.downstream_key == "stripe-idem-123"
+    assert loaded.downstream_key == "k-downstream"
+    assert loaded.guarantee is Guarantee.DOWNSTREAM_IDEMPOTENT
 
 
 def test_execute_raise_leaves_durable_executing_row(
@@ -112,7 +131,7 @@ def test_execute_raise_leaves_durable_executing_row(
             key=key,
             action_type="refund.create",
             execute=execute,
-            guarantee=Guarantee.NONE,
+            effect=OPAQUE_EFFECT,
             args_json=ARGS,
         )
 
@@ -158,7 +177,7 @@ def test_execute_exception_survives_failed_evidence_write(database_url: str, db:
                 key=key,
                 action_type="refund.create",
                 execute=execute,
-                guarantee=Guarantee.NONE,
+                effect=OPAQUE_EFFECT,
                 args_json=ARGS,
             )
         # The secondary failure is attached as a note, not raised in its place.
@@ -190,7 +209,7 @@ def test_precondition_violation_finalizes_aborted(
         action_type="refund.create",
         execute=execute,
         preconditions=lambda: False,
-        guarantee=Guarantee.NONE,
+        effect=OPAQUE_EFFECT,
         args_json=ARGS,
     )
     assert outcome.state is LedgerState.ABORTED
@@ -206,7 +225,7 @@ def test_precondition_violation_finalizes_aborted(
         action_type="refund.create",
         execute=execute,
         preconditions=lambda: True,
-        guarantee=Guarantee.NONE,
+        effect=OPAQUE_EFFECT,
         args_json=ARGS,
     )
     assert duplicate.state is LedgerState.ABORTED
@@ -233,7 +252,7 @@ def test_loser_on_stale_inflight_row_times_out_naming_reconciler(
             key=key,
             action_type="refund.create",
             execute=execute,
-            guarantee=Guarantee.NONE,
+            effect=OPAQUE_EFFECT,
             args_json=ARGS,
             wait_timeout=0.3,
             poll_interval=0.02,
@@ -256,7 +275,7 @@ def test_loser_with_wait_false_raises_immediately(store: PostgresStore) -> None:
             key=key,
             action_type="refund.create",
             execute=lambda dk: pytest.fail("must not execute"),
-            guarantee=Guarantee.NONE,
+            effect=OPAQUE_EFFECT,
             args_json=ARGS,
             wait=False,
         )
@@ -273,7 +292,7 @@ def test_loser_returns_terminal_outcome_even_with_wait_false(store: PostgresStor
         key=key,
         action_type="refund.create",
         execute=lambda dk: pytest.fail("must not execute"),
-        guarantee=Guarantee.NONE,
+        effect=OPAQUE_EFFECT,
         args_json=ARGS,
         wait=False,
     )
@@ -303,7 +322,7 @@ def test_epoch_fence_before_executing_mark_means_no_execute(
             action_type="refund.create",
             execute=execute,
             preconditions=preconditions,
-            guarantee=Guarantee.NONE,
+            effect=OPAQUE_EFFECT,
             args_json=ARGS,
             wait=False,
         )
@@ -332,7 +351,7 @@ def test_epoch_fence_at_finalize_means_no_override(
             key=key,
             action_type="refund.create",
             execute=execute,
-            guarantee=Guarantee.NONE,
+            effect=OPAQUE_EFFECT,
             args_json=ARGS,
             wait=False,
         )
@@ -361,7 +380,7 @@ def test_precondition_fence_falls_back_to_waiting(store: PostgresStore, db: Engi
         action_type="refund.create",
         execute=lambda dk: pytest.fail("must not execute"),
         preconditions=preconditions,
-        guarantee=Guarantee.NONE,
+        effect=OPAQUE_EFFECT,
         args_json=ARGS,
         wait=False,
     )
@@ -376,7 +395,7 @@ def test_rejects_nonpositive_timeouts(store: PostgresStore) -> None:
                 key="k-validate",
                 action_type="a.b",
                 execute=lambda dk: None,
-                guarantee=Guarantee.NONE,
+                effect=OPAQUE_EFFECT,
                 args_json={},
                 **kwargs,  # type: ignore[arg-type]
             )

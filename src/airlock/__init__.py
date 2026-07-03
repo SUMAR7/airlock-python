@@ -12,9 +12,20 @@ from typing import TYPE_CHECKING, Any
 __version__ = "0.0.1"
 
 if TYPE_CHECKING:
+    from airlock._canonical import CANON_VERSION as CANON_VERSION
+    from airlock._canonical import canonical_bytes as canonical_bytes
+    from airlock._canonical import canonical_json as canonical_json
+    from airlock._canonical import decimal_string as decimal_string
     from airlock.commit import commit_once as commit_once
+    from airlock.effects import Effect as Effect
     from airlock.errors import AirlockError as AirlockError
+    from airlock.errors import AtMostOnceWarning as AtMostOnceWarning
+    from airlock.errors import CanonicalizationError as CanonicalizationError
     from airlock.errors import CommitWaitTimeout as CommitWaitTimeout
+    from airlock.errors import VerificationUnknown as VerificationUnknown
+    from airlock.idempotency import build_arg_map as build_arg_map
+    from airlock.idempotency import derive_key as derive_key
+    from airlock.idempotency import namespace_user_key as namespace_user_key
     from airlock.store import Store as Store
     from airlock.store import from_url as from_url
     from airlock.types import Claim as Claim
@@ -22,11 +33,23 @@ if TYPE_CHECKING:
     from airlock.types import CommitRecord as CommitRecord
     from airlock.types import Guarantee as Guarantee
     from airlock.types import LedgerState as LedgerState
+    from airlock.types import Verification as Verification
 
 _EXPORTS: dict[str, str] = {
+    "CANON_VERSION": "airlock._canonical",
+    "canonical_bytes": "airlock._canonical",
+    "canonical_json": "airlock._canonical",
+    "decimal_string": "airlock._canonical",
     "commit_once": "airlock.commit",
+    "Effect": "airlock.effects",
     "AirlockError": "airlock.errors",
+    "AtMostOnceWarning": "airlock.errors",
+    "CanonicalizationError": "airlock.errors",
     "CommitWaitTimeout": "airlock.errors",
+    "VerificationUnknown": "airlock.errors",
+    "build_arg_map": "airlock.idempotency",
+    "derive_key": "airlock.idempotency",
+    "namespace_user_key": "airlock.idempotency",
     "Store": "airlock.store",
     "from_url": "airlock.store",
     "Claim": "airlock.types",
@@ -34,6 +57,7 @@ _EXPORTS: dict[str, str] = {
     "CommitRecord": "airlock.types",
     "Guarantee": "airlock.types",
     "LedgerState": "airlock.types",
+    "Verification": "airlock.types",
 }
 
 __all__ = ["__version__", *sorted(_EXPORTS)]

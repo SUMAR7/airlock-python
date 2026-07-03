@@ -43,6 +43,7 @@ from typing import Any, cast
 
 from pydantic import JsonValue
 
+from airlock._canonical import canonical_json
 from airlock.effects import Effect
 from airlock.errors import (
     AirlockError,
@@ -99,7 +100,10 @@ def commit_once(
             without executing.
         args_json: the canonical arg map (see ``build_arg_map``), persisted
             at claim time for cross-process recovery (PLAN.md section 4.2)
-            and splatted into ``effect.verify`` at post-verify time.
+            and splatted into ``effect.verify`` at post-verify time. Values
+            must lie in the ``airlock-canon-1`` domain (no floats, no
+            over-bound ints, ...) — enforced before the claim, whatever the
+            key's provenance.
         wait: when this call loses to an in-flight row, whether to poll for
             the winner's terminal outcome. ``False`` raises
             ``CommitWaitTimeout`` immediately.
@@ -120,6 +124,12 @@ def commit_once(
             ``effect.guarantee`` is ``none`` (scenario 7 degradation).
 
     Raises:
+        CanonicalizationError: ``args_json`` contains values outside the
+            ``airlock-canon-1`` domain. Raised before anything is durable.
+        AirlockError: the key is already claimed by a DIFFERENT action type —
+            a cross-action key collision that must never be absorbed silently
+            (the other action's outcome would be returned and this action's
+            side effect silently skipped).
         VerificationUnknown: the post-verify probe answered ``unknown`` (or
             itself failed) — the honest non-answer. The row stays
             ``executing`` with the evidence recorded; the P1.3 reconciler
@@ -138,6 +148,17 @@ def commit_once(
     if poll_interval <= 0:
         raise ValueError(f"poll_interval must be > 0, got {poll_interval!r}")
 
+    # args_json is persisted as canonical JSON at claim time (PLAN 4.2/5.1)
+    # and rehydrated by the P1.3 reconciler for verify/preconditions/retry, so
+    # the airlock-canon-1 value domain is enforced HERE, before anything is
+    # durable — regardless of whether the key came from derive_key (which
+    # canonicalizes as a side effect of hashing) or namespace_user_key (which
+    # never sees the args). A float smuggled past the claim would rehydrate as
+    # a float, the probe (written against canonical values — decimal strings)
+    # would answer 'absent' for an effect that happened, and the recovery
+    # table would re-execute: the double-commit the prime directive forbids.
+    canonical_json(dict(args_json))
+
     guarantee = effect.guarantee
     # Derived BEFORE the claim: a broken map_key must fail before anything is
     # durable, and the claim persists exactly the post-map value that execute
@@ -150,6 +171,19 @@ def commit_once(
     # Step 1 — claim, committed in its own transaction before anything runs.
     claim = store.claim(key, action_type, guarantee, args_json, downstream_key)
     if not claim.won:
+        if claim.record.action_type != action_type:
+            # Belt-and-braces under ADR-1: key derivation/namespacing makes
+            # cross-action-type key collisions impossible, but silently
+            # returning ANOTHER action's outcome (and never executing this
+            # one) would be a lost side effect plus a ledger that "proves"
+            # the wrong thing — so any residual collision fails loudly.
+            raise AirlockError(
+                f"idempotency key {key!r} is already claimed by action type "
+                f"{claim.record.action_type!r}, but this call is for action type "
+                f"{action_type!r} — two different actions derived the same ledger key. "
+                "Refusing to return the other action's outcome; fix the key derivation "
+                "or override (contracts/idempotency.md §4)."
+            )
         if claim.record.state.is_terminal:
             # Scenario 1: duplicate call returns the recorded outcome.
             return _outcome_from(claim.record)
@@ -228,10 +262,19 @@ def commit_once(
 
 
 def _warn_at_most_once(action_type: str) -> None:
-    """Warn (once per action type per process) about at-most-once mode."""
+    """Warn (once per action type per process) about at-most-once mode.
+
+    The action type is registered only AFTER ``warnings.warn`` returns
+    normally: under ``-W error::airlock.AtMostOnceWarning`` (the strict-mode
+    escalation the ``errors.py`` docstring recommends) the warn call raises,
+    so EVERY subsequent call for the action type must re-warn and re-raise —
+    registering first would disarm strict mode after its first sighting and
+    let a retry loop execute the unverifiable effect ops believed was blocked
+    (SPEC section 5, scenario 7). When the warning is merely displayed or
+    logged, the once-per-process dedup is unchanged.
+    """
     if action_type in _at_most_once_warned:
         return
-    _at_most_once_warned.add(action_type)
     warnings.warn(
         AtMostOnceWarning(
             f"action type {action_type!r} runs AT-MOST-ONCE: its Effect has neither "
@@ -244,6 +287,7 @@ def _warn_at_most_once(action_type: str) -> None:
         ),
         stacklevel=3,
     )
+    _at_most_once_warned.add(action_type)
 
 
 def _post_verify(
@@ -289,8 +333,16 @@ def _post_verify(
             "evidence": _json_safe(evidence),
         }
         # Two epoch-guarded writes; a fenced (or crashed-between) record_error
-        # leaves evidence resolution to whoever owns the row.
-        store.record_error(key, epoch, error_payload)
+        # leaves evidence resolution to whoever owns the row. A record_error
+        # that RAISES (transient infrastructure failure) must not veto the
+        # truthful terminal state — the probe PROVED absence, so 'failed' is
+        # the honest outcome (PLAN 4.1 step 5: absent -> finalize failed); the
+        # evidence still reaches the caller on the outcome, flagged as not
+        # having landed durably.
+        try:
+            store.record_error(key, epoch, error_payload)
+        except Exception as record_exc:
+            error_payload["evidence_write_failed"] = repr(record_exc)
         if store.finalize(key, epoch, LedgerState.FAILED, None, None):
             return CommitOutcome(
                 key=key, state=LedgerState.FAILED, guarantee=guarantee, error=error_payload
@@ -336,10 +388,13 @@ def _json_safe(value: Any) -> JsonValue:
 
     Evidence should be JSON-safe; when it is not, its ``repr`` is recorded
     rather than losing the ledger write (the evidence trail must survive a
-    sloppy probe).
+    sloppy probe). ``allow_nan=False`` is essential: ``json.dumps`` would
+    otherwise certify ``float('nan')``/``inf`` evidence as safe, and the
+    store's JSONB cast would then reject the bare ``NaN`` token — stranding
+    the row ``executing`` on the absent path instead of finalizing ``failed``.
     """
     try:
-        json.dumps(value)
+        json.dumps(value, allow_nan=False)
     except (TypeError, ValueError):
         return repr(value)
     return cast(JsonValue, value)

@@ -100,8 +100,12 @@ def build_arg_map(
     - a ``*args`` parameter appears under its own name as a JSON **list**
       (empty list when nothing extra was passed);
     - ``**kwargs`` entries are merged into the **top level** of the map —
-      that is the shape a TS options-object produces, and a valid Python call
-      can never pass the same name both ways;
+      that is the shape a TS options-object produces. A name bound BOTH ways
+      is representable in Python (a positional-only parameter passed
+      positionally plus a ``**kwargs`` entry of the same name, e.g.
+      ``def f(account, /, **opts)`` called as ``f("a1", account="acme")``),
+      but NOT in the flat arg_map — such calls are rejected loudly rather
+      than silently overwriting one value with the other;
     - ``key_ignore`` names and ``key_param`` are removed — ``key_param`` is
       the kwarg that will *receive* the derived key (``Effect.key_param``),
       so it can never feed back into the derivation.
@@ -160,8 +164,11 @@ def build_arg_map(
                 if extra_name in arg_map:
                     raise ValueError(
                         f"**kwargs entry {extra_name!r} collides with the map entry for "
-                        f"parameter {extra_name!r} — rename one; a silent overwrite would "
-                        "make two different calls derive the same key"
+                        f"parameter {extra_name!r} (a positional-only parameter passed "
+                        "positionally can legally coexist with a same-named **kwargs "
+                        "entry, but the flat arg_map cannot represent both values) — "
+                        "rename the **kwargs entry; a silent overwrite would make two "
+                        "different calls derive the same key"
                     )
                 arg_map[extra_name] = extra_value
         else:
@@ -178,11 +185,26 @@ def namespace_user_key(action_type: str, user_key: str) -> str:
     at a glance which rows carry custom keys (derived keys are 64 lowercase
     hex chars; namespaced overrides contain the action type and a colon).
 
+    For the encoding to be injective the FIRST colon must be an unambiguous
+    delimiter, so ``action_type`` must not contain ``:`` — otherwise
+    ``("payment:refund", "order-9")`` and ``("payment", "refund:order-9")``
+    would silently collide and the second action's outcome would be the first
+    action's ledger row (a lost side effect that the ledger "proves" wrong).
+    ``user_key`` may contain colons freely: it is the final segment.
+
     Raises:
-        ValueError: empty ``action_type`` or ``user_key``.
+        ValueError: empty ``action_type`` or ``user_key``, or an
+            ``action_type`` containing ``:``.
     """
     if not action_type:
         raise ValueError("action_type must be a non-empty string")
+    if ":" in action_type:
+        raise ValueError(
+            f"action_type {action_type!r} must not contain ':' — the first colon in a "
+            "namespaced ledger key is the action_type/user_key delimiter; a colon inside "
+            "action_type would let two different actions collide on one ledger key "
+            "(contracts/idempotency.md §4)"
+        )
     if not user_key:
         raise ValueError("user_key must be a non-empty string")
     return f"{action_type}:{user_key}"

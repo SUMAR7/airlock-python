@@ -56,8 +56,12 @@ then normalizes:
 - a variadic-positional parameter (`*args`) appears under its own name as a
   JSON **array** (empty array when nothing extra was passed);
 - variadic-keyword entries (`**kwargs`) are merged into the **top level** of
-  the map (a valid Python call can never pass the same name both as a
-  parameter and inside `**kwargs`);
+  the map. A name bound *both* as a parameter and inside `**kwargs` **is**
+  representable in Python — a positional-only parameter passed positionally
+  plus a same-named `**kwargs` entry, e.g. `def f(account, /, **opts)` called
+  as `f("a1", account="acme")` — but NOT in the flat `arg_map`, so such calls
+  are **rejected loudly** (never silently overwritten: an overwrite would
+  make two different calls derive the same key);
 - names listed in `key_ignore` (volatile arguments) and the effect's
   `key_param` (the argument that *receives* the derived key downstream) are
   **removed** and never feed the derivation.
@@ -98,6 +102,19 @@ encoded UTF-8):
   else literal;
 - no `NaN`/`Infinity` (unrepresentable — see the float rule).
 
+> **Normative — key ordering is by Unicode code point, NOT by UTF-16 code
+> units.** This deviates from RFC 8785 (JCS), which sorts object keys by
+> UTF-16 code units, for keys containing characters above U+FFFF: U+FF61
+> (`｡`) sorts *before* U+10000 by code point but *after* it by UTF-16 units
+> (U+10000 encodes as the surrogate pair D800 DC00). **A JCS library cannot
+> be used as-is for canonicalization — only its string-escaping rules
+> apply.** Pinned fixture (both SDK test suites must reproduce it):
+>
+> ```
+> input:     {"｡": 1, "𐀀": 2}        (keys U+FF61 and U+10000)
+> canonical: {"｡":1,"𐀀":2}           (the U+FF61 key sorts FIRST)
+> ```
+
 Permitted value types — **only** these:
 
 | Type | Rule |
@@ -105,9 +122,9 @@ Permitted value types — **only** these:
 | `null` | as-is |
 | `true` / `false` | as-is |
 | integer | only if \|n\| < 2^53 (exact in IEEE-754 doubles); larger magnitudes are **rejected** — carry them as strings |
-| string | any Unicode string |
+| string | any Unicode string containing **no surrogate code points** (U+D800–U+DFFF): lone surrogates have no UTF-8 encoding (and JS strings hold them freely), so they are **rejected** — in values and in object keys |
 | array | of permitted values |
-| object | string keys only, permitted values |
+| object | string keys only (surrogate-free), permitted values |
 
 **Floats are rejected at serialization time, everywhere.** Money is
 `{"amount": "<decimal-string>", "currency": "<ISO-4217>"}` — never a JSON
@@ -135,6 +152,14 @@ ledger_key = "{action_type}:{user_key}"
 Plain string concatenation with a colon — not hashed — so overrides can
 never collide across action types, and are visually distinguishable from
 derived keys (which are exactly 64 lowercase hex characters).
+
+**`action_type` must not contain `:`.** The first colon in a namespaced
+ledger key is the action_type/user_key delimiter; for the encoding to be
+injective it must be unambiguous, so an `action_type` containing a colon is
+**rejected** (otherwise `("payment:refund", "order-9")` and
+`("payment", "refund:order-9")` would collide on one ledger key and the
+second action would silently receive the first action's outcome).
+`user_key` may contain colons freely: it is the final segment.
 
 ## 5. Collide-and-dedupe (the documented caveat)
 

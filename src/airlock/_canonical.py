@@ -26,9 +26,17 @@ encoded as UTF-8 (``canonical_bytes``), over a *restricted* value domain:
 - **Ints beyond ``2**53 - 1`` in magnitude are rejected**: they are not
   exactly representable as IEEE-754 doubles, so a JS/TS consumer would
   silently corrupt them and break cross-language key parity.
-- Object keys sort by Unicode code point (Python ``str`` ordering — what
-  ``sort_keys=True`` does); non-ASCII characters are emitted literally
-  (``ensure_ascii=False``), so the bytes are their UTF-8 encoding.
+- **Strings must be surrogate-free Unicode**: code points in U+D800-U+DFFF
+  (lone surrogates) have no UTF-8 encoding and are rejected — in values AND
+  in object keys.
+- Object keys sort by **Unicode code point** (Python ``str`` ordering — what
+  ``sort_keys=True`` does), **NOT by UTF-16 code units**. This deviates from
+  RFC 8785 (JCS) for keys containing characters above U+FFFF: e.g. U+FF61
+  sorts *before* U+10000 by code point but *after* it by UTF-16 units (U+10000
+  encodes as the surrogate pair D800 DC00). An off-the-shelf JCS canonicalizer
+  therefore CANNOT be used as-is — only its string-escaping rules apply.
+  Non-ASCII characters are emitted literally (``ensure_ascii=False``), so the
+  bytes are their UTF-8 encoding.
 
 Money rule
 ----------
@@ -111,7 +119,10 @@ def canonical_bytes(value: object) -> bytes:
 def decimal_string(amount: Decimal) -> str:
     """Render a ``Decimal`` as the canonical decimal string for Money amounts.
 
-    Normalization (deterministic — equal Decimals always render identically):
+    Normalization (deterministic — equal Decimals always render identically,
+    **independent of the ambient decimal context**: the rendering is purely
+    textual and never rounds, so no thread-local ``getcontext().prec`` setting
+    can change the output or silently truncate an amount):
 
     - plain fixed-point notation, never scientific (``1E+2`` -> ``"100"``);
     - no trailing fractional zeros (``12.50`` -> ``"12.5"``); trailing-zero
@@ -136,7 +147,37 @@ def decimal_string(amount: Decimal) -> str:
         )
     if amount == 0:
         return "0"
-    return format(amount.normalize(), "f")
+    # format(..., "f") is exact and context-free (Decimal.__format__ without a
+    # precision never consults the thread-local context and never rounds) —
+    # unlike Decimal.normalize(), which rounds to the AMBIENT context precision
+    # and would render the same amount differently across processes/threads,
+    # forking idempotency keys (the double-commit ADR-1 exists to prevent).
+    rendered = format(amount, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered
+
+
+def _reject_surrogates(value: str, path: str) -> None:
+    """Reject strings containing surrogate code points (U+D800-U+DFFF).
+
+    Lone surrogates have no UTF-8 encoding, so ``canonical_bytes`` would be
+    undefined for them (Python raises a raw ``UnicodeEncodeError`` outside the
+    ``CanonicalizationError`` contract; JS strings hold lone surrogates
+    freely, so a TS SDK would silently produce *different* bytes). The
+    canonical string domain is therefore surrogate-free Unicode — see
+    ``/contracts/idempotency.md`` §3.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise CanonicalizationError(
+            f"string at {path} contains surrogate code point(s) "
+            "(U+D800-U+DFFF), which have no UTF-8 encoding — canonical JSON "
+            "strings must be surrogate-free Unicode (airlock-canon-1). "
+            "Surrogateescape'd values (e.g. undecodable filenames from os "
+            "APIs) must be re-encoded before keying."
+        ) from None
 
 
 def _reject_forbidden(value: object, path: str) -> None:
@@ -155,6 +196,7 @@ def _reject_forbidden(value: object, path: str) -> None:
             )
         return
     if isinstance(value, str):
+        _reject_surrogates(value, path)
         return
     if isinstance(value, list):
         for index, item in enumerate(value):
@@ -168,6 +210,7 @@ def _reject_forbidden(value: object, path: str) -> None:
                     f"({type(key).__name__}) — canonical JSON object keys must "
                     "be plain str"
                 )
+            _reject_surrogates(key, f"{path} (object key {key!r})")
             _reject_forbidden(item, f"{path}.{key}")
         return
     if isinstance(value, Decimal):

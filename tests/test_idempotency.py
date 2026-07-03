@@ -13,7 +13,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -73,6 +73,25 @@ def test_action_type_separates_domains() -> None:
 def test_empty_action_type_rejected() -> None:
     with pytest.raises(ValueError, match="non-empty"):
         derive_key("", ARG_MAP)
+
+
+def test_empty_arg_map_key_pinned() -> None:
+    """The no-args key, computed independently: canonical_bytes({}) is b'{}'."""
+    expected = hashlib.sha256(b"airlock/v1" + ACTION.encode("utf-8") + b"{}").hexdigest()
+    assert derive_key(ACTION, {}) == expected
+
+
+def test_key_derivation_is_decimal_context_independent() -> None:
+    """Two processes with different ambient decimal contexts must derive the
+    identical key for the identical Money amount — a context-dependent
+    rendering re-executes the retried action (SPEC section 5, rows 1-2)."""
+    amount = Decimal("1234567.891")
+    with localcontext(Context(prec=5)):
+        key_low_prec = derive_key(ACTION, {"amount": decimal_string(amount)})
+    with localcontext(Context(prec=50)):
+        key_high_prec = derive_key(ACTION, {"amount": decimal_string(amount)})
+    assert key_low_prec == key_high_prec
+    assert key_low_prec == derive_key(ACTION, {"amount": decimal_string(amount)})
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +197,17 @@ def test_var_keyword_collision_with_var_positional_name_is_loud() -> None:
         build_arg_map(fn, ("a", "b"), {"items": "sneaky"})
 
 
+def test_positional_only_param_passed_both_ways_is_loud() -> None:
+    """A positional-only parameter CAN legally coexist with a same-named
+    **kwargs entry (contract §2.1) — but a flat arg_map cannot represent both
+    values, so the call is rejected loudly, never silently overwritten."""
+
+    def charge(account: str, /, **opts: object) -> None: ...
+
+    with pytest.raises(ValueError, match="positional-only"):
+        build_arg_map(charge, ("a1",), {"account": "acme"})
+
+
 # ---------------------------------------------------------------------------
 # derive_key: canonical-domain enforcement
 # ---------------------------------------------------------------------------
@@ -232,6 +262,20 @@ def test_namespace_user_key_rejects_empty_parts() -> None:
         namespace_user_key("", "order-77")
     with pytest.raises(ValueError, match="user_key"):
         namespace_user_key("refund.create", "")
+
+
+def test_namespace_user_key_rejects_colon_in_action_type() -> None:
+    """Injectivity (contract §4): without this, ('payment:refund', 'order-9')
+    and ('payment', 'refund:order-9') both map to 'payment:refund:order-9' —
+    the second action would silently receive the first action's outcome and
+    its side effect would never execute."""
+    with pytest.raises(ValueError, match="must not contain ':'"):
+        namespace_user_key("payment:refund", "order-9")
+
+
+def test_namespace_user_key_allows_colons_in_user_key() -> None:
+    """user_key is the final segment, so its colons are unambiguous."""
+    assert namespace_user_key("payment", "refund:order-9") == "payment:refund:order-9"
 
 
 # ---------------------------------------------------------------------------

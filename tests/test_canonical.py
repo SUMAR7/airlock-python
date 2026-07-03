@@ -7,7 +7,7 @@ tests pin exact output strings and bytes, not just round-trip behavior.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 
 import pytest
 
@@ -82,6 +82,45 @@ def test_non_str_dict_key_rejected() -> None:
         canonical_json({1: "a"})
 
 
+def test_lone_surrogate_in_string_value_rejected() -> None:
+    """Lone surrogates (U+D800-U+DFFF) have no UTF-8 encoding: the canonical
+    string domain is surrogate-free Unicode (contract §3), and the rejection
+    is the contract error naming the path — never a raw UnicodeEncodeError."""
+    with pytest.raises(CanonicalizationError, match=r"surrogate.*U\+D800"):
+        canonical_json({"path": "backup\ud800file"})
+    with pytest.raises(CanonicalizationError, match=r"\$\.nested\.name"):
+        canonical_json({"nested": {"name": "\udfff"}})
+
+
+def test_lone_surrogate_in_object_key_rejected() -> None:
+    with pytest.raises(CanonicalizationError, match="surrogate"):
+        canonical_json({"\udc80": 1})
+
+
+def test_surrogateescaped_os_value_rejected_as_contract_error() -> None:
+    """The practical trigger: an undecodable filename surrogateescape'd by an
+    os API used as an action arg must fail with the declared error surface,
+    not escape canonical_bytes as UnicodeEncodeError."""
+    filename = b"caf\xe9.txt".decode("utf-8", "surrogateescape")
+    with pytest.raises(CanonicalizationError, match="surrogate"):
+        canonical_bytes({"filename": filename})
+
+
+def test_astral_key_ordering_is_code_point_not_utf16() -> None:
+    """Contract §3 normative note: keys sort by Unicode CODE POINT, which
+    diverges from RFC 8785 (JCS, UTF-16 code units) for non-BMP keys — U+FF61
+    sorts before U+10000 by code point but after it by UTF-16 units. Pinned
+    so a future TS SDK cannot satisfy the contract with an off-the-shelf JCS
+    canonicalizer and silently fork keys (cross-language double-commit)."""
+    assert canonical_json({"｡": 1, "\U00010000": 2}) == '{"｡":1,"\U00010000":2}'
+    assert canonical_json({"\U0001d306": 1, "｡": 2}) == '{"｡":2,"\U0001d306":1}'
+
+
+def test_empty_containers_pinned() -> None:
+    assert canonical_json({"a": [], "b": {}}) == '{"a":[],"b":{}}'
+    assert canonical_json({}) == "{}"
+
+
 def test_decimal_rejected_pointing_at_helper() -> None:
     with pytest.raises(CanonicalizationError, match="decimal_string"):
         canonical_json({"amount": Decimal("12.5")})
@@ -134,6 +173,27 @@ def test_decimal_string_normalization(raw: str, expected: str) -> None:
 def test_equal_decimals_always_render_identically() -> None:
     assert decimal_string(Decimal("12.50")) == decimal_string(Decimal("12.5"))
     assert decimal_string(Decimal("1E+2")) == decimal_string(Decimal("100.00"))
+
+
+def test_decimal_string_is_context_independent() -> None:
+    """The rendering must never consult the thread-local decimal context: a
+    library that lowers getcontext().prec (common in financial code) must not
+    change the canonical string — a context-dependent rendering forks
+    idempotency keys across processes, the exact double-commit ADR-1 exists
+    to prevent."""
+    amount = Decimal("1234567.891")
+    with localcontext(Context(prec=5)):
+        squeezed = decimal_string(amount)
+    assert squeezed == decimal_string(amount) == "1234567.891"
+
+
+def test_decimal_string_never_rounds_beyond_default_precision() -> None:
+    """30 significant digits exceed even the DEFAULT context precision (28):
+    the amount must render exactly, never silently round to '1E+28'-ish."""
+    amount = Decimal("10000000000000000000000000000.5")
+    assert decimal_string(amount) == "10000000000000000000000000000.5"
+    with localcontext(Context(prec=5)):
+        assert decimal_string(amount) == "10000000000000000000000000000.5"
 
 
 @pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity"])

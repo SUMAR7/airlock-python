@@ -21,6 +21,13 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from hypothesis import HealthCheck, Phase, settings
+
+# The mechanical no-time.sleep guard (PLAN.md 7 / P1.4): re-exporting the
+# autouse fixture here makes it apply to EVERY test in the suite. Any test whose
+# call stack reaches time.sleep fails loudly — all synchronization must be
+# barriers/events/FakeClock/DB-polling-with-a-deadline. See tests/_no_sleep.py.
+from tests._no_sleep import no_time_sleep  # noqa: F401  (autouse fixture, used by collection)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -30,6 +37,69 @@ if TYPE_CHECKING:
     from airlock.store.postgres import PostgresStore
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/airlock_test")
+
+# ---------------------------------------------------------------------------
+# Hypothesis profiles (PLAN.md 7 / SPEC.md 9 / P1.4 deliverable 4).
+#
+# The property suite (tests/test_property_commit.py) is DB-backed and drives the
+# real ledger/reconciler, so each example is not cheap; the budgets are chosen so
+# the PR CI leg is MINUTES, not tens of minutes (PLAN.md 8).
+#
+# - "ci" (the default here): derandomize=True so a red PR is a REAL bug and never
+#   dice; a fixed, modest max_examples; deadline=None because a DB round-trip per
+#   step legitimately exceeds Hypothesis's default per-example deadline (the
+#   suite's determinism guarantee is the no-time.sleep guard + FakeClock, not a
+#   wall-clock deadline). Explain-phase off to keep output terse.
+# - "dev": a small, RANDOM budget for fast local iteration (each `pytest` run
+#   explores fresh interleavings).
+# - "nightly": documented for a future cron (the cron itself is out of P1.4
+#   scope). It seeds from a run id via HYPOTHESIS_SEED, explores a far larger
+#   max_examples, and prints the failing example blob (print_blob=True) so any
+#   nightly counterexample can be pasted back as a permanent @example regression.
+#   Select it with HYPOTHESIS_PROFILE=nightly (and set HYPOTHESIS_SEED=<run id>).
+#
+# Selection: HYPOTHESIS_PROFILE overrides; otherwise CI (env CI=true) picks "ci",
+# a developer machine picks "dev".
+# ---------------------------------------------------------------------------
+settings.register_profile(
+    "ci",
+    max_examples=150,
+    deadline=None,
+    derandomize=True,
+    print_blob=True,
+    phases=(Phase.explicit, Phase.reuse, Phase.generate, Phase.target, Phase.shrink),
+    suppress_health_check=[
+        HealthCheck.too_slow,
+        HealthCheck.data_too_large,
+        HealthCheck.filter_too_much,
+    ],
+)
+settings.register_profile(
+    "dev",
+    max_examples=40,
+    deadline=None,
+    derandomize=False,
+    suppress_health_check=[
+        HealthCheck.too_slow,
+        HealthCheck.data_too_large,
+        HealthCheck.filter_too_much,
+    ],
+)
+settings.register_profile(
+    "nightly",
+    max_examples=2000,
+    deadline=None,
+    derandomize=False,
+    print_blob=True,
+    suppress_health_check=[
+        HealthCheck.too_slow,
+        HealthCheck.data_too_large,
+        HealthCheck.filter_too_much,
+    ],
+)
+settings.load_profile(
+    os.environ.get("HYPOTHESIS_PROFILE") or ("ci" if os.environ.get("CI") else "dev")
+)
 
 EFFECTS_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS effects_log (

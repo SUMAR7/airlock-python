@@ -1,0 +1,911 @@
+"""The Hypothesis property machine — the core of P1.4 (PLAN.md 7, invariants I1-I5).
+
+A single-threaded :class:`hypothesis.stateful.RuleBasedStateMachine`
+(:class:`CommitMachine`) drives the REAL ledger + reconciler
+(``PostgresStore`` + ``commit_once`` + ``reconcile``) through randomized
+interleavings of propose / duplicate_call / crash_at(boundary) / advance_clock /
+reconcile / restart / slow_owner_fenced_reconcile, mixing all three guarantee
+modes, and asserts the P1.4 invariant subset after EVERY step by diffing the
+real system against a simple in-Python reference model.
+
+**Determinism discipline (PLAN.md 7, the FlakyStrategyDefinition trap).** A
+Hypothesis stateful machine MUST NOT let any draw, ``@precondition``, or
+control-flow decision depend on external (DB) state — replay/shrink re-runs the
+rule sequence and a DB-dependent branch would draw a DIFFERENT rule structure,
+which Hypothesis rejects as flaky. So EVERY branch below is decided from the
+in-Python reference model (``self.model``) alone; the DB is read EXCLUSIVELY
+inside ``@invariant`` methods (which never draw) and inside the fenced-owner
+self-checks of the concurrency rule (which assert, never branch a draw).
+
+**Ground truth is the ``effects_log`` autocommit table, not memory (PLAN.md 7).**
+The quantity I1 bounds — ``effect_count`` — is read back from the shared
+``effects_log`` table on a FRESH autocommit connection, exactly like the
+concurrency suite, so the count is an independent record of real ``execute()``
+side effects rather than a mirror of the code under test. The in-Python
+:class:`_Downstream` stays as the dedup/probe MECHANISM (FakeStripe-style
+downstream_idempotent dedup, the verifiable probe), but every raw effect it
+lands ALSO writes one ``effects_log`` row, and the invariants count THOSE.
+
+**Isolation (PLAN.md 10 — the machine must never collide with another test).**
+Each machine instance mints a UNIQUE action_type prefix (``prop.<uuid>.``) and
+every ledger key / action_type it uses carries that prefix, so its rows are
+globally distinct from every other DB-backed test's rows AND from every other
+Hypothesis example's rows. Cleanup is a SCOPED ``DELETE ... WHERE action_type
+LIKE 'prop.%'`` (never ``TRUNCATE``), and ``_real_rows`` reads ONLY this
+machine's prefix — so the machine can neither truncate nor observe another
+test's rows, and the full ``pytest`` run is collision-free without serializing
+jobs.
+
+**Crash model (PLAN.md 7).** This layer crashes by abruptly DROPPING a
+non-pooled DB connection so Postgres rolls back the open transaction — the
+identical DB-visible outcome to process death, and far faster than a subprocess.
+The ``os._exit``-in-subprocess suite (``test_reconcile_crash.py``,
+``test_crash_sigkill_equivalence.py``) owns the orthogonal "did Python cleanup
+lie" dimension; this layer owns breadth of interleavings. The connection-drop
+uses a FRESH ``NullPool`` connection that is explicitly rolled back and hard
+closed, so the "leaked finalize" can never be committed by a pool's
+reset-on-return (the trap the old pooled ``_crash_engine`` left open).
+
+**The reference model** (:class:`_KeyModel`) tracks, per key: the expected
+terminal-ness (pure Python), the ``Guarantee``, and — once terminal — a frozen
+snapshot used to assert monotonicity (I5).
+
+**Invariants asserted after every step (PLAN.md 7, the P1.4 subset I1-I5):**
+
+- **I1** — for every key, ``effect_count <= 1`` (the product; the prime
+  directive), counted from ``effects_log``.
+- **I2** — ``state == committed`` implies ``effect_count == 1``.
+- **I3** — the real scenario-7 property: a ``guarantee=none`` row that crashed
+  while ``executing`` and was then reconciled lands terminal ``unknown`` (never
+  ``committed``, never retried), and the reconcile did not increase its
+  ``effect_count``. A ``none`` row is never re-executed by recovery.
+- **I4** — SCOPED FOR P1.4: the full chained-hash audit is P2.2, so I4 here
+  asserts the weaker available property — the evidence/error trail and ledger
+  terminal states are internally consistent. The real chained-hash I4 lands in
+  P2.2.
+- **I5** — terminal ledger states (committed/aborted/failed/unknown) are
+  monotone: once terminal, a row never changes state or effect_count.
+
+**I6 (paused_runs DAG) and I7 (action_event validation) are OUT OF SCOPE for
+P1.4** — they need P2.3 ``paused_runs`` and P2.2 events, which do not exist yet.
+See the TODO at the bottom of this module.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+import warnings
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
+from pydantic import JsonValue
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
+
+from airlock.commit import commit_once
+from airlock.effects import Effect
+from airlock.errors import (
+    AtMostOnceWarning,
+    CommitWaitTimeout,
+    ExecuteTimeout,
+    VerificationUnknown,
+)
+from airlock.reconcile import OnAbsent, reconcile
+from airlock.registry import Registry
+from airlock.store._schema import ensure_schema
+from airlock.store.postgres import PostgresStore, normalize_postgres_url
+from airlock.types import (
+    TERMINAL_LEDGER_STATES,
+    Guarantee,
+    LedgerState,
+    Verification,
+)
+
+#: The whole module is the property machine — marker lets CI run it as its own
+#: derandomized leg (``pytest -m property``), separate from concurrency/crash/race.
+pytestmark = pytest.mark.property
+
+# ---------------------------------------------------------------------------
+# Strategies (PLAN.md 7): payloads via fixed_dictionaries so duplicate payloads
+# collide BY CONSTRUCTION; guarantee & crash boundary via sampled_from.
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/airlock_test")
+OLDER_THAN = timedelta(seconds=60)
+# Advancing by more than OLDER_THAN makes an in-flight row cross the staleness
+# cutoff deterministically (never time.sleep).
+BIG_ADVANCE = 120.0
+
+#: Every machine's rows share this SQL LIKE prefix; the scoped DELETE / read use
+#: it so the machine touches only ``prop.*`` rows, never another test's.
+_PROP_PREFIX = "prop."
+
+# A SMALL payload space so duplicate keys collide by construction (airlock-canon-1:
+# amount is a decimal STRING, never a float; account is sampled from a tiny set).
+_ACCOUNTS = ("acct_a", "acct_b")
+_AMOUNTS = ("10.00", "12.50", "0")
+
+_action_payload = st.fixed_dictionaries(
+    {
+        "account": st.sampled_from(_ACCOUNTS),
+        "amount": st.sampled_from(_AMOUNTS),
+    }
+)
+_guarantee = st.sampled_from(
+    [Guarantee.DOWNSTREAM_IDEMPOTENT, Guarantee.VERIFIABLE, Guarantee.NONE]
+)
+
+# The named crash boundaries this layer drives (PLAN.md 7). after_finalize_write
+# is omitted here (it lands terminal with the finalize committed — the os._exit
+# suite covers it; here every crash is a mid/pre-finalize interruption, which is
+# the interesting recovery surface).
+_CRASH_BOUNDARIES = st.sampled_from(
+    [
+        "after_claim",
+        "after_executing_mark",
+        "after_effect",
+        "after_verify",
+        "before_finalize_write",
+    ]
+)
+
+
+# ---------------------------------------------------------------------------
+# The downstream world — the dedup/probe MECHANISM. Ground truth for
+# effect_count is the effects_log table (see _EffectsLog), NOT this object.
+# ---------------------------------------------------------------------------
+
+
+class _EffectsLog:
+    """Ground-truth side-effect counter on a dedicated autocommit connection.
+
+    Independent of any ledger transaction (PLAN.md 7): a raw effect is counted
+    the instant it is logged. Reads happen on a FRESH connection so an effect
+    landed by any transaction is visible immediately. Keys carry the machine's
+    unique prefix, so counts are naturally scoped per example without truncating
+    the shared table.
+    """
+
+    def __init__(self, dsn: str) -> None:
+        self._engine = create_engine(normalize_postgres_url(dsn), isolation_level="AUTOCOMMIT")
+
+    def log(self, key: str) -> None:
+        with self._engine.connect() as conn:
+            conn.execute(
+                text("INSERT INTO effects_log (idempotency_key, worker_pid) VALUES (:key, :pid)"),
+                {"key": key, "pid": os.getpid()},
+            )
+
+    def count(self, key: str) -> int:
+        with self._engine.connect() as conn:
+            found = conn.execute(
+                text("SELECT count(*) FROM effects_log WHERE idempotency_key = :key"),
+                {"key": key},
+            ).scalar_one()
+        return int(found)
+
+    def dispose(self) -> None:
+        self._engine.dispose()
+
+
+class _Downstream:
+    """Models the downstream dedup/probe mechanism for all three guarantee modes.
+
+    Every RAW effect it lands is also logged to the ``effects_log`` table
+    (:class:`_EffectsLog`), which is the ground truth the invariants count.
+    ``downstream_idempotent`` dedupes on the downstream key so a re-issue with
+    the same key logs NO new effect; ``verifiable`` reads presence back from the
+    effects_log count; ``none`` logs a raw effect on every execute.
+    """
+
+    def __init__(self, effects: _EffectsLog) -> None:
+        self._effects = effects
+        # downstream key -> stored response (downstream_idempotent dedup table)
+        self._di_responses: dict[str, dict[str, Any]] = {}
+
+    # --- downstream_idempotent -------------------------------------------------
+    def di_apply(self, ledger_key: str, downstream_key: str) -> dict[str, Any]:
+        if downstream_key in self._di_responses:
+            return self._di_responses[downstream_key]  # deduped: NO new effect
+        self._effects.log(ledger_key)
+        resp = {"refund_id": f"re_di_{downstream_key}"}
+        self._di_responses[downstream_key] = resp
+        return resp
+
+    # --- verifiable ------------------------------------------------------------
+    def verifiable_apply(self, ledger_key: str) -> dict[str, Any]:
+        self._effects.log(ledger_key)
+        return {"refund_id": f"re_v_{ledger_key}"}
+
+    def verifiable_probe(self, ledger_key: str) -> tuple[Verification, dict[str, Any]]:
+        present = self._effects.count(ledger_key) >= 1
+        return (
+            (Verification.PRESENT if present else Verification.ABSENT),
+            {"present": present},
+        )
+
+    # --- none ------------------------------------------------------------------
+    def none_apply(self, ledger_key: str) -> dict[str, Any]:
+        self._effects.log(ledger_key)
+        return {"refund_id": f"re_n_{ledger_key}"}
+
+
+# ---------------------------------------------------------------------------
+# The reference model — what the ledger SHOULD look like, per key.
+# ---------------------------------------------------------------------------
+
+
+class _KeyModel:
+    """The modelled expectation for one ledger key."""
+
+    def __init__(self, action_type: str, guarantee: Guarantee, payload: dict[str, str]) -> None:
+        self.action_type = action_type
+        self.guarantee = guarantee
+        self.payload = payload
+        # Whether this key is known to have reached a terminal state. Tracked in
+        # PURE PYTHON (never read back from the DB) so the machine's control flow
+        # is deterministic given the step sequence (see the module docstring on
+        # FlakyStrategyDefinition). DB reads happen only in invariants.
+        self.model_terminal = False
+        # I3 (scenario 7): a `none` row that crashed while executing and was then
+        # reconciled MUST land terminal `unknown`, never committed/retried, and
+        # the reconcile must not add an effect. Set when such a crash is staged.
+        self.none_crashed_executing = False
+        # Terminal snapshot for I5 monotonicity: (state, effect_count) once frozen.
+        self.terminal_state: LedgerState | None = None
+        self.terminal_effect_count: int | None = None
+
+    def freeze_terminal(self, state: LedgerState, effect_count: int) -> None:
+        if self.terminal_state is None:
+            self.terminal_state = state
+            self.terminal_effect_count = effect_count
+        self.model_terminal = True
+
+
+# ---------------------------------------------------------------------------
+# The machine.
+# ---------------------------------------------------------------------------
+
+
+class CommitMachine(RuleBasedStateMachine):
+    """Drive the real ledger + reconciler through randomized interleavings.
+
+    Each example gets a fresh machine whose ``__init__`` mints a UNIQUE
+    action_type prefix and scrubs any stale ``prop.*`` rows with a SCOPED
+    ``DELETE`` (never ``TRUNCATE``), so runs never leak state into each other and
+    the machine never touches another DB-backed test's rows (PLAN.md 10). Ground
+    truth for ``effect_count`` is the ``effects_log`` autocommit table.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fake_now = datetime(2026, 7, 5, 12, 0, 0, tzinfo=UTC)
+        # A unique prefix per machine instance -> globally distinct rows/keys.
+        self.prefix = f"{_PROP_PREFIX}{uuid.uuid4().hex}."
+        self.action_type = f"{self.prefix}refund"
+        self.store = PostgresStore(DATABASE_URL, now_fn=self._now)
+        # A raw autocommit engine for schema/scoped-cleanup/inspection (never the
+        # store's pool).
+        self._raw = create_engine(
+            normalize_postgres_url(DATABASE_URL), isolation_level="AUTOCOMMIT"
+        )
+        ensure_schema(self._raw)
+        self._ensure_effects_log()
+        self.effects = _EffectsLog(DATABASE_URL)
+        self.downstream = _Downstream(self.effects)
+        self.model: dict[str, _KeyModel] = {}
+        # SCOPED cleanup: only this suite's rows, and only ones that could linger
+        # from an earlier prop.* example. With a fresh uuid prefix there is
+        # nothing to delete, but the scoped DELETE is the structural guarantee
+        # that the machine can never wipe another test's rows (PLAN.md 10 fix).
+        with self._raw.connect() as conn:
+            conn.execute(
+                text("DELETE FROM commit_records WHERE action_type LIKE :like"),
+                {"like": f"{_PROP_PREFIX}%"},
+            )
+
+    def _ensure_effects_log(self) -> None:
+        """Create the ground-truth ``effects_log`` table if missing.
+
+        The conftest session fixture creates it too, but the property leg runs as
+        a plain ``unittest`` TestCase that does not pull that fixture graph, so
+        the machine ensures it itself — the machine is self-contained under
+        ``pytest -m property`` on a fresh database.
+        """
+        with self._raw.connect() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS effects_log ("
+                    " id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+                    " idempotency_key TEXT NOT NULL,"
+                    " worker_pid INT NOT NULL,"
+                    " logged_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+                )
+            )
+
+    def _now(self) -> datetime:
+        return self._fake_now
+
+    def teardown(self) -> None:
+        self.store.close()
+        self.effects.dispose()
+        # Scoped cleanup on the way out too, so a killed run leaves no prop.* rows
+        # and this machine's effects_log rows do not accumulate in the shared
+        # table across a session. Both scopes are keyed to this suite / this
+        # machine, never another test's rows (PLAN.md 10).
+        with self._raw.connect() as conn:
+            conn.execute(
+                text("DELETE FROM commit_records WHERE action_type LIKE :like"),
+                {"like": f"{_PROP_PREFIX}%"},
+            )
+            conn.execute(
+                text("DELETE FROM effects_log WHERE idempotency_key LIKE :like"),
+                {"like": f"{self.prefix}%"},
+            )
+        self._raw.dispose()
+
+    def _key_for(self, payload: dict[str, str]) -> str:
+        """A stable, machine-scoped ledger key for a payload — collide by
+        construction whenever the payload recurs, distinct across machines."""
+        return f"{self.action_type}:{payload['account']}:{payload['amount']}"
+
+    # --- effect / probe / execute wiring ---------------------------------------
+
+    def _effect_for(self, guarantee: Guarantee) -> Effect:
+        if guarantee is Guarantee.DOWNSTREAM_IDEMPOTENT:
+            return Effect(key_param="idempotency_key")
+        if guarantee is Guarantee.VERIFIABLE:
+            return Effect(verify=self._make_probe())
+        return Effect()  # none
+
+    def _make_probe(self) -> Callable[..., tuple[Verification, dict[str, Any]]]:
+        downstream = self.downstream
+        action_type = self.action_type
+
+        def verify(*, account: str, amount: str, **_: Any) -> tuple[Verification, dict[str, Any]]:
+            key = f"{action_type}:{account}:{amount}"
+            return downstream.verifiable_probe(key)
+
+        return verify
+
+    def _make_execute(self, guarantee: Guarantee, key: str) -> Callable[..., JsonValue]:
+        downstream = self.downstream
+
+        def execute(downstream_key: str | None, **_: Any) -> JsonValue:
+            if guarantee is Guarantee.DOWNSTREAM_IDEMPOTENT:
+                assert downstream_key is not None
+                return downstream.di_apply(key, downstream_key)
+            if guarantee is Guarantee.VERIFIABLE:
+                return downstream.verifiable_apply(key)
+            return downstream.none_apply(key)
+
+        return execute
+
+    # --- rules -----------------------------------------------------------------
+
+    @rule(payload=_action_payload, guarantee=_guarantee)
+    def propose(self, payload: dict[str, str], guarantee: Guarantee) -> None:
+        """Propose+commit an action to completion (no crash) via commit_once.
+
+        Duplicate payloads collide by construction, so this doubles as scenario
+        1 (sequential duplicate) whenever the same (payload, guarantee) recurs.
+        A guarantee mismatch on an existing key is skipped (the ledger keeps one
+        guarantee per key). Decided from the MODEL only.
+        """
+        key = self._key_for(payload)
+        km = self.model.get(key)
+        if km is not None and km.guarantee is not guarantee:
+            return  # same key must keep one guarantee; skip the mismatch
+        if km is None:
+            km = _KeyModel(self.action_type, guarantee, payload)
+            self.model[key] = km
+
+        self._commit_once_call(key, km)
+
+    @rule()
+    @precondition(lambda self: bool(self.model))
+    def duplicate_call(self) -> None:
+        """Retry an existing key (scenario 1/2 on the sequential path)."""
+        key = self._some_key()
+        km = self.model[key]
+        self._commit_once_call(key, km)
+
+    @rule(payload=_action_payload, guarantee=_guarantee)
+    def claim_dedup(self, payload: dict[str, str], guarantee: Guarantee) -> None:
+        """ADR-1 claim dedup: a SECOND claim of the same key must NOT win.
+
+        The exactly-once guard is ``INSERT ... ON CONFLICT (idempotency_key) DO
+        NOTHING`` — the claim itself is the concurrency gate that makes scenario
+        2 safe (SPEC.md 5 rows 1-2). This rule pins that primitive directly: on a
+        fresh key, the first claim wins; a second and third claim of the SAME key
+        must report ``won == False`` and return the SAME existing row. A claim
+        that mistakenly reports ``won`` for a duplicate (an ``ON CONFLICT DO
+        NOTHING`` regressed to ``DO UPDATE``, or dropped entirely) hands two
+        independent callers the row and green-lights two side effects — the
+        double-commit the prime directive forbids. Terminality/first-claim status
+        is decided from the MODEL only (pure Python), never a DB read.
+        """
+        key = self._key_for(payload)
+        km = self.model.get(key)
+        if km is not None and km.guarantee is not guarantee:
+            return
+        already_claimed = km is not None
+        if km is None:
+            km = _KeyModel(self.action_type, guarantee, payload)
+            self.model[key] = km
+
+        downstream_key = self._effect_for(guarantee).downstream_key_for(key)
+        claim = self.store.claim(key, self.action_type, guarantee, dict(km.payload), downstream_key)
+
+        if already_claimed:
+            # The model knows this key was claimed before — the claim MUST lose.
+            assert not claim.won, (
+                f"CLAIM DEDUP BROKEN: re-claim of existing key {key!r} reported won=True "
+                "(ON CONFLICT DO NOTHING regressed — two callers would both execute)"
+            )
+        else:
+            # First claim of a fresh key wins; an IMMEDIATE second claim must lose.
+            assert claim.won, f"CLAIM DEDUP BROKEN: first claim of fresh key {key!r} lost"
+            second = self.store.claim(
+                key, self.action_type, guarantee, dict(km.payload), downstream_key
+            )
+            assert not second.won, (
+                f"CLAIM DEDUP BROKEN: second claim of just-claimed key {key!r} reported "
+                "won=True (ON CONFLICT DO NOTHING regressed — double-commit hole)"
+            )
+
+    def _commit_once_call(self, key: str, km: _KeyModel) -> None:
+        effect = self._effect_for(km.guarantee)
+        inner = self._make_execute(km.guarantee, key)
+
+        def execute(downstream_key: str | None) -> JsonValue:
+            return inner(downstream_key)
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", AtMostOnceWarning)
+                commit_once(
+                    self.store,
+                    key=key,
+                    action_type=self.action_type,
+                    execute=execute,
+                    effect=effect,
+                    args_json=dict(km.payload),
+                    reconcile_after=OLDER_THAN,
+                    now_fn=self._now,
+                    wait=False,
+                )
+        except (CommitWaitTimeout, VerificationUnknown, ExecuteTimeout):
+            # Losing to an in-flight row, or an honest non-answer: the ledger
+            # holds the claim; recovery handles it. Legal, never a re-execute.
+            pass
+
+    @rule(boundary=_CRASH_BOUNDARIES, payload=_action_payload, guarantee=_guarantee)
+    def crash_at(self, boundary: str, payload: dict[str, str], guarantee: Guarantee) -> None:
+        """Drive the commit flow to ``boundary`` and crash (drop the connection).
+
+        Runs the ``commit_once`` steps by hand up to the boundary. For a boundary
+        whose relevant transaction already committed (after_claim /
+        after_executing_mark / after_effect), the "crash" is simply stopping
+        there. For before_finalize_write we open a finalize transaction on a
+        FRESH non-pooled connection and drop it before COMMIT, proving Postgres
+        rolls it back with no partial write. after_verify is a no-op transition
+        on the ledger (verify does not write), so it lands like after_effect.
+        Every branch here is decided from the MODEL (pure Python).
+        """
+        key = self._key_for(payload)
+        km = self.model.get(key)
+        if km is not None and km.guarantee is not guarantee:
+            return
+        # A crash only makes sense on a fresh or in-flight row; a terminal row
+        # cannot be re-claimed. Decide from the MODEL (pure Python), never a DB
+        # read (FlakyStrategyDefinition — see the module docstring).
+        if km is not None and km.model_terminal:
+            return
+        if km is None:
+            km = _KeyModel(self.action_type, guarantee, payload)
+            self.model[key] = km
+
+        downstream_key = self._effect_for(guarantee).downstream_key_for(key)
+
+        # Step 1 — claim (its own committed txn). A loser just returns.
+        claim = self.store.claim(key, self.action_type, guarantee, dict(km.payload), downstream_key)
+        if not claim.won:
+            return
+        epoch = claim.record.attempts
+        if boundary == "after_claim":
+            return  # durably 'pending', effect-free
+
+        # Step 3 — mark executing (its own committed txn, before any effect).
+        if not self.store.mark_executing(key, epoch):
+            return  # fenced; nothing to crash
+        if boundary == "after_executing_mark":
+            # A none row now sits 'executing' with no effect; if the model later
+            # reconciles it, it must land 'unknown' (I3). Record the intent.
+            if guarantee is Guarantee.NONE:
+                km.none_crashed_executing = True
+            return
+
+        # Step 4 — the side effect (lands in effects_log / ground truth).
+        execute = self._make_execute(guarantee, key)
+        execute(downstream_key)
+        if guarantee is Guarantee.NONE:
+            km.none_crashed_executing = True
+        if boundary in ("after_effect", "after_verify"):
+            # verify does not write to the ledger, so after_verify is
+            # DB-indistinguishable from after_effect: row 'executing', effect in.
+            return
+
+        # boundary == before_finalize_write: open a finalize txn on a FRESH
+        # non-pooled connection and drop it before COMMIT — Postgres rolls it
+        # back, so the row stays 'executing' with no partial finalize.
+        self._drop_connection_mid_finalize(key, epoch)
+        # HARNESS SELF-CHECK: the crash must have ROLLED BACK, leaving the row
+        # 'executing' — not silently committed the "leaked" finalize.
+        crashed = self.store.load(key)
+        assert crashed is not None and crashed.state is LedgerState.EXECUTING, (
+            "before_finalize_write crash did not roll back: the connection-drop "
+            "must leave the row 'executing', never commit the partial finalize"
+        )
+
+    def _drop_connection_mid_finalize(self, key: str, epoch: int) -> None:
+        """Issue the finalize UPDATE on a FRESH non-pooled connection, roll it
+        back, and hard-close — proving the open transaction rolls back with no
+        partial write, and no pool reset-on-return can ever COMMIT the leak.
+
+        A ``NullPool`` engine hands out a brand-new DBAPI connection and disposes
+        it on close (no pool to return to), so there is no reset-on-return path
+        that could commit the pending UPDATE. We explicitly ``rollback()`` before
+        ``close()`` too, so the abort is issued by us, deterministically — the
+        row is durably still 'executing' with no partial finalize.
+        """
+        engine = create_engine(normalize_postgres_url(DATABASE_URL), poolclass=NullPool)
+        try:
+            raw = engine.raw_connection()
+            try:
+                cur = raw.cursor()
+                # Same shape as PostgresStore.finalize's committed UPDATE, but we
+                # never commit: we roll back and hard-close (the crash).
+                cur.execute(
+                    "UPDATE commit_records SET state = 'committed', "
+                    "result_json = '{\"leaked\": true}'::jsonb, committed_at = now() "
+                    "WHERE idempotency_key = %s AND attempts = %s AND state = 'executing'",
+                    (key, epoch),
+                )
+                # Deliberately DO NOT commit. Roll back explicitly, then close.
+                raw.rollback()
+            finally:
+                raw.close()
+        finally:
+            engine.dispose()
+
+    @rule()
+    def advance_clock(self) -> None:
+        """Advance the FakeClock past the reconcile timeout (never time.sleep)."""
+        self._fake_now = self._fake_now + timedelta(seconds=BIG_ADVANCE)
+
+    @rule(on_absent=st.sampled_from([OnAbsent.RETRY, OnAbsent.ABORT]))
+    def do_reconcile(self, on_absent: OnAbsent) -> None:
+        """Run one reconcile pass over all stale in-flight rows.
+
+        Uses one registry whose execute/probe read the real downstream world by
+        the row's rehydrated (account, amount). Uses the same FakeClock, so only
+        rows advanced past OLDER_THAN are eligible. A modelled none row that
+        crashed while executing (``none_crashed_executing``) is finalized
+        ``unknown`` here — asserted by I3, which reads the DB state directly.
+        """
+        reconcile(
+            self.store,
+            older_than=OLDER_THAN,
+            on_absent=on_absent,
+            execute_timeout=None,  # controlled in-process; window vouched for
+            now_fn=self._now,
+            registry=self._registry_for_all(),
+        )
+
+    @rule(payload=_action_payload)
+    def slow_owner_fenced_reconcile(self, payload: dict[str, str]) -> None:
+        """The slow-owner-vs-reconciler epoch-fence interleaving (PLAN.md 7 / I5).
+
+        This is the interleaving the epoch fence exists to defend and that the
+        randomized machine otherwise never generates — a fenced owner at epoch N
+        racing a reconciler that took the row over at epoch N+1 but LEFT IT
+        ``executing`` (an escalation). It brings ``test_reconcile_race``'s overlap
+        into the machine so an epoch-fence regression is caught:
+
+        1. Leave a ``verifiable`` owner ``executing`` at epoch N (claim +
+           mark_executing; no finalize) — a slow owner mid-execute.
+        2. advance_clock past staleness and run a reconcile whose probe answers
+           ``unknown`` — the reconciler bumps to N+1 (fencing the owner) and
+           ESCALATES, leaving the row ``executing`` at N+1. This is the crucial
+           shape: the row's STATE still matches ``finalize``'s state guard, so the
+           ONLY thing standing between the owner and a wrong ``committed`` is the
+           ``AND attempts = :epoch`` epoch guard.
+        3. Attempt the ORIGINAL owner's epoch-N ``finalize`` / ``mark_executing``
+           / ``record_error`` and ASSERT each is fenced (returns False).
+
+        Why this catches the mutation battery where a probe-present recovery does
+        not: after a normal recovery the row is already ``committed`` and
+        ``finalize``'s state guard alone fences the owner, hiding a dropped epoch
+        guard. Here the row is left ``executing`` at the bumped epoch, so:
+
+        - epoch guard dropped on ``finalize``  -> owner (epoch N) commits over the
+          reconciler's N+1 row: assertion fires (fence broken).
+        - ``bump_epoch`` does not increment    -> the row stays at epoch N, so the
+          owner's epoch-N ``finalize`` matches (state executing + epoch N): fence
+          broken.
+        - epoch guard dropped on ``mark_executing`` -> owner re-marks the N+1 row:
+          assertion fires.
+
+        The owner never lands an effect (it blocks before executing, like a slow
+        owner abandoned pre-effect), so effect_count is 0 throughout — this rule
+        proves the FENCE, not effect dedup. Terminality is decided from the MODEL.
+        """
+        guarantee = Guarantee.VERIFIABLE
+        key = self._key_for(payload)
+        km = self.model.get(key)
+        if km is not None and km.guarantee is not guarantee:
+            return  # keep one guarantee per key; skip if the model has another
+        if km is not None and km.model_terminal:
+            return
+        if km is None:
+            km = _KeyModel(self.action_type, guarantee, payload)
+            self.model[key] = km
+
+        # Stage an owner stranded 'executing' at epoch N (no effect, no finalize).
+        claim = self.store.claim(key, self.action_type, guarantee, dict(km.payload), None)
+        if not claim.won:
+            return
+        owner_epoch = claim.record.attempts
+        if not self.store.mark_executing(key, owner_epoch):
+            return
+
+        # Advance past staleness and run a reconciler whose probe answers UNKNOWN,
+        # so it bumps the epoch (fencing the owner) but ESCALATES — the row stays
+        # 'executing' at the bumped epoch. This is what makes the epoch guard the
+        # sole fence (the state guard still matches).
+        self._fake_now = self._fake_now + timedelta(seconds=BIG_ADVANCE)
+        reconcile(
+            self.store,
+            older_than=OLDER_THAN,
+            on_absent=OnAbsent.ABORT,
+            execute_timeout=None,
+            now_fn=self._now,
+            registry=self._unknown_probe_registry(),
+        )
+
+        # THE FENCE, asserted directly: the original owner at epoch N can no
+        # longer finalize, re-mark, or record. Each guarded write must match 0
+        # rows (return False). A dropped epoch guard (or a bump_epoch that does
+        # not increment) turns one of these True — a broken fence.
+        assert not self.store.finalize(
+            key, owner_epoch, LedgerState.COMMITTED, {"owner": "late"}, None
+        ), f"FENCE BROKEN: owner epoch {owner_epoch} finalized {key!r} after takeover"
+        assert not self.store.mark_executing(key, owner_epoch), (
+            f"FENCE BROKEN: owner epoch {owner_epoch} re-marked {key!r} after takeover"
+        )
+        assert not self.store.record_error(key, owner_epoch, {"owner": "late"}), (
+            f"FENCE BROKEN: owner epoch {owner_epoch} recorded on {key!r} after takeover"
+        )
+        count = self.effects.count(key)
+        assert count <= 1, f"FENCE effect leak: key {key!r} has effect_count={count} (> 1)"
+
+    def _unknown_probe_registry(self) -> Registry:
+        """A registry whose probe always answers UNKNOWN -> the reconciler
+        escalates and LEAVES the row executing at the bumped epoch (never
+        finalizes it), which is what the fence rule needs."""
+        action_type = self.action_type
+
+        def probe(**_: Any) -> tuple[Verification, dict[str, Any]]:
+            return Verification.UNKNOWN, {"why": "fence-rule: forced escalation"}
+
+        def execute(downstream_key: str | None, **_: Any) -> JsonValue:  # never called
+            raise AssertionError("fence rule reconcile must not re-execute (probe is unknown)")
+
+        reg = Registry()
+        reg.register(action_type, Effect(verify=probe), execute)
+        return reg
+
+    def _registry_for_all(self) -> Registry:
+        """One registry whose execute/probe dispatch on the row's own payload."""
+        downstream = self.downstream
+        model = self.model
+        action_type = self.action_type
+
+        def probe(*, account: str, amount: str, **_: Any) -> tuple[Verification, dict[str, Any]]:
+            key = f"{action_type}:{account}:{amount}"
+            return downstream.verifiable_probe(key)
+
+        def execute(
+            downstream_key: str | None, *, account: str, amount: str, **_: Any
+        ) -> JsonValue:
+            key = f"{action_type}:{account}:{amount}"
+            km = model.get(key)
+            guarantee = km.guarantee if km is not None else Guarantee.VERIFIABLE
+            if guarantee is Guarantee.DOWNSTREAM_IDEMPOTENT:
+                assert downstream_key is not None
+                return downstream.di_apply(key, downstream_key)
+            if guarantee is Guarantee.NONE:
+                return downstream.none_apply(key)
+            return downstream.verifiable_apply(key)
+
+        reg = Registry()
+        reg.register(action_type, Effect(key_param="idempotency_key", verify=probe), execute)
+        return reg
+
+    @rule()
+    def restart(self) -> None:
+        """Discard in-memory owner state, keep the DB (a process restart)."""
+        self.store.close()
+        self.store = PostgresStore(DATABASE_URL, now_fn=self._now)
+
+    # --- helpers ---------------------------------------------------------------
+
+    def _some_key(self) -> str:
+        # Deterministic pick (first modelled key) — Hypothesis controls sequencing
+        # via rule ordering; we do not need extra randomness here.
+        return next(iter(self.model))
+
+    def _real_rows(self) -> dict[str, Any]:
+        """Read THIS machine's rows only (scoped to its prefix) from a fresh conn.
+
+        The ``action_type LIKE :like`` scope means the invariants can never see
+        another test's rows — the machine is structurally isolated (PLAN.md 10).
+        """
+        with self._raw.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT idempotency_key, state, guarantee, result_json, error_json,"
+                        " committed_at, attempts FROM commit_records"
+                        " WHERE action_type LIKE :like"
+                    ),
+                    {"like": f"{self.prefix}%"},
+                )
+                .mappings()
+                .all()
+            )
+        return {row["idempotency_key"]: row for row in rows}
+
+    # --- invariants (I1-I5), asserted after EVERY step -------------------------
+
+    @invariant()
+    def i1_effect_count_at_most_one(self) -> None:
+        """I1: for every key, the real effects_log effect_count is <= 1."""
+        for key in self.model:
+            count = self.effects.count(key)
+            assert count <= 1, f"I1 VIOLATED: key {key!r} has effect_count={count} (> 1)"
+
+    @invariant()
+    def i2_committed_implies_one_effect(self) -> None:
+        """I2: a committed row has exactly one real effect (from effects_log)."""
+        rows = self._real_rows()
+        for key, row in rows.items():
+            if row["state"] == LedgerState.COMMITTED.value:
+                count = self.effects.count(key)
+                assert count == 1, (
+                    f"I2 VIOLATED: key {key!r} is committed but effect_count={count} (!= 1)"
+                )
+
+    @invariant()
+    def i3_none_crashed_executing_lands_unknown(self) -> None:
+        """I3 (scenario 7): a none row crashed while executing, once terminal,
+        lands 'unknown' — never committed, never retried — and its effect_count
+        never exceeds 1.
+
+        This is the real scenario-7 property (PLAN.md 4.2 / SPEC scenario 7), not
+        the old tautology: a guarantee=none row that was crashed mid-execute and
+        then reconciled MUST be finalized ``unknown`` (the reconciler NEVER
+        re-executes a none row), so it is never ``committed`` and the reconcile
+        pass adds no effect. We assert on the rows the model flagged as
+        none-crashed-executing.
+        """
+        rows = self._real_rows()
+        for key, km in self.model.items():
+            if km.guarantee is not Guarantee.NONE or not km.none_crashed_executing:
+                continue
+            row = rows.get(key)
+            if row is None:
+                continue
+            state = row["state"]
+            # A none row that crashed executing is NEVER committed by recovery.
+            assert state != LedgerState.COMMITTED.value, (
+                f"I3 VIOLATED: none key {key!r} crashed executing then reached "
+                "'committed' — the reconciler re-executed a none row (scenario 7 breach)"
+            )
+            count = self.effects.count(key)
+            assert count <= 1, (
+                f"I3 VIOLATED: none key {key!r} has effect_count={count} (> 1) — "
+                "a none row was retried by recovery"
+            )
+            # Once terminal, the only truthful state for a crashed-executing none
+            # row is 'unknown' (never failed/aborted, which would claim proof it
+            # cannot have).
+            if state in {s.value for s in TERMINAL_LEDGER_STATES}:
+                assert state == LedgerState.UNKNOWN.value, (
+                    f"I3 VIOLATED: none key {key!r} crashed executing but terminal "
+                    f"state is {state!r}, expected 'unknown' (scenario 7)"
+                )
+
+    @invariant()
+    def i4_evidence_and_terminal_states_consistent(self) -> None:
+        """I4 (P1.4 SCOPE): evidence/terminal-state internal consistency.
+
+        The full chained-hash audit is P2.2 (TODO below). Here we assert the
+        weaker available property: no committed row without a result, and no
+        unknown/failed row that claims success.
+        """
+        rows = self._real_rows()
+        for key, row in rows.items():
+            state = row["state"]
+            if state == LedgerState.COMMITTED.value:
+                assert row["committed_at"] is not None, f"I4: committed {key!r} has no committed_at"
+                assert row["result_json"] is not None, f"I4: committed {key!r} has no result"
+            elif state == LedgerState.ABORTED.value:
+                assert row["committed_at"] is None, f"I4: aborted {key!r} claims committed_at"
+                assert row["result_json"] is None, f"I4: aborted {key!r} has a result"
+            elif state in (LedgerState.FAILED.value, LedgerState.UNKNOWN.value):
+                assert row["committed_at"] is None, (
+                    f"I4: {state} {key!r} claims committed_at (a success timestamp)"
+                )
+
+    @invariant()
+    def i5_terminal_states_are_monotone(self) -> None:
+        """I5: once terminal, a row never changes state or effect_count.
+
+        The model snapshots (state, effect_count) the first time it observes a
+        row terminal; every subsequent step must find the SAME state and SAME
+        effect_count. A terminal row that flipped state, or whose effect_count
+        moved, is a monotonicity break — the class of bug a double-commit, a
+        resurrected row, or a BROKEN EPOCH FENCE (a fenced owner finalizing over
+        the reconciler's terminal row) would show.
+        """
+        rows = self._real_rows()
+        for key, row in rows.items():
+            state = LedgerState(row["state"])
+            km = self.model.get(key)
+            if km is None:
+                continue
+            count = self.effects.count(key)
+            if state in TERMINAL_LEDGER_STATES:
+                if km.terminal_state is None:
+                    km.freeze_terminal(state, count)
+                else:
+                    assert km.terminal_state == state, (
+                        f"I5 VIOLATED: terminal key {key!r} changed state "
+                        f"{km.terminal_state.value!r} -> {state.value!r}"
+                    )
+                    assert km.terminal_effect_count == count, (
+                        f"I5 VIOLATED: terminal key {key!r} effect_count changed "
+                        f"{km.terminal_effect_count} -> {count}"
+                    )
+
+
+# The Hypothesis test the machine compiles to. Settings (max_examples, deadline,
+# derandomize, the suppressed DB-backed health checks) come from the active
+# profile — "ci" is derandomized with a fixed budget and no deadline (see
+# tests/conftest.py). No per-test override: the profile is the single knob.
+TestCommitMachine = CommitMachine.TestCase
+
+
+# ---------------------------------------------------------------------------
+# I6 / I7 — OUT OF SCOPE for P1.4 (do NOT stub).
+#
+# TODO(P2.3): I6 — paused_runs.status follows the ADR-4 DAG only
+#   (proposed -> approved|rejected -> committed|aborted). Needs the paused_runs
+#   table and apply_decision, which land in P2.3. Add a `propose_gate` /
+#   `approve` / `reject` / `duplicate_webhook` rule set and an I6 invariant then.
+#
+# TODO(P2.2): I7 — every terminal call produced exactly one schema-valid
+#   action_event. Needs the action_event.v1 model + JSON Schema + the audit
+#   events table, which land in P2.2. Add an I7 invariant that reads back the
+#   emitted events and validates them against the pinned schema then.
+#
+# Leaving these as named TODOs (not empty rules/invariants) so the machine never
+# gives false confidence about properties it does not yet exercise.
+# ---------------------------------------------------------------------------

@@ -62,6 +62,7 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
     "concurrency: multi-process barrier tests hammering one idempotency key (SPEC section 9)",
-    "crash: subprocess crash-injection tests (os._exit mid-flight) (SPEC section 9)",
+    "crash: subprocess crash-injection tests (os._exit / SIGKILL mid-flight) (SPEC section 9)",
     "race: named race tests, e.g. slow-owner-vs-reconciler epoch fence (PLAN section 7)",
+    "property: the Hypothesis property machine (I1-I5) — derandomized on CI (PLAN section 7)",
 ]

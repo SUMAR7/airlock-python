@@ -1,116 +1,136 @@
-"""SPEC scenario 3 — crash after effect, before commit mark (crash-injection).
+"""Crash-injection: kill the real ``commit_once`` flow at every named boundary.
 
-A subprocess worker runs the commit flow and dies via ``os._exit`` mid-flight
-at a named crashpoint in ``{after_effect, after_verify, before_finalize_write}``
-— deterministic like a mock, real like SIGKILL: ``os._exit`` skips
+SPEC scenarios 3 & 4 under true SIGKILL-equivalent crashes. A spawn subprocess
+drives the REAL :func:`airlock.commit.commit_once` (via the consolidated
+:mod:`tests._harness`) and dies via ``os._exit`` at a named crashpoint —
+deterministic like a mock, real like SIGKILL: ``os._exit`` skips
 ``finally``/``atexit`` and the DB connection dies mid-transaction, so the last
-DURABLE state is whatever committed before the crash. Every one of these
-crashpoints lands the row ``state=executing`` with the effect already applied
-(``effect_count == 1``).
+DURABLE state is whatever committed before the crash. The parent then advances
+a fake clock past the reconcile timeout, runs one reconcile pass, and asserts
+the row recovers with ``effect_count`` never exceeding 1 (I1) — the prime
+directive under crashes.
 
-The parent then advances a fake clock past the reconcile timeout and runs one
-reconcile pass with a VERIFIABLE probe that returns PRESENT. Assert: the row
-becomes ``committed``, ``effect_count`` is STILL 1 (never re-executed), and the
-evidence carries a ``reconciled`` event.
+Before P1.4 this file staged the flow by hand and covered three boundaries;
+now every boundary in :data:`tests._harness.CRASHPOINTS` is exercised through
+the real primitive, and the harness is shared with P2.3.
 
-Determinism substrate (PLAN.md section 7): the crash is produced by
-``os._exit`` in a spawn subprocess (never a timer); "past the reconcile
-timeout" is produced by advancing the store's injectable ``now_fn`` (never
-``time.sleep``). Side-effect ground truth is the ``effects_log`` autocommit
-table, asserted from a fresh connection.
+Determinism substrate (PLAN.md 7): the crash is ``os._exit`` in a spawn
+subprocess (never a timer); "past the reconcile timeout" is produced by
+advancing the store's injectable ``now_fn`` (never ``time.sleep``). Side-effect
+ground truth is the ``effects_log`` autocommit table, asserted from a fresh
+connection.
 """
 
 from __future__ import annotations
 
 import multiprocessing
-import os
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from sqlalchemy import create_engine, text
 
 from airlock.effects import Effect
-from airlock.reconcile import Outcome, reconcile
+from airlock.reconcile import OnAbsent, Outcome, reconcile
 from airlock.registry import Registry
-from airlock.store.postgres import PostgresStore, normalize_postgres_url
 from airlock.types import Guarantee, LedgerState, Verification
+from tests._harness import (
+    CRASH_EXIT_CODE,
+    CRASHPOINTS,
+    effect_applied_at_crash,
+    expected_state_after_crash,
+    rebase_last_attempt,
+    run_commit_to_crashpoint,
+)
 from tests.conftest import EffectsLog, FakeClock, read_row
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
+    from airlock.store.postgres import PostgresStore
+
 CRASH_ACTION = "crash.refund"
-CRASHPOINTS = ["after_effect", "after_verify", "before_finalize_write"]
 DEADLINE = 60.0
+OLDER_THAN = timedelta(seconds=60)
 
 
-def _rebase_last_attempt(engine: Engine, key: str, when: datetime) -> None:
-    """Re-stamp a crashed row's last_attempt_at onto the fake clock's timeline.
-
-    The crash subprocess necessarily used its own real clock; the reconciler
-    runs on the fake clock. Aligning last_attempt_at to the fake clock keeps the
-    staleness trigger deterministic (advance the clock, never sleep). State,
-    attempts, and effects are untouched — only the timeline the stale scan reads.
-    """
-    with engine.begin() as conn:
-        rowcount = conn.execute(
-            text("UPDATE commit_records SET last_attempt_at = :when WHERE idempotency_key = :key"),
-            {"when": when, "key": key},
-        ).rowcount
-    assert rowcount == 1
-
-
-def _crash_worker(dsn: str, key: str, crashpoint: str) -> None:
-    """Run the commit flow to ``crashpoint``, apply the effect once, then
-    ``os._exit`` — leaving the row durably ``executing`` (SIGKILL-equivalent)."""
-    engine = create_engine(normalize_postgres_url(dsn))
-    effects_engine = create_engine(normalize_postgres_url(dsn), isolation_level="AUTOCOMMIT")
-    store = PostgresStore(dsn)
-
-    def log_effect() -> None:
-        with effects_engine.connect() as conn:
-            conn.execute(
-                text("INSERT INTO effects_log (idempotency_key, worker_pid) VALUES (:key, :pid)"),
-                {"key": key, "pid": os.getpid()},
-            )
-
-    # Steps 1 + 3: claim (own txn) then mark executing (own txn, committed
-    # BEFORE the effect). Both are durable before the effect runs.
-    store.claim(key, CRASH_ACTION, Guarantee.VERIFIABLE, {"invoice": "inv_crash"}, None)
-    store.mark_executing(key, 1)
-
-    # Step 4: the side effect. Exactly one, applied on the autocommit connection
-    # so it survives the crash independently of any ledger transaction.
-    log_effect()
-    if crashpoint == "after_effect":
-        os._exit(137)  # died the instant the effect landed; no verify, no finalize
-
-    # Step 5: post-verify (the effect happened, so a real probe would say PRESENT).
-    if crashpoint == "after_verify":
-        os._exit(137)  # verified but died before writing the terminal state
-
-    if crashpoint == "before_finalize_write":
-        os._exit(137)  # about to finalize committed; the write never happens
-
-    # Unreachable for these crashpoints; a real run would finalize here.
-    store.finalize(key, 1, LedgerState.COMMITTED, {"refund_id": "re_worker"}, None)
-    engine.dispose()
-    effects_engine.dispose()
-    store.close()
+def _spawn_crash(dsn: str, key: str, crashpoint: str, guarantee: Guarantee) -> int:
+    """Run the crash worker in a spawn subprocess; return its exit code."""
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(
+        target=run_commit_to_crashpoint,
+        kwargs={
+            "dsn": dsn,
+            "key": key,
+            "action_type": CRASH_ACTION,
+            "crashpoint": crashpoint,
+            "guarantee": guarantee,
+        },
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout=DEADLINE)
+    assert not proc.is_alive(), f"crash worker for {crashpoint!r} did not exit"
+    return proc.exitcode  # type: ignore[return-value]
 
 
-def _crash_after_claim_worker(dsn: str, key: str) -> None:
-    """Claim (own txn) then die BEFORE mark_executing — the row stays 'pending'
-    (provably effect-free: the executing marker commits before any effect)."""
-    store = PostgresStore(dsn)
-    store.claim(key, CRASH_ACTION, Guarantee.VERIFIABLE, {"invoice": "inv_pre"}, None)
-    os._exit(137)
+# ---------------------------------------------------------------------------
+# The durable-state contract: each boundary lands the ledger in a known state,
+# with a known effect count — driven through the real commit_once.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.crash
 @pytest.mark.parametrize("crashpoint", CRASHPOINTS)
-def test_scenario_3_crash_leaves_executing_then_probe_present_recovers(
+def test_crash_leaves_expected_durable_state(
+    db: Engine,
+    database_url: str,
+    effects: EffectsLog,
+    crashpoint: str,
+) -> None:
+    """A kill at each boundary leaves the documented durable state + effect count.
+
+    This pins the harness contract the recovery tests build on: pending &
+    effect-free before the executing marker; executing with the effect applied
+    from after_effect on; committed after the finalize write lands.
+    """
+    key = f"k-crash-state-{crashpoint}"
+    exitcode = _spawn_crash(database_url, key, crashpoint, Guarantee.VERIFIABLE)
+    assert exitcode == CRASH_EXIT_CODE, (
+        f"expected os._exit({CRASH_EXIT_CODE}) at {crashpoint!r}, got {exitcode} "
+        "(a clean 0 means the crashpoint never fired)"
+    )
+
+    row = read_row(db, key)
+    expected = expected_state_after_crash(crashpoint)
+    assert row.state == expected.value, f"{crashpoint!r} should leave state {expected.value!r}"
+
+    expected_effects = 1 if effect_applied_at_crash(crashpoint) else 0
+    assert effects.count(key) == expected_effects, (
+        f"{crashpoint!r}: effect_count must be {expected_effects}"
+    )
+    # Only after_finalize_write set committed_at (its finalize committed).
+    if expected is LedgerState.COMMITTED:
+        assert row.committed_at is not None
+    else:
+        assert row.committed_at is None
+
+
+# ---------------------------------------------------------------------------
+# SPEC scenario 3 — crash left the row executing with the effect applied; a
+# VERIFIABLE probe answering PRESENT recovers 'committed' WITHOUT re-executing.
+# ---------------------------------------------------------------------------
+
+# The boundaries that leave state=executing WITH the effect already applied.
+_EXECUTING_WITH_EFFECT = [
+    cp
+    for cp in CRASHPOINTS
+    if expected_state_after_crash(cp) is LedgerState.EXECUTING and effect_applied_at_crash(cp)
+]
+
+
+@pytest.mark.crash
+@pytest.mark.parametrize("crashpoint", _EXECUTING_WITH_EFFECT)
+def test_scenario_3_executing_with_effect_probe_present_recovers_committed(
     db: Engine,
     database_url: str,
     effects: EffectsLog,
@@ -118,35 +138,22 @@ def test_scenario_3_crash_leaves_executing_then_probe_present_recovers(
     fake_clock: FakeClock,
     crashpoint: str,
 ) -> None:
-    key = f"k-crash-{crashpoint}"
+    """after_effect / after_verify / before_finalize_write: the effect landed and
+    the row is executing. Verify PRESENT -> committed, effect_count stays 1
+    (never re-executed), recovery evidence recorded."""
+    key = f"k-crash-s3-{crashpoint}"
+    assert _spawn_crash(database_url, key, crashpoint, Guarantee.VERIFIABLE) == CRASH_EXIT_CODE
 
-    ctx = multiprocessing.get_context("spawn")
-    proc = ctx.Process(target=_crash_worker, args=(database_url, key, crashpoint), daemon=True)
-    proc.start()
-    proc.join(timeout=DEADLINE)
-    assert not proc.is_alive(), "crash worker did not exit"
-    # os._exit(137) is the crash; a clean 0 would mean the crashpoint never fired.
-    assert proc.exitcode == 137, f"expected os._exit(137), got {proc.exitcode}"
-
-    # Post-crash durable state: executing, with exactly one effect applied.
     row = read_row(db, key)
-    assert row.state == LedgerState.EXECUTING.value, "crash must leave the row executing"
-    assert row.committed_at is None
+    assert row.state == LedgerState.EXECUTING.value
     assert effects.count(key) == 1
+    rebase_last_attempt(db, key, fake_clock())
 
-    # The crash worker stamped last_attempt_at from its own (real) clock; the
-    # reconciler runs on the fake clock. Re-stamp the row to the fake clock's
-    # start instant so the fake-clock staleness check is deterministic — the
-    # crash and the timeout stay on the two substrate mechanisms (os._exit and
-    # clock advance), never wall time.
-    _rebase_last_attempt(db, key, fake_clock())
-
-    # A VERIFIABLE probe that confirms the effect (it really did land).
     probe_calls: list[dict[str, Any]] = []
 
     def verify(**arg_map: Any) -> tuple[Verification, dict[str, str]]:
         probe_calls.append(arg_map)
-        return Verification.PRESENT, {"refund_id": "re_worker"}
+        return Verification.PRESENT, {"refund_id": f"re_{key}"}
 
     reg = Registry()
     reg.register(
@@ -155,63 +162,69 @@ def test_scenario_3_crash_leaves_executing_then_probe_present_recovers(
         lambda dk, **_: pytest.fail("recovery of a present-verifiable row must not re-execute"),
     )
 
-    # Advance the fake clock past the reconcile timeout (never time.sleep).
     fake_clock.advance(300)
-    report = reconcile(
-        clock_store, older_than=timedelta(seconds=60), now_fn=fake_clock, registry=reg
-    )
+    report = reconcile(clock_store, older_than=OLDER_THAN, now_fn=fake_clock, registry=reg)
 
-    # Recovered by verification, not re-execution.
     assert report.count(Outcome.COMMITTED) == 1
-    assert probe_calls == [{"invoice": "inv_crash"}]  # probe got the rehydrated arg_map
-    assert effects.count(key) == 1  # STILL exactly one effect
+    assert probe_calls == [{"invoice": key}]  # probe got the rehydrated arg_map
+    assert effects.count(key) == 1  # STILL exactly one effect (I1)
 
     recovered = read_row(db, key)
     assert recovered.state == LedgerState.COMMITTED.value
-    assert recovered.result_json == {"refund_id": "re_worker"}
+    assert recovered.result_json == {"refund_id": f"re_{key}"}
     assert recovered.committed_at is not None
     assert recovered.attempts == 2  # recovered under the bumped epoch
-    assert recovered.error_json["reconciled"] == "committed"  # recovery evidence
+    assert recovered.error_json["reconciled"] == "committed"
+
+
+# ---------------------------------------------------------------------------
+# SPEC scenario 4 — crash before effect (after_claim / after_executing_mark).
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.crash
-def test_scenario_4_crash_before_effect_leaves_pending(
+@pytest.mark.parametrize("crashpoint", ["after_claim", "after_executing_mark"])
+def test_scenario_4_crash_before_effect_retry_gives_exactly_one_effect(
     db: Engine,
     database_url: str,
     effects: EffectsLog,
     clock_store: PostgresStore,
     fake_clock: FakeClock,
+    crashpoint: str,
 ) -> None:
-    """crashpoint after_claim: the row is durably 'pending' with ZERO effects
-    (the executing marker commits before the effect, so pending is provably
-    effect-free). Recovery re-validates preconditions and retries -> exactly one
-    effect, committed, attempts > 1."""
-    key = "k-crash-after-claim"
+    """Crash before the effect: after_claim leaves 'pending' (provably
+    effect-free), after_executing_mark leaves 'executing' with zero effects.
 
-    ctx = multiprocessing.get_context("spawn")
-    proc = ctx.Process(target=_crash_after_claim_worker, args=(database_url, key), daemon=True)
-    proc.start()
-    proc.join(timeout=DEADLINE)
-    assert proc.exitcode == 137
+    - pending -> on_absent=RETRY re-validates preconditions and re-runs execute
+      (probe PRESENT) -> exactly one effect, committed.
+    - executing-with-no-effect -> the probe answers ABSENT (nothing landed), so
+      recovery treats it as effect-free and retries -> exactly one effect.
+    """
+    key = f"k-crash-s4-{crashpoint}"
+    assert _spawn_crash(database_url, key, crashpoint, Guarantee.VERIFIABLE) == CRASH_EXIT_CODE
 
     row = read_row(db, key)
-    assert row.state == LedgerState.PENDING.value
+    assert row.state == expected_state_after_crash(crashpoint).value
     assert effects.count(key) == 0  # provably effect-free
-    _rebase_last_attempt(db, key, fake_clock())
+    rebase_last_attempt(db, key, fake_clock())
 
     def execute(downstream_key: str | None, **_: Any) -> Any:
         effects.log(key)
         return {"refund_id": "re_retry"}
 
+    # Probe answers ABSENT until the retry logs the effect (mirrors reality: the
+    # crash left nothing downstream). For the pending row the probe is not even
+    # consulted before retry; for the executing row it proves absence first.
+    def verify(**_: Any) -> tuple[Verification, None]:
+        return (Verification.PRESENT if effects.count(key) else Verification.ABSENT), None
+
     reg = Registry()
-    reg.register(CRASH_ACTION, Effect(verify=lambda **_: (Verification.PRESENT, None)), execute)
+    reg.register(CRASH_ACTION, Effect(verify=verify), execute)
 
     fake_clock.advance(300)
-    from airlock.reconcile import OnAbsent
-
     report = reconcile(
         clock_store,
-        older_than=timedelta(seconds=60),
+        older_than=OLDER_THAN,
         on_absent=OnAbsent.RETRY,
         now_fn=fake_clock,
         registry=reg,
@@ -221,3 +234,48 @@ def test_scenario_4_crash_before_effect_leaves_pending(
     recovered = read_row(db, key)
     assert recovered.state == LedgerState.COMMITTED.value
     assert recovered.attempts > 1
+
+
+# ---------------------------------------------------------------------------
+# after_finalize_write — the finalize COMMITTED before the crash: the reconciler
+# never sees it (terminal rows are not stale-in-flight), and a duplicate call
+# returns the recorded outcome (scenario 1 across a crash).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.crash
+def test_crash_after_finalize_write_is_already_terminal(
+    db: Engine,
+    database_url: str,
+    effects: EffectsLog,
+    clock_store: PostgresStore,
+    fake_clock: FakeClock,
+) -> None:
+    """after_finalize_write: the finalize durably committed, the process died
+    before returning. The ledger is already terminal (committed) with one
+    effect; a reconcile pass finds nothing to do (terminal rows are not
+    stale-in-flight), so the crash is fully recovered by the durable finalize
+    alone."""
+    key = "k-crash-after-finalize"
+    assert (
+        _spawn_crash(database_url, key, "after_finalize_write", Guarantee.VERIFIABLE)
+        == CRASH_EXIT_CODE
+    )
+
+    row = read_row(db, key)
+    assert row.state == LedgerState.COMMITTED.value
+    assert row.committed_at is not None
+    assert effects.count(key) == 1
+    rebase_last_attempt(db, key, fake_clock())
+
+    reg = Registry()
+    reg.register(
+        CRASH_ACTION,
+        Effect(verify=lambda **_: (Verification.PRESENT, None)),
+        lambda dk, **_: pytest.fail("a committed row must never be recovered/re-executed"),
+    )
+    fake_clock.advance(300)
+    report = reconcile(clock_store, older_than=OLDER_THAN, now_fn=fake_clock, registry=reg)
+    assert report.total == 0  # terminal rows are invisible to the sweep
+    assert effects.count(key) == 1
+    assert read_row(db, key).state == LedgerState.COMMITTED.value

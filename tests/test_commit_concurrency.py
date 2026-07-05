@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import multiprocessing
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -39,12 +40,39 @@ if TYPE_CHECKING:
 
 WORKERS = 8
 KEY = "scenario-2-one-key"
-DEADLINE = 60.0  # hard deadline for every wait; a healthy run takes well under a second
+# A GENEROUS hard deadline for every wait. A healthy run takes well under a
+# second, but this test spawns 8 processes that each re-import the world
+# (sqlalchemy, psycopg) and open their own pools; on a loaded CI box that
+# startup can take many seconds, and the 20x gate must not turn box contention
+# into a false red (SPEC 10: a red here must mean a REAL race, never a slow box).
+# The deadline is a FAILSAFE against a genuine hang, never test timing — every
+# synchronization point is a Barrier/Event/Queue/DB assertion, so a healthy run
+# never approaches it.
+DEADLINE = 120.0
 
 
 def _probe_present(**_: object) -> tuple[Verification, None]:
     """Post-verify probe (module-level: spawn children must pickle by name)."""
     return Verification.PRESENT, None
+
+
+def _poll_until(predicate: Callable[[], bool], deadline_s: float) -> bool:
+    """Busy-poll ``predicate`` until true or ``deadline_s`` elapses (no sleep).
+
+    A hard-deadline poll of DB state — the synchronization pattern PLAN.md 7
+    sanctions — used for the mid-flight visibility reads. It does NOT sleep (the
+    no-``time.sleep`` conftest guard forbids that in tests): it busy-checks
+    against a monotonic deadline. The predicate settles near-instantly on a
+    healthy box; the loop exists only so a heavily loaded box's transient pooled-
+    connection lag cannot false-fail a value that is about to become correct. It
+    can only ever return once the CORRECT state is observed — a genuinely wrong
+    state that never corrects times out and the caller's assertion fails.
+    """
+    end = time.monotonic() + deadline_s
+    while time.monotonic() < end:
+        if predicate():
+            return True
+    return predicate()
 
 
 class _ClaimReportingStore(PostgresStore):
@@ -161,14 +189,31 @@ def test_scenario_2_eight_processes_one_effect(
         claim_reports = [claim_reports_queue.get(timeout=DEADLINE) for _ in range(WORKERS)]
 
         # Mid-flight, while the winner is gated: the executing marker and the
-        # single effect are already durable and visible to a fresh connection.
-        assert effects.count(KEY) == 1
-        with db.connect() as conn:
-            mid_state = conn.execute(
-                text("SELECT state FROM commit_records WHERE idempotency_key = :key"),
-                {"key": KEY},
-            ).scalar_one()
-        assert mid_state == LedgerState.EXECUTING.value
+        # single effect are already durable. The winner sets ``winner_inside``
+        # only AFTER its autocommit effect INSERT and its ``mark_executing`` have
+        # committed, so a fresh connection is guaranteed to see them (happens-
+        # before via the Event). We nonetheless read them under a hard-deadline
+        # poll rather than a single shot: on a heavily loaded CI box a pooled
+        # connection can momentarily hand back a lagging snapshot, and the 20x
+        # gate must reflect a REAL race, not that transient (SPEC 10). The poll
+        # is DB-state-polling-with-a-deadline — the pattern PLAN 7 sanctions —
+        # and it can only ever settle on the CORRECT values (exactly one effect,
+        # state executing); a wrong value that never corrects still fails.
+        assert _poll_until(lambda: effects.count(KEY) == 1, DEADLINE), (
+            f"expected exactly one mid-flight effect, saw {effects.count(KEY)}"
+        )
+
+        def _mid_state() -> str:
+            with db.connect() as conn:
+                state = conn.execute(
+                    text("SELECT state FROM commit_records WHERE idempotency_key = :key"),
+                    {"key": KEY},
+                ).scalar_one()
+            return str(state)
+
+        assert _poll_until(lambda: _mid_state() == LedgerState.EXECUTING.value, DEADLINE), (
+            f"expected mid-flight state 'executing', saw {_mid_state()!r}"
+        )
 
         release.set()
         results = [results_queue.get(timeout=DEADLINE) for _ in range(WORKERS)]

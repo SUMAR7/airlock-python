@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from airlock.errors import AirlockError as AirlockError
     from airlock.errors import AtMostOnceWarning as AtMostOnceWarning
     from airlock.errors import CanonicalizationError as CanonicalizationError
+    from airlock.errors import CommitFailed as CommitFailed
     from airlock.errors import CommitWaitTimeout as CommitWaitTimeout
     from airlock.errors import GateNotSupported as GateNotSupported
     from airlock.errors import PreconditionFailed as PreconditionFailed
@@ -64,6 +65,7 @@ _EXPORTS: dict[str, str] = {
     "AirlockError": "airlock.errors",
     "AtMostOnceWarning": "airlock.errors",
     "CanonicalizationError": "airlock.errors",
+    "CommitFailed": "airlock.errors",
     "CommitWaitTimeout": "airlock.errors",
     "GateNotSupported": "airlock.errors",
     "PreconditionFailed": "airlock.errors",

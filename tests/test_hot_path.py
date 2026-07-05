@@ -116,6 +116,29 @@ def test_guard_deny_path_no_socket_no_store() -> None:
 
 
 @pytest.mark.usefixtures("no_network", "guard_isolation")
+def test_guard_gate_path_no_socket_no_store() -> None:
+    """@guard's GATE fail-safe surfaces without a socket and without touching the
+    store: the side effect never runs, and the block is reached purely
+    in-process (no paused_runs is built in P2.1, so no store write happens)."""
+    from airlock.errors import ActionPending, GateNotSupported
+
+    init(store=_ExplodingStore(), policy=Policy(default=Decision.GATE))
+
+    executed: list[int] = []
+
+    @guard("gated.op", reversibility=Reversibility.IRREVERSIBLE)
+    def do_gated(x: int) -> int:
+        executed.append(x)  # must never run
+        return x
+
+    with pytest.raises(GateNotSupported) as excinfo:
+        do_gated(1)
+    assert isinstance(excinfo.value, ActionPending)
+    assert excinfo.value.run_id is None  # no paused_runs row (P2.1)
+    assert executed == []  # no side effect
+
+
+@pytest.mark.usefixtures("no_network", "guard_isolation")
 def test_guard_deny_before_any_ledger_write() -> None:
     """Deny raises before the store is even consulted — asserted by the
     exploding store staying untouched (any access would have raised its own

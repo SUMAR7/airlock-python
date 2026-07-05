@@ -64,6 +64,7 @@ def test_lazy_public_surface() -> None:
         AirlockError,
         AtMostOnceWarning,
         CanonicalizationError,
+        CommitFailed,
         CommitWaitTimeout,
         GateNotSupported,
         PreconditionFailed,
@@ -97,6 +98,7 @@ def test_lazy_public_surface() -> None:
     assert airlock.AirlockError is AirlockError
     assert airlock.AtMostOnceWarning is AtMostOnceWarning
     assert airlock.CanonicalizationError is CanonicalizationError
+    assert airlock.CommitFailed is CommitFailed
     assert airlock.CommitWaitTimeout is CommitWaitTimeout
     assert airlock.GateNotSupported is GateNotSupported
     assert airlock.PreconditionFailed is PreconditionFailed

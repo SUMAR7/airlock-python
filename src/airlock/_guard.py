@@ -57,7 +57,13 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 from pydantic import JsonValue
 
 from airlock.effects import Effect
-from airlock.errors import ActionDenied, AirlockError, GateNotSupported, PreconditionFailed
+from airlock.errors import (
+    ActionDenied,
+    AirlockError,
+    CommitFailed,
+    GateNotSupported,
+    PreconditionFailed,
+)
 from airlock.events import EventSink, PolicyDecisionEvent, emit_policy_decision
 from airlock.idempotency import build_arg_map, derive_key, namespace_user_key
 from airlock.policy import ActionContext, Policy, PolicyBackend
@@ -397,6 +403,8 @@ def _commit_auto(
         reconcile_after=runtime.reconcile_after,
         execute_timeout=runtime.execute_timeout,
     )
+    if outcome.state is LedgerState.COMMITTED:
+        return outcome.result
     if outcome.state is LedgerState.ABORTED:
         # Preconditions failed after the claim (SPEC scenario 8): surface it as
         # PreconditionFailed rather than a silent None, so the caller sees the
@@ -407,7 +415,22 @@ def _commit_auto(
             action_type=spec.action_type,
             key=ledger_key,
         )
-    return outcome.result
+    # FAILED (post-verify proved the effect absent) or UNKNOWN (a duplicate call
+    # read back a row the reconciler / an at-most-once crash left unknown). The
+    # prime directive is "always provable": returning outcome.result (None) here
+    # would let the caller mistake a non-landed effect for a successful commit,
+    # so surface the non-committed terminal state explicitly. (A live
+    # post-verify 'unknown' raises VerificationUnknown from commit_once before a
+    # terminal state exists; that propagates unchanged and never reaches here.)
+    raise CommitFailed(
+        f"action {spec.action_type!r} finalized {outcome.state.value!r}, not committed: the "
+        "side effect did not provably take effect (see the error/evidence on the ledger row "
+        f"for key {ledger_key!r}). Airlock never blind-retries a non-committed row.",
+        action_type=spec.action_type,
+        key=ledger_key,
+        state=outcome.state.value,
+        error=outcome.error,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -510,10 +533,8 @@ def _bind_from_map(
 
     positional: list[Any] = []
     keyword: dict[str, Any] = {}
-    declared: set[str] = set()
 
     for name, parameter in parameters.items():
-        declared.add(name)
         if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
             positional.extend(remaining.pop(name, []))
         elif name not in remaining:

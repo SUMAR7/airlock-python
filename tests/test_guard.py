@@ -155,6 +155,40 @@ def test_auto_callable_cost_and_blast_radius_resolved_from_args(
     assert effects.count("500") == 0
 
 
+def test_auto_failed_post_verify_surfaces_commit_failed(
+    store: PostgresStore, effects: EffectsLog, db: Engine
+) -> None:
+    """An AUTO action whose post-verify probe PROVES the effect absent finalizes
+    the ledger row 'failed'. @guard must surface that as CommitFailed rather than
+    a silent None — the prime directive is 'always provable', so the caller must
+    not mistake a non-landed effect for a successful commit."""
+    from airlock.errors import CommitFailed
+    from airlock.types import Verification
+
+    init(store=store, policy=_auto_policy())
+
+    @guard(
+        "refund.probeabsent",
+        reversibility=Reversibility.REVERSIBLE,
+        effect=Effect(verify=lambda **_: (Verification.ABSENT, {"checked": True})),
+    )
+    def do_refund(invoice: str) -> str:
+        effects.log(invoice)
+        return invoice
+
+    with pytest.raises(CommitFailed) as excinfo:
+        do_refund("inv_absent")
+    assert excinfo.value.action_type == "refund.probeabsent"
+    assert excinfo.value.state == LedgerState.FAILED.value
+    assert excinfo.value.error is not None  # the probe evidence is carried
+    # The ledger row is durably 'failed' (executed, confirmed not to have landed).
+    with db.connect() as conn:
+        state = conn.execute(
+            text("SELECT state FROM commit_records WHERE action_type = 'refund.probeabsent'")
+        ).scalar_one()
+    assert state == LedgerState.FAILED.value
+
+
 # ---------------------------------------------------------------------------
 # DENY — raises, does not execute, nothing durable.
 # ---------------------------------------------------------------------------

@@ -1,8 +1,9 @@
-"""Airlock error hierarchy — P1.2 surface.
+"""Airlock error hierarchy — P1.2 + P2.1 surface.
 
-Later phases add their own errors here (``ActionDenied``, ``ActionPending``,
-``PreconditionFailed``, ``AtMostOnceUnknown`` — PLAN.md section 3.1); do not
-pre-create them: the SDK raises exactly what is defined below.
+P2.1 adds the ``@guard`` decision-path errors (``ActionDenied``,
+``ActionPending``, ``PreconditionFailed`` — PLAN.md 3.1). ``AtMostOnceUnknown``
+remains unbuilt; do not pre-create it — the SDK raises exactly what is defined
+below.
 
 ``AtMostOnceWarning`` lives here too: it is not an ``AirlockError`` (it is a
 ``Warning``), but this module is the single home for every signal type Airlock
@@ -16,11 +17,15 @@ from typing import Any
 from airlock.types import LedgerState
 
 __all__ = [
+    "ActionDenied",
+    "ActionPending",
     "AirlockError",
     "AtMostOnceWarning",
     "CanonicalizationError",
     "CommitWaitTimeout",
     "ExecuteTimeout",
+    "GateNotSupported",
+    "PreconditionFailed",
     "VerificationUnknown",
 ]
 
@@ -122,3 +127,87 @@ class VerificationUnknown(AirlockError):
         super().__init__(message)
         self.key = key
         self.evidence = evidence
+
+
+# ---------------------------------------------------------------------------
+# The @guard decision-path errors (P2.1).
+# ---------------------------------------------------------------------------
+
+
+class ActionDenied(AirlockError):
+    """The policy returned ``deny``: the guarded action is BLOCKED (ADR-6).
+
+    No side effect runs — ``@guard`` raises this INSTEAD of calling the tool,
+    before any ledger claim — and a policy-decision audit record is emitted
+    first (PLAN.md "Deny = block + audit event"; the durable hash-chained row
+    is P2.2, which formalizes it). This is a hard stop for the current call:
+    there is nothing to retry until the policy or the action's risk metadata
+    changes.
+
+    Attributes:
+        action_type: the action the policy denied.
+    """
+
+    def __init__(self, message: str, *, action_type: str) -> None:
+        super().__init__(message)
+        self.action_type = action_type
+
+
+class ActionPending(AirlockError):
+    """The policy returned ``gate``: the action needs human approval (ADR-4).
+
+    In P2.1 gating is DELIBERATELY MINIMAL: the durable pause, resume, and
+    approval transport are P2.3. ``@guard`` raises this the moment a GATE
+    decision is reached — AFTER emitting the policy-decision audit record and
+    BEFORE any side effect (fail-safe: a gated action never executes here) —
+    so a gate is surfaced cleanly rather than silently executed or dropped.
+    P2.3 replaces the raise with a durable ``paused_runs`` write + transport
+    send/wait; the seam is documented in ``airlock._guard``.
+
+    ``run_id`` is ``None`` in P2.1 (no ``paused_runs`` row is created yet);
+    the attribute exists so P2.3 can populate it without a signature change.
+
+    Attributes:
+        action_type: the action the policy gated.
+        run_id: the paused-run id — always ``None`` until P2.3.
+    """
+
+    def __init__(self, message: str, *, action_type: str, run_id: str | None = None) -> None:
+        super().__init__(message)
+        self.action_type = action_type
+        self.run_id = run_id
+
+
+class GateNotSupported(ActionPending):
+    """A GATE decision was reached but no pause layer is wired (P2.1 default).
+
+    A subclass of :class:`ActionPending` (so ``except ActionPending`` catches
+    it) that names P2.3 explicitly: in P2.1 there is no durable pause or
+    transport, so the only honest thing ``@guard`` can do on GATE is refuse to
+    proceed and say why. When P2.3 lands, a configured pause layer supersedes
+    this and the plain :class:`ActionPending` (with a ``run_id``) is raised for
+    async callers instead. The distinct type lets integrators assert "P2.1 did
+    not silently execute a gated action" without conflating it with a real
+    async-pending pause.
+    """
+
+
+class PreconditionFailed(AirlockError):
+    """A guarded action's ``preconditions`` returned ``False`` before executing.
+
+    Raised by ``@guard`` when the AUTO path re-validates preconditions after
+    the claim and they do not hold (SPEC.md scenario 8 at the decorator layer):
+    the action is finalized ``aborted`` in the ledger (no side effect) and this
+    is raised so the caller sees the abort explicitly rather than a silent
+    no-op. ``commit_once`` performs the same re-validation internally; this
+    error is the caller-facing surface ``@guard`` puts on that abort.
+
+    Attributes:
+        action_type: the action whose preconditions failed.
+        key: the idempotency key of the aborted ledger row.
+    """
+
+    def __init__(self, message: str, *, action_type: str, key: str) -> None:
+        super().__init__(message)
+        self.action_type = action_type
+        self.key = key

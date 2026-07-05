@@ -16,23 +16,40 @@ if TYPE_CHECKING:
     from airlock._canonical import canonical_bytes as canonical_bytes
     from airlock._canonical import canonical_json as canonical_json
     from airlock._canonical import decimal_string as decimal_string
+    from airlock._guard import Airlock as Airlock
+    from airlock._guard import guard as guard
+    from airlock._guard import init as init
     from airlock.commit import commit_once as commit_once
     from airlock.effects import Effect as Effect
+    from airlock.errors import ActionDenied as ActionDenied
+    from airlock.errors import ActionPending as ActionPending
     from airlock.errors import AirlockError as AirlockError
     from airlock.errors import AtMostOnceWarning as AtMostOnceWarning
     from airlock.errors import CanonicalizationError as CanonicalizationError
     from airlock.errors import CommitWaitTimeout as CommitWaitTimeout
+    from airlock.errors import GateNotSupported as GateNotSupported
+    from airlock.errors import PreconditionFailed as PreconditionFailed
     from airlock.errors import VerificationUnknown as VerificationUnknown
+    from airlock.events import EventSink as EventSink
+    from airlock.events import PolicyDecisionEvent as PolicyDecisionEvent
     from airlock.idempotency import build_arg_map as build_arg_map
     from airlock.idempotency import derive_key as derive_key
     from airlock.idempotency import namespace_user_key as namespace_user_key
+    from airlock.policy import ActionContext as ActionContext
+    from airlock.policy import Policy as Policy
+    from airlock.policy import PolicyBackend as PolicyBackend
+    from airlock.policy import Rule as Rule
     from airlock.store import Store as Store
     from airlock.store import from_url as from_url
+    from airlock.types import BlastRadius as BlastRadius
     from airlock.types import Claim as Claim
     from airlock.types import CommitOutcome as CommitOutcome
     from airlock.types import CommitRecord as CommitRecord
+    from airlock.types import Decision as Decision
     from airlock.types import Guarantee as Guarantee
     from airlock.types import LedgerState as LedgerState
+    from airlock.types import Money as Money
+    from airlock.types import Reversibility as Reversibility
     from airlock.types import Verification as Verification
 
 _EXPORTS: dict[str, str] = {
@@ -42,21 +59,38 @@ _EXPORTS: dict[str, str] = {
     "decimal_string": "airlock._canonical",
     "commit_once": "airlock.commit",
     "Effect": "airlock.effects",
+    "ActionDenied": "airlock.errors",
+    "ActionPending": "airlock.errors",
     "AirlockError": "airlock.errors",
     "AtMostOnceWarning": "airlock.errors",
     "CanonicalizationError": "airlock.errors",
     "CommitWaitTimeout": "airlock.errors",
+    "GateNotSupported": "airlock.errors",
+    "PreconditionFailed": "airlock.errors",
     "VerificationUnknown": "airlock.errors",
+    "EventSink": "airlock.events",
+    "PolicyDecisionEvent": "airlock.events",
+    "Airlock": "airlock._guard",
+    "guard": "airlock._guard",
+    "init": "airlock._guard",
     "build_arg_map": "airlock.idempotency",
     "derive_key": "airlock.idempotency",
     "namespace_user_key": "airlock.idempotency",
+    "ActionContext": "airlock.policy",
+    "Policy": "airlock.policy",
+    "PolicyBackend": "airlock.policy",
+    "Rule": "airlock.policy",
     "Store": "airlock.store",
     "from_url": "airlock.store",
+    "BlastRadius": "airlock.types",
     "Claim": "airlock.types",
     "CommitOutcome": "airlock.types",
     "CommitRecord": "airlock.types",
+    "Decision": "airlock.types",
     "Guarantee": "airlock.types",
     "LedgerState": "airlock.types",
+    "Money": "airlock.types",
+    "Reversibility": "airlock.types",
     "Verification": "airlock.types",
 }
 

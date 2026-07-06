@@ -2,8 +2,10 @@
 
 P1.1 surface: ``claim`` / ``mark_executing`` / ``record_error`` /
 ``finalize`` / ``load``. P1.3 adds the two reconciler methods
-(``stale_inflight``, ``bump_epoch``). The pause methods arrive in P2.3 and
-``append_audit`` in P2.2 — do not add them early.
+(``stale_inflight``, ``bump_epoch``). P2.2 adds the audit chain (ADR-5):
+``append_audit`` per PLAN.md 3.3, plus the verifier's read surface
+(``audit_head`` / ``iter_audit``) that ``airlock.audit.verify_chain``
+consumes. The pause methods arrive in P2.3 — do not add them early.
 
 This module must stay import-light: importing it (or ``airlock`` itself) must
 never import sqlalchemy/psycopg. Backends are imported lazily inside
@@ -12,13 +14,21 @@ never import sqlalchemy/psycopg. Backends are imported lazily inside
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import timedelta
 from typing import Protocol
 
 from pydantic import JsonValue
 
-from airlock.types import Claim, CommitRecord, Guarantee, LedgerState
+from airlock.types import (
+    AuditEvent,
+    AuditHead,
+    AuditRow,
+    Claim,
+    CommitRecord,
+    Guarantee,
+    LedgerState,
+)
 
 __all__ = ["Store", "from_url"]
 
@@ -95,10 +105,14 @@ class Store(Protocol):
         Returns ``False`` when fenced — the reconciler owns resolution; never
         override.
 
-        ``audit`` is a documented no-op seam in P1.1: the parameter is
-        accepted but nothing is persisted. P2.2 adds the hash-chained audit
-        append INSIDE this same transaction without changing this signature
-        (PLAN.md section 10 sequencing).
+        ``audit`` (P2.2, the P1.1 seam upgraded without a signature change —
+        PLAN.md section 10 sequencing): an
+        :class:`~airlock.types.AuditEvent` to append to the hash chain
+        INSIDE this same transaction (SPEC section 5 step 5), or ``None`` for
+        no audit row. Either the terminal CAS and the chained append both
+        land, or neither does — a crash/rollback between them is impossible.
+        The append happens only when the CAS matched (a fenced finalize must
+        not put a false transition on the chain).
         """
         ...
 
@@ -145,6 +159,33 @@ class Store(Protocol):
         ``record_error`` all carry ``WHERE attempts = <its epoch>``, a bumped
         row fences the original owner: it can no longer execute or finalize.
         """
+        ...
+
+    def append_audit(self, event: AuditEvent) -> AuditRow:
+        """Append one hash-chained audit row (ADR-5, PLAN.md 5.1/5.2).
+
+        The append protocol, inside the enclosing transaction: SELECT the
+        ``audit_chain_head`` singleton ``FOR UPDATE`` (the head-row lock
+        serializes appenders across processes), assign the gapless
+        ``seq = head.seq + 1``, compute ``row_hash`` in the SDK
+        (``airlock.audit.compute_row_hash`` — the DB never hashes), INSERT
+        the row, UPDATE the head. The hashed ``created_at`` and the stored
+        column are the same SDK-supplied value (never ``DEFAULT now()``).
+
+        Audit rows are never updated or deleted (append-only is additionally
+        enforced in the DB by a trigger + REVOKE).
+        """
+        ...
+
+    def audit_head(self) -> AuditHead | None:
+        """Read the chain head (no lock): the last ``(seq, row_hash)``, or
+        ``None`` when the audit schema is uninitialized."""
+        ...
+
+    def iter_audit(self, start_seq: int = 0) -> Iterator[AuditRow]:
+        """Stream audit rows ``ORDER BY seq`` from ``start_seq`` (inclusive),
+        with constant memory (server-side cursor) — the
+        ``airlock.audit.verify_chain`` read path (O(n) single pass)."""
         ...
 
 

@@ -9,8 +9,10 @@ single biggest failure mode found in design review.
 
 P1.1 defined the commit-ledger types; P1.2 adds ``Verification`` (the probe
 vocabulary); P2.1 adds the policy vocabulary (``Decision``, ``Reversibility``,
-``BlastRadius``, ``Money``). Later phases add the remaining section 3.2 rows
-(``PauseStatus`` in P2.3) to this same module.
+``BlastRadius``, ``Money``); P2.2 adds the event vocabulary
+(``ActionOutcome``, ``HumanDecision``) and the audit-chain models
+(``AuditEvent``/``AuditRow``/``AuditHead``). Later phases add the remaining
+section 3.2 rows (``PauseStatus`` in P2.3) to this same module.
 """
 
 from __future__ import annotations
@@ -25,12 +27,17 @@ __all__ = [
     "BLAST_RADIUS_ORDER",
     "IN_FLIGHT_LEDGER_STATES",
     "TERMINAL_LEDGER_STATES",
+    "ActionOutcome",
+    "AuditEvent",
+    "AuditHead",
+    "AuditRow",
     "BlastRadius",
     "Claim",
     "CommitOutcome",
     "CommitRecord",
     "Decision",
     "Guarantee",
+    "HumanDecision",
     "LedgerState",
     "Money",
     "Reversibility",
@@ -328,3 +335,105 @@ class Money(BaseModel):
     def as_decimal(self) -> Decimal:
         """The amount as a :class:`decimal.Decimal` (for comparisons/arithmetic)."""
         return Decimal(self.amount)
+
+
+# ---------------------------------------------------------------------------
+# Event vocabulary (P2.2) — the ``action_event.v1`` enums (PLAN.md 6.3).
+#
+# Same single-source rule (PLAN.md 10.5): the JSON-schema enum lists in
+# /contracts/events/action_event.v1.json are CI-asserted against these.
+# ---------------------------------------------------------------------------
+
+
+class ActionOutcome(StrEnum):
+    """The ``outcome`` field of ``action_event.v1`` (PLAN.md 6.3).
+
+    The four terminal ledger states plus ``denied`` (a policy DENY blocks the
+    call before any ledger claim exists, so it is an event outcome but never a
+    ledger state). The first four values are asserted equal to
+    :data:`TERMINAL_LEDGER_STATES` by a CI test — one vocabulary, never forked.
+    """
+
+    COMMITTED = "committed"
+    ABORTED = "aborted"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+    DENIED = "denied"
+
+
+class HumanDecision(StrEnum):
+    """The ``human_decision`` field of ``action_event.v1`` (PLAN.md 6.3).
+
+    ``null`` on the event means no human was involved (auto/deny paths, and
+    every P2.2 event — the approval flow that populates this lands in P2.3).
+    """
+
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+# ---------------------------------------------------------------------------
+# Audit models (P2.2, ADR-5) — the hash-chained ``audit_events`` rows.
+# Hash computation/verification lives in ``airlock.audit``; these are the
+# import-light data shapes (pydantic only) the Store protocol speaks.
+# ---------------------------------------------------------------------------
+
+
+class AuditEvent(BaseModel):
+    """One audit event to append to the chain (the ``Store.append_audit`` input).
+
+    ``seq``, ``prev_hash`` and ``row_hash`` are assigned by the append protocol
+    under the chain-head lock (PLAN.md 5.1/5.2) — a caller never supplies them.
+    ``created_at`` is SDK-supplied (never ``DEFAULT now()``); when ``None`` the
+    store stamps it with its own injectable ``now_fn`` at append time, and the
+    STAMPED value is both hashed and stored (the hashed ``created_at`` and the
+    stored column are the same instant, PLAN.md 5.2). A naive (tz-less)
+    ``created_at`` is rejected at hash time (``airlock.audit``).
+
+    ``payload`` must lie in the ``airlock-canon-1`` value domain (no floats,
+    no over-bound ints, ... — /contracts/canonical-json.md): it is canonicalized
+    for hashing at append time, and a value outside the domain fails the append
+    BEFORE anything is durable.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    event_type: str
+    payload: dict[str, JsonValue]
+    run_id: str | None = None
+    action_type: str | None = None
+    created_at: datetime | None = None
+
+
+class AuditRow(BaseModel):
+    """One appended row of the ``audit_events`` chain (PLAN.md 5.1).
+
+    Rows are append-only (ADR-5): never updated, never deleted — enforced in
+    the DB by a BEFORE UPDATE/DELETE trigger plus REVOKE, and tamper-evident
+    via the hash chain (``airlock.audit.verify_chain``).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    seq: int
+    event_type: str
+    payload: dict[str, JsonValue]
+    prev_hash: bytes
+    row_hash: bytes
+    created_at: datetime
+    run_id: str | None = None
+    action_type: str | None = None
+
+
+class AuditHead(BaseModel):
+    """The ``audit_chain_head`` singleton: O(1) tail lookup (PLAN.md 5.1).
+
+    Its row lock serializes appenders across processes; ``seq``/``row_hash``
+    always mirror the last appended row.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    seq: int
+    row_hash: bytes

@@ -21,6 +21,7 @@ __all__ = [
     "ActionPending",
     "AirlockError",
     "AtMostOnceWarning",
+    "AuditChainError",
     "CanonicalizationError",
     "CommitFailed",
     "CommitWaitTimeout",
@@ -55,6 +56,25 @@ class AtMostOnceWarning(UserWarning):
     a feature; never suppress this warning in library code. Escalate it to an
     error in strict deployments with ``-W error::airlock.AtMostOnceWarning``.
     """
+
+
+class AuditChainError(AirlockError):
+    """The hash-chained audit trail failed verification (ADR-5).
+
+    Raised by ``airlock.audit.verify_chain`` when any row's recomputed hash,
+    ``prev_hash`` linkage, gapless ``seq`` ordering, genesis constant, or the
+    chain-head match fails — i.e. the append-only history was tampered with,
+    truncated, reordered, or the chain metadata is corrupt. This is exactly
+    the condition the chain exists to make detectable; treat it as a P0
+    integrity incident, never a transient error.
+
+    Attributes:
+        seq: the first offending chain position.
+    """
+
+    def __init__(self, message: str, *, seq: int) -> None:
+        super().__init__(message)
+        self.seq = seq
 
 
 class CommitWaitTimeout(AirlockError):

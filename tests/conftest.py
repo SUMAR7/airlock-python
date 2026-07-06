@@ -259,3 +259,27 @@ def read_row(engine: Engine, key: str) -> Any:
             ),
             {"key": key},
         ).one()
+
+
+@pytest.fixture
+def guard_isolation() -> Iterator[None]:
+    """Isolate @guard tests: reset the ambient runtime AND the shared registry.
+
+    ``airlock.init`` sets a process-wide contextvar and ``@guard`` populates the
+    process-wide default registry; without a reset those leak across tests (a
+    stale runtime, or a "already registered with a different registration"
+    collision when two tests reuse an action_type). This fixture snapshots and
+    restores both around a test. Request it in every @guard test (P2.1).
+    """
+    from airlock._guard import _runtime_var
+    from airlock.registry import registry
+
+    token = _runtime_var.set(None)
+    saved_registrations = dict(registry._registrations)
+    registry._registrations.clear()
+    try:
+        yield
+    finally:
+        registry._registrations.clear()
+        registry._registrations.update(saved_registrations)
+        _runtime_var.reset(token)

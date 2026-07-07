@@ -147,7 +147,7 @@ def db(schema_engine: Engine) -> Engine:
     from airlock.store._schema import seed_genesis
 
     with schema_engine.begin() as conn:
-        conn.execute(text("TRUNCATE commit_records, effects_log RESTART IDENTITY"))
+        conn.execute(text("TRUNCATE commit_records, paused_runs, effects_log RESTART IDENTITY"))
         conn.execute(text("TRUNCATE audit_events, audit_chain_head RESTART IDENTITY"))
     seed_genesis(schema_engine)
     return schema_engine

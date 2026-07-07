@@ -11,12 +11,14 @@ P1.1 defined the commit-ledger types; P1.2 adds ``Verification`` (the probe
 vocabulary); P2.1 adds the policy vocabulary (``Decision``, ``Reversibility``,
 ``BlastRadius``, ``Money``); P2.2 adds the event vocabulary
 (``ActionOutcome``, ``HumanDecision``) and the audit-chain models
-(``AuditEvent``/``AuditRow``/``AuditHead``). Later phases add the remaining
-section 3.2 rows (``PauseStatus`` in P2.3) to this same module.
+(``AuditEvent``/``AuditRow``/``AuditHead``); P2.3 adds the pause vocabulary
+(``PauseStatus`` — exactly the ADR-4 state machine — plus ``PausedRun``,
+``PauseClaim`` and ``ApprovalDecision``).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -26,8 +28,12 @@ from pydantic import BaseModel, ConfigDict, JsonValue, field_validator
 __all__ = [
     "BLAST_RADIUS_ORDER",
     "IN_FLIGHT_LEDGER_STATES",
+    "OPEN_PAUSE_STATUSES",
+    "PAUSE_TRANSITIONS",
+    "RESOLVED_PAUSE_STATUSES",
     "TERMINAL_LEDGER_STATES",
     "ActionOutcome",
+    "ApprovalDecision",
     "AuditEvent",
     "AuditHead",
     "AuditRow",
@@ -40,6 +46,9 @@ __all__ = [
     "HumanDecision",
     "LedgerState",
     "Money",
+    "PauseClaim",
+    "PauseStatus",
+    "PausedRun",
     "Reversibility",
     "Verification",
 ]
@@ -437,3 +446,162 @@ class AuditHead(BaseModel):
 
     seq: int
     row_hash: bytes
+
+
+# ---------------------------------------------------------------------------
+# Pause vocabulary (P2.3, ADR-4) — the durable-pause state machine.
+#
+# Same single-source rule (PLAN.md 10.5): the ``paused_runs.status`` DDL CHECK
+# list is GENERATED from ``PauseStatus`` and CI-asserted against it. The state
+# machine is LOCKED by ADR-4: ``proposed -> approved|rejected ->
+# committed|aborted`` — there is NO TTL/'expired' state in v1 (PLAN.md 10.9;
+# adding one goes through PROPOSAL.md, never here).
+# ---------------------------------------------------------------------------
+
+
+class PauseStatus(StrEnum):
+    """Lifecycle of a ``paused_runs`` row — exactly the ADR-4 machine.
+
+    - ``proposed``  — persisted, awaiting a human decision.
+    - ``approved``  — a human approved; the commit may not have landed yet
+      (this is the state the ensure-committed core / the reconciler sweep
+      exists for — an approved run is NEVER stranded, PLAN.md 4.3).
+    - ``rejected``  — a human rejected; driven to ``aborted`` by
+      ``apply_decision`` (rejected is an intermediate state, not terminal).
+    - ``committed`` — the effect committed exactly once (terminal).
+    - ``aborted``   — we chose not to execute: rejection, or preconditions
+      violated at commit time (terminal).
+    """
+
+    PROPOSED = "proposed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    COMMITTED = "committed"
+    ABORTED = "aborted"
+
+    @property
+    def is_resolved(self) -> bool:
+        return self in RESOLVED_PAUSE_STATUSES
+
+
+#: The ADR-4 DAG — the ONLY legal status transitions, single-sourced here:
+#: the store's guarded CAS refuses any pair not in this set, and the property
+#: machine's I6 invariant asserts observed history never leaves it.
+PAUSE_TRANSITIONS: frozenset[tuple[PauseStatus, PauseStatus]] = frozenset(
+    {
+        (PauseStatus.PROPOSED, PauseStatus.APPROVED),
+        (PauseStatus.PROPOSED, PauseStatus.REJECTED),
+        (PauseStatus.APPROVED, PauseStatus.COMMITTED),
+        (PauseStatus.APPROVED, PauseStatus.ABORTED),
+        (PauseStatus.REJECTED, PauseStatus.ABORTED),
+    }
+)
+
+#: Terminal pause statuses — a resolved run never transitions again.
+RESOLVED_PAUSE_STATUSES: frozenset[PauseStatus] = frozenset(
+    {PauseStatus.COMMITTED, PauseStatus.ABORTED}
+)
+
+#: Non-terminal statuses, in DDL/lifecycle order. A re-gate of the same action
+#: ATTACHES to a run in one of these (PLAN.md 4.3: collide-and-dedupe).
+OPEN_PAUSE_STATUSES: tuple[PauseStatus, ...] = (
+    PauseStatus.PROPOSED,
+    PauseStatus.APPROVED,
+    PauseStatus.REJECTED,
+)
+
+
+class PausedRun(BaseModel):
+    """One row of ``paused_runs`` (DDL exactly per PLAN.md 5.1).
+
+    ``approval_ref`` is SDK-minted and is THE only cross-boundary join key
+    (PLAN.md 6.1); ``approval_id`` is reserved for the P3.x backstop poll and
+    stays ``None`` until a hosted control plane assigns one.
+    ``serialized_state`` is canonical JSON (never pickle): the arg_map, the
+    propose-time precondition snapshot, and the resolved risk metadata —
+    everything a FRESH process needs to rehydrate the call (scenario 6).
+    ``state_version`` gates rehydration: an unknown version is refused loudly,
+    never misparsed. ``approved_action_json`` is RESERVED for
+    edit-before-approve and is always ``None`` in v1 (PLAN.md 10.9).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    run_id: str
+    idempotency_key: str
+    approval_ref: str
+    action_type: str
+    serialized_state: dict[str, JsonValue]
+    state_version: int
+    status: PauseStatus
+    approval_id: str | None = None
+    approved_action_json: JsonValue = None  # reserved; NULL in v1
+    decided_by: str | None = None
+    decided_by_display: str | None = None
+    decided_at: datetime | None = None
+    decision_latency_ms: int | None = None
+    created_at: datetime
+    resolved_at: datetime | None = None
+
+
+class PauseClaim(BaseModel):
+    """Result of ``Store.save_paused`` — did this caller create the row?
+
+    ``created=True``  — the INSERT landed; ``run`` is the fresh ``proposed``
+    row. ``created=False`` — the ``UNIQUE(idempotency_key)`` conflict fired:
+    ``run`` is the EXISTING row (open: the caller attaches to it; resolved:
+    its terminal outcome is surfaced — collide-and-dedupe, PLAN.md 4.3).
+    Mirrors :class:`Claim` for the commit ledger.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    created: bool
+    run: PausedRun
+
+
+@dataclass(frozen=True)
+class ApprovalDecision:
+    """A human decision for one paused run (PLAN.md 3.3), transport-delivered.
+
+    ``decided_by`` is an opaque actor id (``usr_...``), never an email — the
+    email belongs in ``decided_by_display`` (PLAN.md 10.6).
+    ``decision_latency_ms`` is control-plane-computed and recorded VERBATIM
+    when present (PLAN.md 6.2); a local transport may leave it ``None`` and
+    ``apply_decision`` computes it from the SDK's own clock pair instead.
+
+    ``edited_args`` is RESERVED (PLAN.md 10.9 / settled decision 9): the field
+    exists so the shape is stable, and it is always ``None`` in v1 — no
+    transport can carry edits until the edit-before-approve phase. Setting it
+    raises ``NotImplementedError`` at construction, before any state changes.
+
+    A plain frozen dataclass (not pydantic) so the reserved-field check can
+    raise ``NotImplementedError`` verbatim rather than a wrapped
+    ``ValidationError``.
+    """
+
+    decision: HumanDecision
+    decided_by: str | None = None
+    decided_by_display: str | None = None
+    decided_at: datetime | None = None
+    decision_latency_ms: int | None = None
+    reason: str | None = None
+    edited_args: None = None  # RESERVED — always None in v1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision, HumanDecision):
+            raise TypeError(
+                f"decision must be an airlock.types.HumanDecision, got {self.decision!r}"
+            )
+        if self.edited_args is not None:
+            raise NotImplementedError(
+                "ApprovalDecision.edited_args is reserved for the edit-before-approve "
+                "phase (post-MVP; PLAN.md section 10, settled decision 9) and must be "
+                "None in v1 — no transport can carry edits yet. Only the schema "
+                "reservation ships now."
+            )
+        if self.decision_latency_ms is not None and self.decision_latency_ms < 0:
+            raise ValueError(f"decision_latency_ms must be >= 0, got {self.decision_latency_ms!r}")
+        if self.decided_at is not None and self.decided_at.tzinfo is None:
+            raise ValueError(f"decided_at must be timezone-aware, got naive {self.decided_at!r}")

@@ -5,7 +5,10 @@ P1.1 surface: ``claim`` / ``mark_executing`` / ``record_error`` /
 (``stale_inflight``, ``bump_epoch``). P2.2 adds the audit chain (ADR-5):
 ``append_audit`` per PLAN.md 3.3, plus the verifier's read surface
 (``audit_head`` / ``iter_audit``) that ``airlock.audit.verify_chain``
-consumes. The pause methods arrive in P2.3 — do not add them early.
+consumes. P2.3 adds the durable pause (ADR-4): ``save_paused`` /
+``load_paused_by_ref`` / ``transition_paused`` per PLAN.md 3.3, plus the
+reconciler's ``stale_approved_paused`` scan (PLAN.md 4.2 — an approved run
+whose commit crashed is never stranded).
 
 This module must stay import-light: importing it (or ``airlock`` itself) must
 never import sqlalchemy/psycopg. Backends are imported lazily inside
@@ -21,6 +24,7 @@ from typing import Protocol
 from pydantic import JsonValue
 
 from airlock.types import (
+    ApprovalDecision,
     AuditEvent,
     AuditHead,
     AuditRow,
@@ -28,6 +32,9 @@ from airlock.types import (
     CommitRecord,
     Guarantee,
     LedgerState,
+    PauseClaim,
+    PausedRun,
+    PauseStatus,
 )
 
 __all__ = ["Store", "from_url"]
@@ -159,6 +166,81 @@ class Store(Protocol):
         ``record_error`` all carry ``WHERE attempts = <its epoch>``, a bumped
         row fences the original owner: it can no longer execute or finalize.
         """
+        ...
+
+    def save_paused(
+        self,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        approval_ref: str,
+        action_type: str,
+        serialized_state: Mapping[str, JsonValue],
+        state_version: int = 1,
+        audit: AuditEvent | None = None,
+    ) -> PauseClaim:
+        """INSERT the ``proposed`` pause row, ``ON CONFLICT (idempotency_key)
+        DO NOTHING`` — the ADR-4 durable pause, one transaction (PLAN.md 3.3).
+
+        Returns ``PauseClaim(created=True, run=<fresh proposed row>)`` when
+        the insert landed. On conflict, returns ``created=False`` with the
+        EXISTING row: an OPEN run the caller attaches to, or a RESOLVED run
+        whose terminal outcome is surfaced — collide-and-dedupe (PLAN.md 4.3;
+        a deliberate second attempt needs a distinguishing arg or a ``key``
+        override). ``created_at`` is stamped from the store's injectable
+        ``now_fn`` (never ``DEFAULT now()``).
+
+        ``audit`` (the ``pause_transition`` creation event) is appended to the
+        hash chain INSIDE this same transaction, and ONLY when the insert
+        landed — an attach must not put a duplicate creation on the chain.
+        """
+        ...
+
+    def load_paused_by_ref(self, approval_ref: str) -> PausedRun | None:
+        """Plain read by the SDK-minted ``approval_ref`` (the only
+        cross-boundary key, PLAN.md 6.1) — the post-restart rehydration entry
+        (scenario 6). ``None`` when no such run exists."""
+        ...
+
+    def transition_paused(
+        self,
+        run_id: str,
+        from_status: PauseStatus,
+        to_status: PauseStatus,
+        *,
+        decision: ApprovalDecision | None = None,
+        audit: AuditEvent | tuple[AuditEvent, ...] | None = None,
+    ) -> bool:
+        """Guarded CAS ``from_status -> to_status`` for ``run_id`` (PLAN.md 3.3).
+
+        The (from, to) pair must be an edge of the ADR-4 DAG
+        (``airlock.types.PAUSE_TRANSITIONS``); anything else raises
+        ``ValueError`` before touching the database — an illegal transition is
+        unrepresentable, not merely fenced. Returns ``False`` when the CAS
+        matched zero rows (another applier already moved the run — the caller
+        reads back the recorded state and must not override, PLAN.md 4.3).
+
+        ``decision`` (on the ``proposed -> approved|rejected`` edge) persists
+        the decision metadata — ``decided_by`` / ``decided_by_display`` /
+        ``decided_at`` / ``decision_latency_ms`` — on the row.
+        ``resolved_at`` is stamped (store ``now_fn``) when ``to_status`` is
+        terminal. ``audit`` — one or more chained audit events (the
+        ``pause_transition`` record, plus the terminal ``action_event`` where
+        the transition is the run's terminal state) — is appended INSIDE this
+        same transaction, and ONLY when the CAS matched: either the transition
+        and its evidence both land, or neither does (the P2.2 finalize
+        pattern).
+        """
+        ...
+
+    def stale_approved_paused(self, older_than: timedelta) -> list[PausedRun]:
+        """The reconciler's paused sweep scan (PLAN.md 4.2): ``approved`` rows
+        whose ``decided_at`` is older than ``now_fn() - older_than`` — an
+        approval landed but the commit never did (crash between the approve
+        CAS and ``commit_once``). Selected ``FOR UPDATE SKIP LOCKED`` like
+        ``stale_inflight``; recovery drives each through ``apply_decision``
+        (ensure-committed, PLAN.md 4.3). ``proposed`` rows are NEVER swept —
+        there is no TTL expiry in v1 (ADR-4 is locked)."""
         ...
 
     def append_audit(self, event: AuditEvent) -> AuditRow:

@@ -53,15 +53,40 @@ def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 class _ExplodingStore:
     """A store sentinel: ANY attribute access is a hot-path violation.
 
-    The DENY (and GATE) decision must be reached WITHOUT touching the store, so
-    handing @guard this object and getting the decision anyway proves no
-    data-plane I/O happened on the block path.
+    The GATE decision must be reached WITHOUT touching the store, so handing
+    @guard this object and getting the decision anyway proves no data-plane
+    I/O happened on the block path. (DENY is different as of P2.2: after the
+    pure decision it performs exactly ONE local audit append — PLAN.md 4.4
+    "DENY = decision + one local audit append" — see _DenyAuditOnlyStore.)
     """
 
     def __getattr__(self, name: str) -> Any:
         raise AssertionError(
-            f"the decision path touched the store ({name!r}) — a deny/gate decision "
+            f"the decision path touched the store ({name!r}) — this decision "
             "must not perform any store I/O (PLAN.md 4.4)"
+        )
+
+
+class _DenyAuditOnlyStore:
+    """A store allowing exactly the deny path's sanctioned I/O: append_audit.
+
+    Every OTHER store surface (claim/mark_executing/finalize/...) explodes —
+    proving the deny path never claims a ledger row, never executes, and its
+    only store touch is the one local audit append PLAN.md 4.4 sanctions.
+    """
+
+    def __init__(self) -> None:
+        self.appended: list[Any] = []
+
+    def append_audit(self, event: Any) -> Any:
+        self.appended.append(event)
+        return None  # @guard ignores the returned AuditRow
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(
+            f"the deny path touched the store beyond append_audit ({name!r}) — "
+            "DENY is the pure decision + ONE local audit append (PLAN.md 4.4), "
+            "never a ledger claim or execute"
         )
 
 
@@ -97,10 +122,12 @@ def test_policy_evaluate_opens_no_socket() -> None:
 
 
 @pytest.mark.usefixtures("no_network", "guard_isolation")
-def test_guard_deny_path_no_socket_no_store() -> None:
-    """@guard's DENY raises ActionDenied with no socket and no store access —
-    the block happens purely in-process, before any ledger claim."""
-    init(store=_ExplodingStore(), policy=_matrix_policy())
+def test_guard_deny_path_no_socket_one_audit_append_only() -> None:
+    """@guard's DENY raises ActionDenied with no socket and exactly ONE store
+    touch — the local audit append (PLAN.md 4.4: "DENY = decision + one local
+    audit append"). No ledger claim, no execute, nothing else."""
+    store = _DenyAuditOnlyStore()
+    init(store=store, policy=_matrix_policy())
 
     executed: list[str] = []
 
@@ -113,6 +140,13 @@ def test_guard_deny_path_no_socket_no_store() -> None:
         do_payout("acct_1")
     assert excinfo.value.action_type == "payout.wire"
     assert executed == []  # no side effect
+    # Exactly one append, and it is the denied action_event.
+    assert len(store.appended) == 1
+    appended = store.appended[0]
+    assert appended.event_type == "action_event"
+    assert appended.payload["outcome"] == "denied"
+    assert appended.payload["policy_decision"] == "deny"
+    assert appended.payload["action_type"] == "payout.wire"
 
 
 @pytest.mark.usefixtures("no_network", "guard_isolation")
@@ -140,10 +174,11 @@ def test_guard_gate_path_no_socket_no_store() -> None:
 
 @pytest.mark.usefixtures("no_network", "guard_isolation")
 def test_guard_deny_before_any_ledger_write() -> None:
-    """Deny raises before the store is even consulted — asserted by the
-    exploding store staying untouched (any access would have raised its own
-    AssertionError with a different message)."""
-    init(store=_ExplodingStore(), policy=Policy(default=Decision.DENY))
+    """Deny never touches the ledger surface — the only store call is the
+    audit append; any claim/mark/finalize on the deny path would explode the
+    _DenyAuditOnlyStore with its own AssertionError."""
+    store = _DenyAuditOnlyStore()
+    init(store=store, policy=Policy(default=Decision.DENY))
 
     @guard("anything.here", reversibility=Reversibility.UNKNOWN)
     def tool(x: int) -> int:
@@ -151,6 +186,7 @@ def test_guard_deny_before_any_ledger_write() -> None:
 
     with pytest.raises(ActionDenied):
         tool(1)
+    assert len(store.appended) == 1  # the deny record — and nothing else
 
 
 def test_decision_layer_evaluable_with_core_deps_only() -> None:

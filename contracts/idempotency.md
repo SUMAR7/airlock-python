@@ -83,10 +83,12 @@ strings — §3).
 
 ## 3. Canonical JSON — `airlock-canon-1` (embedded)
 
-*These rules are normative for this contract. The standalone
-`/contracts/canonical-json.md` formally lands in P2.2 (audit hash chain,
-PLAN.md section 8) and must be byte-for-byte compatible with this section;
-the single shared implementation is `airlock._canonical`.*
+*These rules are normative for this contract. The standalone contract of
+record is [`canonical-json.md`](canonical-json.md) (landed in P2.2 with the
+audit hash chain, which consumes the same rule); this embedded section is the
+key-derivation subset and is byte-for-byte compatible with it — a divergence
+between the two documents is a contract break. The single shared
+implementation is `airlock._canonical`.*
 
 Serialization (equivalent to Python
 `json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)`,

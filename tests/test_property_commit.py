@@ -59,10 +59,19 @@ snapshot used to assert monotonicity (I5).
   while ``executing`` and was then reconciled lands terminal ``unknown`` (never
   ``committed``, never retried), and the reconcile did not increase its
   ``effect_count``. A ``none`` row is never re-executed by recovery.
-- **I4** — SCOPED FOR P1.4: the full chained-hash audit is P2.2, so I4 here
-  asserts the weaker available property — the evidence/error trail and ledger
-  terminal states are internally consistent. The real chained-hash I4 lands in
-  P2.2.
+- **I4** — THE REAL INVARIANT (upgraded in P2.2 from the P1.4 weakened form):
+  after every step the FULL hash-chained audit trail verifies end-to-end
+  (``verify_chain``: genesis constant, gapless seq, prev_hash linkage,
+  recomputed row hashes, head match). The chain is example-scoped — each
+  machine truncates the audit tables and re-seeds genesis (a harness reset,
+  same as the db fixture's per-test TRUNCATE; the chain is global by
+  construction so scoped DELETEs are impossible by design) — which keeps the
+  full-chain verify O(example) and deterministic. Every ``commit_once`` in
+  the machine carries an event context, so terminal transitions append
+  chained action_events inside their finalize transactions and the reconcile
+  rules append reconcile events: I4 exercises the finalize+append atomicity
+  under the whole interleaving space. The P1.4 evidence-consistency check is
+  retained as I4b.
 - **I5** — terminal ledger states (committed/aborted/failed/unknown) are
   monotone: once terminal, a row never changes state or effect_count.
 
@@ -87,22 +96,27 @@ from pydantic import JsonValue
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
+from airlock.audit import verify_chain
 from airlock.commit import commit_once
 from airlock.effects import Effect
 from airlock.errors import (
     AtMostOnceWarning,
+    AuditChainError,
     CommitWaitTimeout,
     ExecuteTimeout,
     VerificationUnknown,
 )
+from airlock.events import ActionEventContext
 from airlock.reconcile import OnAbsent, reconcile
 from airlock.registry import Registry
-from airlock.store._schema import ensure_schema
+from airlock.store._schema import ensure_schema, seed_genesis
 from airlock.store.postgres import PostgresStore, normalize_postgres_url
 from airlock.types import (
     TERMINAL_LEDGER_STATES,
+    Decision,
     Guarantee,
     LedgerState,
+    Reversibility,
     Verification,
 )
 
@@ -308,6 +322,19 @@ class CommitMachine(RuleBasedStateMachine):
                 text("DELETE FROM commit_records WHERE action_type LIKE :like"),
                 {"like": f"{_PROP_PREFIX}%"},
             )
+        # Audit-chain reset (I4, P2.2). The chain is GLOBAL by construction —
+        # one gapless hash chain per database — so per-example isolation cannot
+        # be a scoped DELETE (deleting audit rows is exactly what the chain
+        # exists to detect, and it would corrupt the chain for every later
+        # verify). Instead each example starts a FRESH chain: truncate + re-seed
+        # genesis, the same harness-level reset the db fixture performs per
+        # test. This is safe for the same reason the fixture's TRUNCATE is:
+        # the suite runs examples sequentially against the test database. With
+        # the chain example-scoped, the I4 invariant can verify the FULL chain
+        # after every step at O(example) cost.
+        with self._raw.connect() as conn:
+            conn.execute(text("TRUNCATE audit_events, audit_chain_head RESTART IDENTITY"))
+        seed_genesis(self._raw)
 
     def _ensure_effects_log(self) -> None:
         """Create the ground-truth ``effects_log`` table if missing.
@@ -466,6 +493,17 @@ class CommitMachine(RuleBasedStateMachine):
         def execute(downstream_key: str | None) -> JsonValue:
             return inner(downstream_key)
 
+        # An event context on every commit_once call (P2.2): terminal
+        # transitions append a chained action_event INSIDE their finalize
+        # transaction, so I4 exercises the finalize+append seam under the
+        # machine's full interleaving space, not just reconcile events. The
+        # minted run_id/event_id do not influence any draw or branch
+        # (determinism discipline holds).
+        event_ctx = ActionEventContext(
+            run_id=f"run_{uuid.uuid4().hex}",
+            policy_decision=Decision.AUTO,
+            reversibility=Reversibility.IRREVERSIBLE,
+        )
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", AtMostOnceWarning)
@@ -479,6 +517,7 @@ class CommitMachine(RuleBasedStateMachine):
                     reconcile_after=OLDER_THAN,
                     now_fn=self._now,
                     wait=False,
+                    event_context=event_ctx,
                 )
         except (CommitWaitTimeout, VerificationUnknown, ExecuteTimeout):
             # Losing to an in-flight row, or an honest non-answer: the ledger
@@ -833,13 +872,32 @@ class CommitMachine(RuleBasedStateMachine):
                 )
 
     @invariant()
-    def i4_evidence_and_terminal_states_consistent(self) -> None:
-        """I4 (P1.4 SCOPE): evidence/terminal-state internal consistency.
+    def i4_audit_chain_verifies_end_to_end(self) -> None:
+        """I4 (THE REAL INVARIANT, PLAN.md 7): after every step, the FULL
+        audit chain verifies end-to-end.
 
-        The full chained-hash audit is P2.2 (TODO below). Here we assert the
-        weaker available property: no committed row without a result, and no
-        unknown/failed row that claims success.
+        The chain is example-scoped (fresh genesis per machine, see __init__),
+        so a full verify_chain pass here recomputes every row hash, checks
+        every prev_hash link, the gapless seq order, the genesis constant and
+        the head match — after EVERY rule the machine executes. Any finalize
+        that wrote a terminal state without its chained event landing
+        atomically, any crash that half-applied a finalize+append, any
+        rollback that leaked an audit row, breaks this immediately.
+
+        The P1.4 evidence-consistency assertions are kept below (they cover a
+        different, ledger-internal property).
         """
+        try:
+            verify_chain(self.store)
+        except AuditChainError as exc:
+            raise AssertionError(
+                f"I4 VIOLATED: audit chain broken at seq {exc.seq}: {exc}"
+            ) from exc
+
+    @invariant()
+    def i4b_evidence_and_terminal_states_consistent(self) -> None:
+        """I4 supplement (the P1.4 property, retained): no committed row
+        without a result, and no non-committed row that claims success."""
         rows = self._real_rows()
         for key, row in rows.items():
             state = row["state"]
@@ -894,17 +952,20 @@ TestCommitMachine = CommitMachine.TestCase
 
 
 # ---------------------------------------------------------------------------
-# I6 / I7 — OUT OF SCOPE for P1.4 (do NOT stub).
+# I6 / I7 — OUT OF SCOPE here (do NOT stub).
 #
 # TODO(P2.3): I6 — paused_runs.status follows the ADR-4 DAG only
 #   (proposed -> approved|rejected -> committed|aborted). Needs the paused_runs
 #   table and apply_decision, which land in P2.3. Add a `propose_gate` /
 #   `approve` / `reject` / `duplicate_webhook` rule set and an I6 invariant then.
 #
-# TODO(P2.2): I7 — every terminal call produced exactly one schema-valid
-#   action_event. Needs the action_event.v1 model + JSON Schema + the audit
-#   events table, which land in P2.2. Add an I7 invariant that reads back the
-#   emitted events and validates them against the pinned schema then.
+# TODO(P2.3): I7 — every terminal call produced exactly one schema-valid
+#   action_event. The action_event.v1 model/schema/audit rows exist as of P2.2
+#   (and the emission matrix incl. schema round-trips is pinned in
+#   tests/test_guard_events.py + tests/test_events_contract.py), but the
+#   machine-level "exactly one per terminal call INCLUDING gate resolutions"
+#   invariant needs the P2.3 pause/resume rules to be meaningful — it lands
+#   with I6 per PLAN.md section 8 (P2.3 row: "invariants I6-I7").
 #
 # Leaving these as named TODOs (not empty rules/invariants) so the machine never
 # gives false confidence about properties it does not yet exercise.

@@ -1,9 +1,19 @@
-"""``python -m airlock`` — the reconciler CLI (PLAN.md 4.2, the cron/k8s model).
+"""``python -m airlock`` — the reconciler + audit-verifier CLI.
 
 Usage::
 
     python -m airlock reconcile --store $DATABASE_URL --import mymodule \
         --execute-timeout SECONDS [--older-than SECONDS] [--on-absent retry|abort]
+    python -m airlock audit verify --store $DATABASE_URL \
+        [--from-seq N --from-hash HEX]
+
+``audit verify`` (P2.2, ADR-5) streams the hash-chained ``audit_events`` table
+``ORDER BY seq`` and verifies every link (PLAN.md 5.2): genesis constant,
+gapless seq, prev_hash linkage, recomputed row_hash, chain-head match — O(n),
+constant memory. ``--from-seq N --from-hash HEX`` verifies from an
+externally-noted checkpoint at O(delta). Exit code 0 = chain verifies;
+1 = TAMPER/BREAK DETECTED (the offending seq is printed — treat as a P0
+integrity incident); 2 = argument/setup errors (argparse).
 
 ``--import`` loads the integrator's module(s) so their
 :func:`airlock.registry.register` calls run BEFORE the sweep — the reconciler
@@ -112,6 +122,45 @@ def _build_parser() -> argparse.ArgumentParser:
             "Default 'abort' (fail safe)."
         ),
     )
+
+    audit = sub.add_parser(
+        "audit",
+        help="Audit-chain operations (ADR-5).",
+        description="Operations on the hash-chained audit_events table (ADR-5).",
+    )
+    audit_sub = audit.add_subparsers(dest="audit_command", required=True)
+    verify = audit_sub.add_parser(
+        "verify",
+        help="Verify the hash chain end-to-end (or from a checkpoint).",
+        description=(
+            "Stream audit_events ORDER BY seq and verify every link (PLAN.md 5.2): genesis "
+            "constant, gapless seq, prev_hash linkage, recomputed row_hash, chain-head match. "
+            "With --from-seq/--from-hash, verify from an externally-noted checkpoint at "
+            "O(delta). Exit 0 = verified; exit 1 = tamper/break detected."
+        ),
+    )
+    verify.add_argument(
+        "--store",
+        required=True,
+        metavar="DSN",
+        help="Postgres DSN for the audit chain (e.g. postgresql://host/db).",
+    )
+    verify.add_argument(
+        "--from-seq",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Checkpoint seq: verify from this row to the head only (O(delta)). "
+            "Requires --from-hash — the row_hash you externally noted for seq N."
+        ),
+    )
+    verify.add_argument(
+        "--from-hash",
+        default=None,
+        metavar="HEX",
+        help="The 64-hex-char row_hash externally noted for --from-seq.",
+    )
     return parser
 
 
@@ -122,10 +171,59 @@ def _summarize(report: ReconcileReport) -> str:
     return f"reconcile: {report.total} row(s) — " + ", ".join(parts)
 
 
+def _audit_verify(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """The ``audit verify`` subcommand: exit 0 verified / 1 tamper detected."""
+    from airlock.audit import verify_chain
+    from airlock.errors import AuditChainError
+
+    from_hash: bytes | None = None
+    if args.from_hash is not None:
+        try:
+            from_hash = bytes.fromhex(args.from_hash)
+        except ValueError:
+            parser.error(f"--from-hash {args.from_hash!r} is not valid hex")
+        if len(from_hash) != 32:
+            parser.error(f"--from-hash must be 32 bytes (64 hex chars), got {len(from_hash)}")
+    if (args.from_seq is None) != (from_hash is None):
+        parser.error("--from-seq and --from-hash must be supplied together")
+    if args.from_seq is not None and args.from_seq < 0:
+        parser.error(f"--from-seq must be >= 0, got {args.from_seq}")
+
+    try:
+        store = from_url(args.store)
+    except (ValueError, ImportError, NotImplementedError) as exc:
+        parser.error(f"--store {args.store!r} could not be opened: {exc}")
+
+    try:
+        report = verify_chain(store, from_seq=args.from_seq, from_hash=from_hash)
+    except AuditChainError as exc:
+        print(
+            f"audit verify: FAILED at seq {exc.seq}: {exc}\n"
+            "The append-only history was tampered with, truncated, or reordered — "
+            "treat as a P0 integrity incident (ADR-5).",
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    span = "full chain" if report.from_seq == 0 else f"from checkpoint seq {report.from_seq}"
+    print(
+        f"audit verify: OK ({span}) — {report.rows_verified} row(s) verified, "
+        f"head seq={report.head_seq} hash={report.head_hash.hex()}"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point. Returns a process exit code (0 = pass completed)."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "audit":
+        return _audit_verify(parser, args)
 
     if args.older_than <= 0:
         parser.error(f"--older-than must be positive, got {args.older_than}")

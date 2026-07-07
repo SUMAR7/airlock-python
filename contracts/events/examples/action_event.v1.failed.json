@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "event_id": "ffeeddccbbaa99887766554433221100",
+  "emitted_at": "2026-07-06T12:00:02.000000Z",
+  "run_id": "run_abcdef0123456789abcdef0123456789",
+  "idempotency_key": "refund.create:order-42",
+  "action_type": "refund.create",
+  "policy_decision": "auto",
+  "cost": {"amount": "0", "currency": "USD"},
+  "reversibility": "reversible",
+  "blast_radius_estimate": "high",
+  "guarantee": "downstream_idempotent",
+  "human_decision": null,
+  "decision_latency_ms": null,
+  "decided_by": null,
+  "action_diff": null,
+  "outcome": "failed",
+  "post_verify": {"ran": true, "result": "absent"}
+}

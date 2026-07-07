@@ -134,11 +134,22 @@ def schema_engine(database_url: str) -> Iterator[Engine]:
 
 @pytest.fixture
 def db(schema_engine: Engine) -> Engine:
-    """Truncates ledger + effects tables before each test; returns the engine."""
+    """Truncates ledger + effects + audit tables before each test; returns the engine.
+
+    The audit chain is global by construction (one gapless chain per database),
+    so per-test isolation is a TRUNCATE + genesis re-seed — a test-harness
+    reset of the whole chain, NOT a row deletion (which the append-only
+    trigger forbids and the chain would detect). TRUNCATE is available here
+    because the test role owns the table (the REVOKE strips it from PUBLIC).
+    """
     from sqlalchemy import text
+
+    from airlock.store._schema import seed_genesis
 
     with schema_engine.begin() as conn:
         conn.execute(text("TRUNCATE commit_records, effects_log RESTART IDENTITY"))
+        conn.execute(text("TRUNCATE audit_events, audit_chain_head RESTART IDENTITY"))
+    seed_genesis(schema_engine)
     return schema_engine
 
 

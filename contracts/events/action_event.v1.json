@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://airlock.dev/contracts/events/action_event.v1.json",
+  "title": "action_event.v1",
+  "description": "The one Airlock event schema (PLAN.md 6.3, SPEC section 7). Emitted for every guarded call — deny at decision time, auto/gate at terminal state — and written durably as a hash-chained audit_events row (event_type='action_event'). Enum value lists are generated from airlock.types (the single vocabulary source) and CI-asserted against it. Versioning: adding optional fields does not bump the version; consumers ignore unknown fields; any rename/type/semantic change is action_event.v2, and these v1 fixtures stay green forever.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "emitted_at",
+    "run_id",
+    "idempotency_key",
+    "action_type",
+    "policy_decision",
+    "cost",
+    "reversibility",
+    "blast_radius_estimate",
+    "guarantee",
+    "human_decision",
+    "decision_latency_ms",
+    "decided_by",
+    "action_diff",
+    "outcome",
+    "post_verify"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Frozen at 1 for this document."
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique id for this event emission (uuid4 hex in the Python SDK)."
+    },
+    "emitted_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{6}Z$",
+      "description": "RFC 3339 UTC with microsecond precision and a Z suffix — the airlock-canon-1 timestamp convention (/contracts/canonical-json.md). Also the hashed created_at of the audit row carrying this event."
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The guarded invocation this event describes (SDK-minted; joins paused_runs.run_id from P2.3 on)."
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The ledger key of the action (/contracts/idempotency.md). Never transits the hosted control plane (PLAN.md 6.1) — this event lives in the customer's audit_events only."
+    },
+    "action_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "policy_decision": {
+      "enum": ["auto", "gate", "deny"],
+      "description": "airlock.types.Decision (single source)."
+    },
+    "cost": {
+      "oneOf": [{"$ref": "#/$defs/money"}, {"type": "null"}],
+      "description": "Money or null — never a JSON float, anywhere (PLAN.md 3.2)."
+    },
+    "reversibility": {
+      "enum": ["reversible", "irreversible", "unknown"],
+      "description": "airlock.types.Reversibility (single source)."
+    },
+    "blast_radius_estimate": {
+      "oneOf": [{"enum": ["low", "medium", "high"]}, {"type": "null"}],
+      "description": "airlock.types.BlastRadius (ordered low < medium < high) or null when unclassified."
+    },
+    "guarantee": {
+      "enum": ["downstream_idempotent", "verifiable", "none"],
+      "description": "airlock.types.Guarantee (ADR-2). 'none' means the action ran at-most-once."
+    },
+    "human_decision": {
+      "oneOf": [{"enum": ["approved", "rejected"]}, {"type": "null"}],
+      "description": "airlock.types.HumanDecision or null when no human was involved (auto/deny; always null until the P2.3 approval flow)."
+    },
+    "decision_latency_ms": {
+      "oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}],
+      "description": "Control-plane-computed from its own clock pair, recorded verbatim (PLAN.md 6.2); null until P2.3+."
+    },
+    "decided_by": {
+      "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+      "description": "Opaque actor id (usr_...), NEVER an email (PLAN.md 10.6); null until P2.3+."
+    },
+    "action_diff": {
+      "type": "null",
+      "description": "RESERVED for the edit-before-approve preference-learning signal (SPEC section 7). Always null in v1; a non-null shape is an action_event.v2 change."
+    },
+    "outcome": {
+      "enum": ["committed", "aborted", "failed", "unknown", "denied"],
+      "description": "airlock.types.ActionOutcome: the four terminal ledger states plus 'denied' (a policy block that never reached the ledger)."
+    },
+    "post_verify": {"$ref": "#/$defs/post_verify"}
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "currency"],
+      "properties": {
+        "amount": {
+          "type": "string",
+          "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$",
+          "description": "Canonical decimal string (airlock.decimal_string): plain fixed-point, no trailing fractional zeros, zero is '0'. Never a JSON number."
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "description": "ISO-4217 alphabetic code."
+        }
+      }
+    },
+    "post_verify": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ran", "result"],
+      "properties": {
+        "ran": {
+          "type": "boolean",
+          "description": "Whether a post-verify probe executed for this call."
+        },
+        "result": {
+          "oneOf": [{"enum": ["present", "absent", "unknown"]}, {"type": "null"}],
+          "description": "airlock.types.Verification (single source) or null."
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"ran": {"const": false}}},
+          "then": {"properties": {"result": {"type": "null"}}}
+        }
+      ]
+    }
+  }
+}

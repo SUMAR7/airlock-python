@@ -30,6 +30,7 @@ def test_base_import_is_light() -> None:
         "import sys\n"
         "import airlock\n"
         "import airlock._canonical\n"
+        "import airlock.audit\n"
         "import airlock.commit\n"
         "import airlock.effects\n"
         "import airlock.errors\n"
@@ -56,6 +57,7 @@ def test_lazy_public_surface() -> None:
     """PEP 562 re-exports resolve to the real objects."""
     from airlock._canonical import CANON_VERSION, canonical_bytes, canonical_json, decimal_string
     from airlock._guard import Airlock, guard, init
+    from airlock.audit import ChainReport, compute_row_hash, verify_chain
     from airlock.commit import commit_once
     from airlock.effects import Effect
     from airlock.errors import (
@@ -63,6 +65,7 @@ def test_lazy_public_surface() -> None:
         ActionPending,
         AirlockError,
         AtMostOnceWarning,
+        AuditChainError,
         CanonicalizationError,
         CommitFailed,
         CommitWaitTimeout,
@@ -70,17 +73,22 @@ def test_lazy_public_surface() -> None:
         PreconditionFailed,
         VerificationUnknown,
     )
-    from airlock.events import EventSink, PolicyDecisionEvent
+    from airlock.events import ActionEvent, EventSink, PostVerify
     from airlock.idempotency import build_arg_map, derive_key, namespace_user_key
     from airlock.policy import ActionContext, Policy, PolicyBackend, Rule
     from airlock.store import Store, from_url
     from airlock.types import (
+        ActionOutcome,
+        AuditEvent,
+        AuditHead,
+        AuditRow,
         BlastRadius,
         Claim,
         CommitOutcome,
         CommitRecord,
         Decision,
         Guarantee,
+        HumanDecision,
         LedgerState,
         Money,
         Reversibility,
@@ -91,20 +99,25 @@ def test_lazy_public_surface() -> None:
     assert airlock.canonical_bytes is canonical_bytes
     assert airlock.canonical_json is canonical_json
     assert airlock.decimal_string is decimal_string
+    assert airlock.ChainReport is ChainReport
+    assert airlock.compute_row_hash is compute_row_hash
+    assert airlock.verify_chain is verify_chain
     assert airlock.commit_once is commit_once
     assert airlock.Effect is Effect
     assert airlock.ActionDenied is ActionDenied
     assert airlock.ActionPending is ActionPending
     assert airlock.AirlockError is AirlockError
     assert airlock.AtMostOnceWarning is AtMostOnceWarning
+    assert airlock.AuditChainError is AuditChainError
     assert airlock.CanonicalizationError is CanonicalizationError
     assert airlock.CommitFailed is CommitFailed
     assert airlock.CommitWaitTimeout is CommitWaitTimeout
     assert airlock.GateNotSupported is GateNotSupported
     assert airlock.PreconditionFailed is PreconditionFailed
     assert airlock.VerificationUnknown is VerificationUnknown
+    assert airlock.ActionEvent is ActionEvent
     assert airlock.EventSink is EventSink
-    assert airlock.PolicyDecisionEvent is PolicyDecisionEvent
+    assert airlock.PostVerify is PostVerify
     assert airlock.Airlock is Airlock
     assert airlock.guard is guard
     assert airlock.init is init
@@ -117,12 +130,17 @@ def test_lazy_public_surface() -> None:
     assert airlock.Rule is Rule
     assert airlock.Store is Store
     assert airlock.from_url is from_url
+    assert airlock.ActionOutcome is ActionOutcome
+    assert airlock.AuditEvent is AuditEvent
+    assert airlock.AuditHead is AuditHead
+    assert airlock.AuditRow is AuditRow
     assert airlock.BlastRadius is BlastRadius
     assert airlock.Claim is Claim
     assert airlock.CommitOutcome is CommitOutcome
     assert airlock.CommitRecord is CommitRecord
     assert airlock.Decision is Decision
     assert airlock.Guarantee is Guarantee
+    assert airlock.HumanDecision is HumanDecision
     assert airlock.LedgerState is LedgerState
     assert airlock.Money is Money
     assert airlock.Reversibility is Reversibility

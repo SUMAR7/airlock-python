@@ -14,14 +14,24 @@ side effect:
                      is invoked — that ordering is what makes a ``pending``
                      row provably effect-free.
 - ``record_error``   epoch-guarded error_json write; state stays ``executing``.
-- ``finalize``       CAS to a terminal state; ONE transaction that P2.2 will
-                     extend with the hash-chained audit append (same
-                     signature, same transaction).
+- ``finalize``       CAS to a terminal state PLUS (P2.2) the hash-chained
+                     audit append, in ONE transaction — the P1.1 seam
+                     upgraded without changing the signature (PLAN.md 10).
 - ``load``           plain read.
 - ``stale_inflight`` (P1.3) FOR UPDATE SKIP LOCKED scan of stale in-flight
                      rows for the reconciler.
 - ``bump_epoch``     (P1.3) the takeover fence: atomically bump the epoch of a
                      still-stale in-flight row, returning the new epoch.
+- ``append_audit``   (P2.2, ADR-5) append one hash-chained ``audit_events``
+                     row: SELECT the chain head FOR UPDATE (the head-row lock
+                     serializes appenders across processes), compute the
+                     row_hash IN THE SDK (``airlock.audit`` — never a DB
+                     trigger), INSERT, UPDATE the head. Gapless ``seq`` by
+                     construction.
+- ``audit_head`` / ``iter_audit``  the verifier's read surface
+                     (``airlock.audit.verify_chain``): the head singleton, and
+                     a streaming ORDER BY seq scan (server-side cursor,
+                     constant memory).
 
 Lost races are detected by guarded-UPDATE rowcount (the epoch fence), never
 by SELECT-then-UPDATE.
@@ -30,17 +40,22 @@ by SELECT-then-UPDATE.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import JsonValue
-from sqlalchemy import create_engine, text
+from sqlalchemy import Connection, create_engine, text
 
+from airlock._canonical import canonical_json
+from airlock.audit import compute_row_hash
 from airlock.errors import AirlockError
 from airlock.types import (
     IN_FLIGHT_LEDGER_STATES,
     TERMINAL_LEDGER_STATES,
+    AuditEvent,
+    AuditHead,
+    AuditRow,
     Claim,
     CommitRecord,
     Guarantee,
@@ -148,6 +163,42 @@ _BUMP_EPOCH_SQL = text(
        AND state IN ({_IN_FLIGHT_STATE_LIST})
        AND last_attempt_at < :cutoff
     RETURNING attempts
+    """
+)
+
+
+# --- The audit chain (P2.2, ADR-5) ------------------------------------------
+#
+# The append protocol (PLAN.md 5.1/5.2), always inside the enclosing
+# transaction: lock the head row (FOR UPDATE — THE serialization point for
+# appenders across processes), compute row_hash in the SDK, INSERT the row at
+# seq = head.seq + 1 (gapless by construction: the lock makes the read-
+# increment-insert atomic), UPDATE the head. The DB never hashes.
+
+_AUDIT_HEAD_LOCK_SQL = text("SELECT seq, row_hash FROM audit_chain_head WHERE singleton FOR UPDATE")
+
+_AUDIT_HEAD_READ_SQL = text("SELECT seq, row_hash FROM audit_chain_head WHERE singleton")
+
+_AUDIT_INSERT_SQL = text(
+    """
+    INSERT INTO audit_events
+        (seq, run_id, action_type, event_type, payload_json, prev_hash, row_hash, created_at)
+    VALUES
+        (:seq, :run_id, :action_type, :event_type, CAST(:payload AS JSONB),
+         :prev_hash, :row_hash, :created_at)
+    RETURNING *
+    """
+)
+
+_AUDIT_HEAD_UPDATE_SQL = text(
+    "UPDATE audit_chain_head SET seq = :seq, row_hash = :row_hash WHERE singleton"
+)
+
+_AUDIT_ITER_SQL = text(
+    """
+    SELECT * FROM audit_events
+     WHERE seq >= :start
+     ORDER BY seq
     """
 )
 
@@ -280,6 +331,11 @@ class PostgresStore:
     ) -> bool:
         if state not in TERMINAL_LEDGER_STATES:
             raise ValueError(f"finalize target must be a terminal state, got {state!r}")
+        if audit is not None and not isinstance(audit, AuditEvent):
+            raise TypeError(
+                f"finalize audit must be an airlock.types.AuditEvent or None, "
+                f"got {type(audit).__name__}"
+            )
         committed = state is LedgerState.COMMITTED
         sql = _FINALIZE_SQL[state]
         with self._engine.begin() as conn:
@@ -293,12 +349,95 @@ class PostgresStore:
                     "committed_at": self._now_fn() if committed else None,
                 },
             ).rowcount
-            # Documented no-op seam: P2.2 appends the hash-chained audit row
-            # RIGHT HERE, inside this same transaction, without changing the
-            # finalize signature (PLAN.md section 10 sequencing). P1.1
-            # persists nothing for `audit`.
-            _ = audit
+            # The P1.1 seam, upgraded (PLAN.md 10 / SPEC section 5 step 5):
+            # the terminal-state CAS and the hash-chained audit append are ONE
+            # transaction — a crash/rollback between them is impossible;
+            # either both land or neither does. The append happens ONLY when
+            # the CAS matched (rowcount 1): a fenced finalize did not
+            # transition the row, so appending its event would put a false
+            # statement on the tamper-evident chain.
+            if rowcount == 1 and audit is not None:
+                self._append_audit_on(conn, audit)
         return rowcount == 1
+
+    def append_audit(self, event: AuditEvent) -> AuditRow:
+        """Append one hash-chained audit row in its own transaction (ADR-5)."""
+        with self._engine.begin() as conn:
+            return self._append_audit_on(conn, event)
+
+    def _append_audit_on(self, conn: Connection, event: AuditEvent) -> AuditRow:
+        """The append protocol (PLAN.md 5.1/5.2), on the CALLER'S transaction.
+
+        Lock the chain head (``FOR UPDATE`` — serializes appenders across
+        processes), assign ``seq = head.seq + 1`` (gapless under the lock),
+        compute ``row_hash`` in the SDK, INSERT the row, UPDATE the head. The
+        hashed ``created_at`` and the stored column are the same value: the
+        event's SDK-supplied timestamp, or this store's ``now_fn`` when the
+        event carries none — never ``DEFAULT now()``.
+        """
+        head = conn.execute(_AUDIT_HEAD_LOCK_SQL).mappings().first()
+        if head is None:
+            raise AirlockError(
+                "audit_chain_head is missing — the audit schema is not initialized; "
+                "run ensure_schema() before appending audit events (ADR-5)"
+            )
+        seq = int(head["seq"]) + 1
+        prev_hash = bytes(head["row_hash"])
+        created_at = event.created_at if event.created_at is not None else self._now_fn()
+        # Hash first: a payload outside the airlock-canon-1 domain raises
+        # CanonicalizationError HERE, before anything is written, aborting the
+        # enclosing transaction whole (the finalize+append atomicity tests
+        # inject exactly this fault).
+        row_hash = compute_row_hash(
+            prev_hash,
+            seq=seq,
+            run_id=event.run_id,
+            action_type=event.action_type,
+            event_type=event.event_type,
+            created_at=created_at,
+            payload=event.payload,
+        )
+        inserted = (
+            conn.execute(
+                _AUDIT_INSERT_SQL,
+                {
+                    "seq": seq,
+                    "run_id": event.run_id,
+                    "action_type": event.action_type,
+                    "event_type": event.event_type,
+                    "payload": canonical_json(event.payload),
+                    "prev_hash": prev_hash,
+                    "row_hash": row_hash,
+                    "created_at": created_at,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        conn.execute(_AUDIT_HEAD_UPDATE_SQL, {"seq": seq, "row_hash": row_hash})
+        return _row_to_audit(inserted)
+
+    def audit_head(self) -> AuditHead | None:
+        """Read the ``audit_chain_head`` singleton (no lock), or ``None``."""
+        with self._engine.begin() as conn:
+            head = conn.execute(_AUDIT_HEAD_READ_SQL).mappings().first()
+        if head is None:
+            return None
+        return AuditHead(seq=int(head["seq"]), row_hash=bytes(head["row_hash"]))
+
+    def iter_audit(self, start_seq: int = 0) -> Iterator[AuditRow]:
+        """Stream audit rows ``ORDER BY seq`` from ``start_seq`` (inclusive).
+
+        Server-side cursor (``stream_results``) so ``verify_chain`` is O(n)
+        with constant memory; the connection is held only while the generator
+        is being consumed.
+        """
+        with self._engine.connect() as conn:
+            result = conn.execution_options(stream_results=True, max_row_buffer=500).execute(
+                _AUDIT_ITER_SQL, {"start": start_seq}
+            )
+            for row in result.mappings():
+                yield _row_to_audit(row)
 
     def load(self, key: str) -> CommitRecord | None:
         with self._engine.begin() as conn:
@@ -324,6 +463,20 @@ class PostgresStore:
                 _BUMP_EPOCH_SQL, {"key": key, "now": now, "cutoff": cutoff}
             ).scalar_one_or_none()
         return None if new_epoch is None else int(new_epoch)
+
+
+def _row_to_audit(row: Mapping[Any, Any]) -> AuditRow:
+    return AuditRow(
+        id=row["id"],
+        seq=row["seq"],
+        run_id=row["run_id"],
+        action_type=row["action_type"],
+        event_type=row["event_type"],
+        payload=row["payload_json"],
+        prev_hash=bytes(row["prev_hash"]),
+        row_hash=bytes(row["row_hash"]),
+        created_at=row["created_at"],
+    )
 
 
 def _row_to_record(row: Mapping[Any, Any]) -> CommitRecord:

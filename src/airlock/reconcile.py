@@ -82,9 +82,10 @@ from pydantic import JsonValue
 from airlock.effects import Effect
 from airlock.registry import Registration, Registry
 from airlock.registry import registry as default_registry
-from airlock.types import CommitRecord, Guarantee, LedgerState, Verification
+from airlock.types import AuditEvent, CommitRecord, Guarantee, LedgerState, Verification
 
 __all__ = [
+    "RECONCILE_EVENT_TYPE",
     "ExecuteWindow",
     "OnAbsent",
     "Outcome",
@@ -94,6 +95,10 @@ __all__ = [
     "reconcile_key",
     "reconcile_on_startup",
 ]
+
+#: The ``audit_events.event_type`` for reconciler evidence rows (PLAN.md 4.2:
+#: recovered / escalation events are audit events — chained as of P2.2).
+RECONCILE_EVENT_TYPE = "reconcile"
 
 
 def _utcnow() -> datetime:
@@ -510,6 +515,7 @@ def _recover_effect_free(
             evidence={"reconciled": "aborted", "reason": on_absent.value, "at": _now_iso(now_fn)},
             outcome=Outcome.ABORTED,
             report=report,
+            now_fn=now_fn,
         )
         return
 
@@ -529,6 +535,7 @@ def _recover_effect_free(
             },
             outcome=Outcome.ABORTED,
             report=report,
+            now_fn=now_fn,
             detail="preconditions no longer hold on retry — aborting rather than blind-retrying",
         )
         return
@@ -577,6 +584,7 @@ def _recover_executing_verifiable(
             evidence={"reconciled": "committed", "post_verify": "present", "at": _now_iso(now_fn)},
             outcome=Outcome.COMMITTED,
             report=report,
+            now_fn=now_fn,
             detail="probe confirmed the effect present; recovered without re-executing",
         )
         return
@@ -595,8 +603,10 @@ def _recover_executing_verifiable(
         return
 
     # UNKNOWN — the honest non-answer. NEVER finalize (no terminal state would
-    # be truthful): record escalation evidence, leave the row for a human/next
-    # pass. record_error is epoch-guarded; a fenced write is fine to ignore.
+    # be truthful): record escalation evidence, append the loud escalation
+    # audit event (PLAN.md 4.2 "unknown -> leave, escalate via audit event" —
+    # a chained row as of P2.2), and leave the row for a human/next pass.
+    # record_error is epoch-guarded; a fenced write is fine to ignore.
     escalation: dict[str, JsonValue] = {
         "reconciled": "escalated",
         "post_verify": Verification.UNKNOWN.value,
@@ -605,6 +615,13 @@ def _recover_executing_verifiable(
     }
     with contextlib.suppress(Exception):  # evidence is best-effort; escalation still counts
         store.record_error(key, epoch, escalation)
+    _append_escalation(
+        store,
+        record,
+        epoch=epoch,
+        now_fn=now_fn,
+        reason="verify answered 'unknown'; row left executing",
+    )
     report._record(
         ReconcileAction(
             key=key,
@@ -655,6 +672,7 @@ def _recover_executing_downstream_idempotent(
             },
             outcome=Outcome.UNKNOWN,
             report=report,
+            now_fn=now_fn,
             detail="downstream_idempotent but preconditions violated — finalized unknown, loud",
         )
         return
@@ -707,6 +725,7 @@ def _recover_executing_none(
         },
         outcome=Outcome.UNKNOWN,
         report=report,
+        now_fn=now_fn,
         detail="guarantee=none stuck executing — finalized unknown, loud, never retried",
     )
 
@@ -758,6 +777,13 @@ def _reexecute(
                     "phase": "reconcile_reexecute",
                 },
             )
+        _append_escalation(
+            store,
+            record,
+            epoch=epoch,
+            now_fn=now_fn,
+            reason=f"re-execute raised {type(exc).__name__}; row left executing",
+        )
         report._record(
             ReconcileAction(
                 key=key,
@@ -793,6 +819,7 @@ def _reexecute(
                 evidence=error_payload,
                 outcome=Outcome.FAILED,
                 report=report,
+                now_fn=now_fn,
                 detail="re-execute post-verify proved the fresh attempt absent — failed",
             )
             return
@@ -807,6 +834,13 @@ def _reexecute(
                         "phase": "reconcile_reexecute",
                     },
                 )
+            _append_escalation(
+                store,
+                record,
+                epoch=epoch,
+                now_fn=now_fn,
+                reason="re-execute post-verify answered 'unknown'; row left executing",
+            )
             report._record(
                 ReconcileAction(
                     key=key,
@@ -821,8 +855,17 @@ def _reexecute(
             )
             return
 
-    # present (or no probe) -> finalize committed under the bumped epoch.
-    if store.finalize(key, epoch, LedgerState.COMMITTED, _json_safe(result), None):
+    # present (or no probe) -> finalize committed under the bumped epoch, with
+    # the reconciler's chained audit event in the same transaction (P2.2).
+    retried_event = _reconcile_audit_event(
+        record,
+        outcome=Outcome.RETRIED_COMMITTED,
+        epoch=epoch,
+        now_fn=now_fn,
+        to_state=LedgerState.COMMITTED,
+        reason="re-executed and committed under the bumped epoch",
+    )
+    if store.finalize(key, epoch, LedgerState.COMMITTED, _json_safe(result), retried_event):
         report._record(
             ReconcileAction(
                 key=key,
@@ -839,6 +882,66 @@ def _reexecute(
     _record_fenced(record, epoch, report, "finalize fenced during re-execute")
 
 
+def _reconcile_audit_event(
+    record: CommitRecord,
+    *,
+    outcome: Outcome,
+    epoch: int,
+    now_fn: Callable[[], datetime],
+    to_state: LedgerState | None = None,
+    reason: str | None = None,
+) -> AuditEvent:
+    """Build the chained audit event for one recovery action (PLAN.md 4.2).
+
+    ``event_type='reconcile'`` — the recovered/escalation evidence PLAN 4.2
+    calls audit events, hash-chained as of P2.2. The payload is deliberately
+    a small, fully-controlled vocabulary (states, outcome, epoch, reason) so
+    it always lies in the airlock-canon-1 domain; free-form probe evidence
+    stays on ``commit_records.error_json`` where it always lived — the chain
+    records WHAT the reconciler concluded, the ledger row keeps the raw why.
+    """
+    payload: dict[str, JsonValue] = {
+        "key": record.idempotency_key,
+        "from_state": record.state.value,
+        "to_state": None if to_state is None else to_state.value,
+        "outcome": outcome.value,
+        "epoch": epoch,
+        "guarantee": record.guarantee.value,
+        "reason": reason,
+        "at": _now_iso(now_fn),
+    }
+    return AuditEvent(
+        event_type=RECONCILE_EVENT_TYPE,
+        run_id=record.run_id,
+        action_type=record.action_type,
+        payload=payload,
+        created_at=now_fn(),
+    )
+
+
+def _append_escalation(
+    store: Any,
+    record: CommitRecord,
+    *,
+    epoch: int,
+    now_fn: Callable[[], datetime],
+    reason: str,
+) -> None:
+    """Append the loud escalation audit row (PLAN.md 4.2: "escalate via audit event").
+
+    Standalone append (no state changed, so there is no finalize transaction
+    to ride). Best-effort like every other evidence write in this module: a
+    transient append failure must not abort the sweep mid-pass — the
+    escalation is still counted on the report, and the row is still left
+    ``executing`` for the next pass to escalate again.
+    """
+    event = _reconcile_audit_event(
+        record, outcome=Outcome.ESCALATED, epoch=epoch, now_fn=now_fn, reason=reason
+    )
+    with contextlib.suppress(Exception):
+        store.append_audit(event)
+
+
 def _finalize(
     store: Any,
     record: CommitRecord,
@@ -849,12 +952,18 @@ def _finalize(
     evidence: JsonValue,
     outcome: Outcome,
     report: ReconcileReport,
+    now_fn: Callable[[], datetime],
     detail: str | None = None,
 ) -> None:
     """Record evidence (best-effort) then epoch-guarded finalize to ``state``.
 
+    The finalize carries the reconciler's chained audit event (P2.2): the
+    terminal transition and its audit row land in ONE transaction, exactly
+    like ``commit_once``'s own finalize.
+
     A fenced finalize (rowcount 0) means a third actor took over mid-recovery
-    — never override; count it fenced.
+    — never override; count it fenced (the store appends nothing for a fenced
+    finalize, so no false transition reaches the chain).
     """
     key = record.idempotency_key
     if evidence is not None:
@@ -862,7 +971,10 @@ def _finalize(
             Exception
         ):  # evidence best-effort; the terminal state is the point
             store.record_error(key, epoch, evidence)
-    if store.finalize(key, epoch, state, result, None):
+    audit_event = _reconcile_audit_event(
+        record, outcome=outcome, epoch=epoch, now_fn=now_fn, to_state=state, reason=detail
+    )
+    if store.finalize(key, epoch, state, result, audit_event):
         report._record(
             ReconcileAction(
                 key=key,

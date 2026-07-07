@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "event_id": "5f2c9a1de0b34c1f8a7d3e6b2c4f9a10",
+  "emitted_at": "2026-07-06T12:00:00.000123Z",
+  "run_id": "run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50",
+  "idempotency_key": "1f4a9c0d2e6b8a7c5d3f1e0b9a8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c",
+  "action_type": "refund.create",
+  "policy_decision": "auto",
+  "cost": {"amount": "12.5", "currency": "EUR"},
+  "reversibility": "irreversible",
+  "blast_radius_estimate": "low",
+  "guarantee": "verifiable",
+  "human_decision": null,
+  "decision_latency_ms": null,
+  "decided_by": null,
+  "action_diff": null,
+  "outcome": "committed",
+  "post_verify": {"ran": true, "result": "present"}
+}

@@ -5,13 +5,16 @@
 
 - **AUTO**  → commit the effect exactly once via ``commit_once`` (P1.1), the
   key derived from the call args (P1.2), the ``Effect`` and preconditions
-  passed through.
-- **DENY**  → emit a policy-decision event and raise :class:`ActionDenied`
+  passed through; the terminal ``action_event.v1`` is appended to the hash
+  chain INSIDE the finalize transaction (P2.2).
+- **DENY**  → append the ``action_event`` (outcome='denied') durably to the
+  hash chain + mirror it to the sinks, then raise :class:`ActionDenied`
   BEFORE any ledger claim — block, no side effect (PLAN.md "Deny = block +
-  audit event").
-- **GATE**  → emit the policy-decision event and surface the gate cleanly
-  WITHOUT executing (fail-safe). The durable pause + resume + transport are
-  P2.3 and OUT OF SCOPE here (see "The GATE seam" below).
+  audit event"; PLAN.md 4.4 "DENY = decision + one local audit append").
+- **GATE**  → surface the gate cleanly WITHOUT executing (fail-safe). The
+  durable pause + resume + transport are P2.3 and OUT OF SCOPE here (see
+  "The GATE seam" below); the gate's ``action_event`` is emitted at its
+  terminal state, which P2.3 owns — P2.2 emits nothing for GATE.
 
 **Decoration is side-effect-free except one registration.** Applying ``@guard``
 does not touch the store, the policy, or the network; it only records
@@ -36,22 +39,26 @@ persist-then-send/wait (or a plain ``ActionPending(run_id=...)`` for async
 agents). Until then, GATE surfacing is honest about the missing layer rather
 than silently executing or dropping the action.
 
-The audit seam (P2.1)
+The audit seam (P2.2)
 ---------------------
-Events go through :func:`airlock.events.emit_policy_decision` (best-effort,
-sink-isolated). That is NOT the hash-chained audit-of-record — P2.2 owns the
-durable ``audit_events`` row and is the durability owner for deny records too.
-See ``airlock.events`` for the full disclaimer.
+The durable, hash-chained ``audit_events`` row IS the record of truth now:
+deny events are appended at decision time (``Store.append_audit``), auto
+events inside the finalize transaction (``commit_once`` → ``Store.finalize``).
+``EventSink`` is the best-effort mirror of the same :class:`ActionEvent`
+object — sink failures are isolated and can never perturb the guarded call
+(see ``airlock.events``).
 """
 
 from __future__ import annotations
 
 import functools
 import inspect
+import uuid
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
 from pydantic import JsonValue
@@ -64,12 +71,25 @@ from airlock.errors import (
     GateNotSupported,
     PreconditionFailed,
 )
-from airlock.events import EventSink, PolicyDecisionEvent, emit_policy_decision
+from airlock.events import (
+    ActionEventContext,
+    EventSink,
+    PostVerify,
+    build_action_event,
+    emit_action_event,
+)
 from airlock.idempotency import build_arg_map, derive_key, namespace_user_key
 from airlock.policy import ActionContext, Policy, PolicyBackend
 from airlock.registry import Registry
 from airlock.registry import registry as default_registry
-from airlock.types import BlastRadius, Decision, LedgerState, Money, Reversibility
+from airlock.types import (
+    ActionOutcome,
+    BlastRadius,
+    Decision,
+    LedgerState,
+    Money,
+    Reversibility,
+)
 
 if TYPE_CHECKING:
     from airlock.store import Store
@@ -158,8 +178,9 @@ def init(
         policy: the :class:`PolicyBackend`. ``None`` installs
             ``Policy(default=GATE)`` — fail safe: with no rules every action
             gates for a human (PLAN.md 3.3).
-        event_sinks: best-effort :class:`EventSink`s for policy-decision events
-            (P2.1 seam; P2.2 adds the durable hash-chained record).
+        event_sinks: best-effort :class:`EventSink` mirrors of the
+            ``action_event.v1`` records; the durable hash-chained
+            ``audit_events`` row is the record of truth (P2.2).
         registry: the shared action :class:`Registry`; defaults to the
             process-wide one ``@guard`` populates and the reconciler reads.
         reconcile_after: forwarded to ``commit_once`` on the AUTO path — the
@@ -316,36 +337,97 @@ def _invoke(spec: _GuardSpec, args: tuple[Any, ...], kwargs: Mapping[str, Any]) 
     # THE HOT PATH: pure, in-process, zero I/O (SPEC.md 3 / ADR-3).
     decision = runtime.policy.evaluate(ctx)
 
-    # Emit the policy-decision event for EVERY verdict, before acting on it: the
-    # deny record must survive the block (PLAN.md "Deny = block + audit event"),
-    # the gate record must exist even though the action pauses, and the auto
-    # record captures the decision alongside the commit. Best-effort + sink-
-    # isolated in P2.1; P2.2 makes the durable hash-chained row the record of
-    # truth (see airlock.events).
-    event = PolicyDecisionEvent(
-        action_type=spec.action_type,
+    # The decision-time half of THE one action_event.v1 (PLAN.md 6.3). run_id
+    # identifies this guarded invocation; the terminal half (outcome,
+    # post_verify) is filled where the outcome becomes known — deny right
+    # here, auto inside commit_once's finalize transaction, gate at the P2.3
+    # terminal state (P2.2 emits nothing for gate — see airlock.events).
+    event_ctx = ActionEventContext(
+        run_id=f"run_{uuid.uuid4().hex}",
         policy_decision=decision,
-        cost=resolved_cost,
         reversibility=spec.reversibility,
+        cost=resolved_cost,
         blast_radius=resolved_blast,
+        sinks=runtime.event_sinks,
     )
-    emit_policy_decision(runtime.event_sinks, event)
 
     if decision is Decision.DENY:
-        # Block before any ledger claim: no side effect.
-        raise ActionDenied(
-            f"policy denied action {spec.action_type!r}; the action was blocked and no side "
-            "effect ran (a policy-decision event was emitted).",
-            action_type=spec.action_type,
-        )
+        # Block before any ledger claim: no side effect. DENY = the pure
+        # decision + one local audit append (PLAN.md 4.4): the action_event
+        # (outcome='denied') is written durably to the hash chain, then
+        # mirrored to the sinks — see _handle_deny for the failure posture.
+        _handle_deny(runtime, spec, args, kwargs, event_ctx)
+        raise AssertionError("unreachable: _handle_deny always raises")  # pragma: no cover
 
     if decision is Decision.GATE:
         # Fail-safe: surface the gate WITHOUT executing. The durable pause +
-        # transport are P2.3 (see module docstring).
+        # transport are P2.3 (see module docstring); the gate's action_event
+        # is emitted at its terminal state, which P2.3 owns.
         return _handle_gate(runtime, spec, args, kwargs)
 
-    # AUTO — commit the effect exactly once (P1.1).
-    return _commit_auto(runtime, spec, args, kwargs)
+    # AUTO — commit the effect exactly once (P1.1); the terminal action_event
+    # rides inside commit_once's finalize transaction (P2.2).
+    return _commit_auto(runtime, spec, args, kwargs, event_ctx)
+
+
+def _handle_deny(
+    runtime: _Runtime,
+    spec: _GuardSpec,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    event_ctx: ActionEventContext,
+) -> None:
+    """The DENY path: one durable audit append + the sink mirror, then raise.
+
+    PLAN.md 4.4: "DENY = decision + one local audit append." The DECISION was
+    already taken purely in-process; what happens here is data-plane I/O to
+    the customer's own store — never a control-plane call. The action_event
+    (outcome='denied', post_verify never ran) is appended as a hash-chained
+    ``audit_events`` row in its own transaction; the idempotency key on the
+    event is derived from the call args exactly as the AUTO path would have
+    (pure computation), so a later retry of the same call is joinable.
+
+    Failure posture: the block is the fail-safe and it stands regardless.
+    If the durable append fails (audit store unreachable), the deny STILL
+    raises :class:`ActionDenied` — converting a deny into an infrastructure
+    error could only make a blocked action less blocked — but the failure is
+    never silent: a warning fires and the failure is attached to the raised
+    error as a note. The sink mirror fires either way (best-effort).
+    """
+    arg_map = _arg_map(spec, args, kwargs)
+    ledger_key = _ledger_key(spec, args, kwargs, arg_map)
+    event = build_action_event(
+        event_ctx,
+        idempotency_key=ledger_key,
+        action_type=spec.action_type,
+        guarantee=spec.effect.guarantee,
+        outcome=ActionOutcome.DENIED,
+        post_verify=PostVerify(ran=False),
+        now_fn=lambda: datetime.now(UTC),
+    )
+    append_error: Exception | None = None
+    try:
+        runtime.store.append_audit(event.to_audit_event())
+    except Exception as exc:
+        append_error = exc
+        warnings.warn(
+            f"airlock: the durable deny audit append for {spec.action_type!r} failed "
+            f"({exc!r}); the deny itself stands (no side effect ran), but the "
+            "tamper-evident record did not land — investigate the audit store.",
+            stacklevel=4,
+        )
+    emit_action_event(event_ctx.sinks, event)
+    denied = ActionDenied(
+        f"policy denied action {spec.action_type!r}; the action was blocked and no side "
+        "effect ran (the deny was recorded as a hash-chained action_event audit row).",
+        action_type=spec.action_type,
+    )
+    if append_error is not None:
+        denied.add_note(
+            f"airlock: the durable deny audit append failed ({append_error!r}); "
+            "the deny record reached only the best-effort event sinks."
+        )
+    raise denied
 
 
 def _handle_gate(
@@ -365,7 +447,11 @@ def _handle_gate(
 
 
 def _commit_auto(
-    runtime: _Runtime, spec: _GuardSpec, args: tuple[Any, ...], kwargs: Mapping[str, Any]
+    runtime: _Runtime,
+    spec: _GuardSpec,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    event_ctx: ActionEventContext,
 ) -> Any:
     """The AUTO path: derive the key, then ``commit_once`` (exactly-once).
 
@@ -402,6 +488,7 @@ def _commit_auto(
         args_json=arg_map,
         reconcile_after=runtime.reconcile_after,
         execute_timeout=runtime.execute_timeout,
+        event_context=event_ctx,
     )
     if outcome.state is LedgerState.COMMITTED:
         return outcome.result

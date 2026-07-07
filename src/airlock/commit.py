@@ -70,10 +70,24 @@ from airlock.errors import (
     ExecuteTimeout,
     VerificationUnknown,
 )
+from airlock.events import (
+    ActionEvent,
+    ActionEventContext,
+    PostVerify,
+    build_action_event,
+    emit_action_event,
+)
 from airlock.reconcile import OnAbsent, ReconcileAction, reconcile_key
 from airlock.registry import Registry
 from airlock.store import Store
-from airlock.types import CommitOutcome, CommitRecord, Guarantee, LedgerState, Verification
+from airlock.types import (
+    ActionOutcome,
+    CommitOutcome,
+    CommitRecord,
+    Guarantee,
+    LedgerState,
+    Verification,
+)
 
 __all__ = ["commit_once"]
 
@@ -125,6 +139,7 @@ def commit_once(
     reconcile_after: timedelta | None = None,
     execute_timeout: timedelta | None = None,
     on_absent: OnAbsent = OnAbsent.ABORT,
+    event_context: ActionEventContext | None = None,
     now_fn: Callable[[], datetime] = _utcnow,
 ) -> CommitOutcome:
     """Execute ``execute(downstream_key)`` at most once per ``key``.
@@ -193,9 +208,24 @@ def commit_once(
         on_absent: forwarded to inline :func:`~airlock.reconcile.reconcile_key`
             — whether a loser's reconciliation retries or aborts a
             provably-absent / effect-free row (default ``ABORT``, fail safe).
-        now_fn: the clock used to timestamp inline reconciliation evidence and
-            (via the store) compute staleness; share it with the store's
-            ``now_fn`` so the loser's staleness view matches the ledger's.
+        event_context: (P2.2) the decision-time half of the ``action_event.v1``
+            record (:class:`~airlock.events.ActionEventContext` — run_id,
+            policy verdict, resolved risk inputs, mirror sinks), supplied by
+            ``@guard``. When set, every terminal transition THIS CALL performs
+            (precondition abort, post-verify-failed, committed) builds the one
+            :class:`~airlock.events.ActionEvent` and appends it as a
+            hash-chained ``audit_events`` row INSIDE the finalize transaction
+            (SPEC section 5 step 5), then mirrors the same object to the
+            context's sinks (best-effort). ``None`` (the bare-primitive
+            default) keeps finalize's audit slot empty — the decorator is the
+            emission owner (PLAN.md 6.3: events describe GUARDED calls).
+            Duplicate calls that merely read back an existing terminal row
+            append nothing: events are per terminal TRANSITION, not per call.
+        now_fn: the clock used to timestamp inline reconciliation evidence,
+            the terminal ``action_event`` (its ``emitted_at`` doubles as the
+            audit row's hashed ``created_at``), and — via the store — compute
+            staleness; share it with the store's ``now_fn`` so the loser's
+            staleness view matches the ledger's.
 
     Returns:
         The terminal :class:`~airlock.types.CommitOutcome` for ``key``. A
@@ -289,6 +319,29 @@ def commit_once(
         now_fn=now_fn,
     )
 
+    # The P2.2 event seam for the terminal transitions THIS call performs.
+    # terminal_event builds the one action_event (or None without a guard
+    # context); its audit form rides INSIDE the finalize transaction, and
+    # mirror() sends the SAME object to the sinks — only after the durable
+    # transition actually landed (a fenced finalize mirrors nothing, because
+    # nothing happened).
+    def terminal_event(outcome: ActionOutcome, post_verify: PostVerify) -> ActionEvent | None:
+        if event_context is None:
+            return None
+        return build_action_event(
+            event_context,
+            idempotency_key=key,
+            action_type=action_type,
+            guarantee=guarantee,
+            outcome=outcome,
+            post_verify=post_verify,
+            now_fn=now_fn,
+        )
+
+    def mirror(event: ActionEvent | None) -> None:
+        if event is not None and event_context is not None:
+            emit_action_event(event_context.sinks, event)
+
     # Step 1 — claim, committed in its own transaction before anything runs.
     claim = store.claim(key, action_type, guarantee, args_json, downstream_key)
     if not claim.won:
@@ -322,7 +375,15 @@ def commit_once(
 
     # Step 2 — re-validate preconditions after the claim (scenario 8).
     if preconditions is not None and not preconditions():
-        if store.finalize(key, epoch, LedgerState.ABORTED, None, None):
+        aborted_event = terminal_event(ActionOutcome.ABORTED, PostVerify(ran=False))
+        if store.finalize(
+            key,
+            epoch,
+            LedgerState.ABORTED,
+            None,
+            None if aborted_event is None else aborted_event.to_audit_event(),
+        ):
+            mirror(aborted_event)
             return CommitOutcome(key=key, state=LedgerState.ABORTED, guarantee=guarantee)
         # Fenced: a takeover owns the row now; treat as a lost claim.
         return _await_terminal(
@@ -398,13 +459,28 @@ def commit_once(
             wait_timeout=wait_timeout,
             poll_interval=poll_interval,
             ctx=loser_ctx,
+            event_builder=terminal_event,
+            mirror=mirror,
         )
         if verify_outcome is not None:
             return verify_outcome
         # None -> the probe answered `present`; proceed to finalize committed.
 
-    # Step 6 — finalize committed (audit append joins this transaction in P2.2).
-    if store.finalize(key, epoch, LedgerState.COMMITTED, result, None):
+    # Step 6 — finalize committed + the chained action_event, ONE transaction
+    # (SPEC section 5 step 5 / PLAN.md 4.1 step 6).
+    probe_ran = effect.verify is not None
+    committed_event = terminal_event(
+        ActionOutcome.COMMITTED,
+        PostVerify(ran=probe_ran, result=Verification.PRESENT if probe_ran else None),
+    )
+    if store.finalize(
+        key,
+        epoch,
+        LedgerState.COMMITTED,
+        result,
+        None if committed_event is None else committed_event.to_audit_event(),
+    ):
+        mirror(committed_event)
         return CommitOutcome(
             key=key, state=LedgerState.COMMITTED, guarantee=guarantee, result=result
         )
@@ -548,6 +624,8 @@ def _post_verify(
     wait_timeout: float,
     poll_interval: float,
     ctx: _LoserContext,
+    event_builder: Callable[[ActionOutcome, PostVerify], ActionEvent | None],
+    mirror: Callable[[ActionEvent | None], None],
 ) -> CommitOutcome | None:
     """Run the probe after a successful execute; ``None`` means proceed.
 
@@ -590,7 +668,17 @@ def _post_verify(
             store.record_error(key, epoch, error_payload)
         except Exception as record_exc:
             error_payload["evidence_write_failed"] = repr(record_exc)
-        if store.finalize(key, epoch, LedgerState.FAILED, None, None):
+        failed_event = event_builder(
+            ActionOutcome.FAILED, PostVerify(ran=True, result=Verification.ABSENT)
+        )
+        if store.finalize(
+            key,
+            epoch,
+            LedgerState.FAILED,
+            None,
+            None if failed_event is None else failed_event.to_audit_event(),
+        ):
+            mirror(failed_event)
             return CommitOutcome(
                 key=key, state=LedgerState.FAILED, guarantee=guarantee, error=error_payload
             )

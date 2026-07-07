@@ -30,6 +30,10 @@ dev = [
     "hypothesis",
     "ruff",
     "mypy",
+    # Test-only: validates the /contracts/events fixtures against the JSON
+    # Schema (the model <-> schema <-> fixture round-trip, PLAN.md 6.3).
+    # Never a runtime dependency — the base import stays pydantic-only.
+    "jsonschema",
 ]
 
 [tool.hatch.build.targets.wheel]

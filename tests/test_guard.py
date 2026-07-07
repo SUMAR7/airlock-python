@@ -537,28 +537,31 @@ def test_no_paused_runs_table_is_created(store: PostgresStore, db: Engine) -> No
 
 
 # ---------------------------------------------------------------------------
-# The audit/event seam (P2.1): the policy decision is emitted for every verdict.
+# The event seam (P2.2): the ONE action_event.v1, mirrored to sinks.
+# The full durable-emission matrix (audit rows, fields, chain integrity) lives
+# in tests/test_guard_events.py; here we pin the sink-mirror behavior.
 # ---------------------------------------------------------------------------
 
 
 class _RecordingSink:
-    """A test EventSink that records every policy-decision event it receives."""
+    """A test EventSink that records every ActionEvent it receives."""
 
     def __init__(self) -> None:
-        from airlock.events import PolicyDecisionEvent
+        from airlock.events import ActionEvent
 
-        self.events: list[PolicyDecisionEvent] = []
+        self.events: list[ActionEvent] = []
 
     def emit(self, event: Any) -> None:
         self.events.append(event)
 
 
-def test_event_sink_receives_the_decision_for_every_verdict(
+def test_event_sink_mirrors_auto_and_deny_but_not_gate(
     store: PostgresStore, effects: EffectsLog, db: Engine
 ) -> None:
-    """The event seam (deliverable 4): a policy-decision event carrying
-    action_type/policy_decision/cost/reversibility/blast_radius is emitted for
-    auto AND deny AND gate — so the decision signal exists from day one."""
+    """The one event contract (PLAN.md 6.3): AUTO mirrors its terminal
+    action_event (outcome committed), DENY mirrors the denied event at decision
+    time, and GATE emits NOTHING in P2.2 — its event belongs to the P2.3
+    terminal state (see airlock.events)."""
     sink = _RecordingSink()
     policy = Policy(
         rules=[
@@ -594,25 +597,31 @@ def test_event_sink_receives_the_decision_for_every_verdict(
     with pytest.raises(GateNotSupported):
         gate(1)
 
-    decisions = [(e.action_type, e.policy_decision) for e in sink.events]
-    assert decisions == [
-        ("refund.ev", Decision.AUTO),
-        ("payout.ev", Decision.DENY),
-        ("gate.ev", Decision.GATE),
+    from airlock.types import ActionOutcome
+
+    seen = [(e.action_type, e.policy_decision, e.outcome) for e in sink.events]
+    assert seen == [
+        ("refund.ev", Decision.AUTO, ActionOutcome.COMMITTED),
+        ("payout.ev", Decision.DENY, ActionOutcome.DENIED),
+        # gate.ev: nothing — no terminal state exists for a gate until P2.3.
     ]
-    # The AUTO event carries the resolved risk metadata.
+    # The AUTO event carries the resolved risk metadata + the schema-pinned shape.
     auto_event = sink.events[0]
+    assert auto_event.schema_version == 1
     assert auto_event.cost == USD("10")
     assert auto_event.reversibility is Reversibility.REVERSIBLE
-    assert auto_event.blast_radius is BlastRadius.LOW
+    assert auto_event.blast_radius_estimate is BlastRadius.LOW
+    assert auto_event.guarantee.value == "downstream_idempotent"
+    assert auto_event.post_verify.ran is False and auto_event.post_verify.result is None
+    assert auto_event.run_id.startswith("run_")
 
 
 def test_raising_event_sink_does_not_break_the_decision(
     store: PostgresStore, effects: EffectsLog, db: Engine
 ) -> None:
     """A best-effort sink that raises must NOT change control flow: the deny
-    still raises ActionDenied, the auto still commits. The durable record is
-    P2.2's job (airlock.events); a broken mirror sink cannot fail a decision."""
+    still raises ActionDenied, the auto still commits. The durable audit row is
+    the record of truth (P2.2); a broken mirror sink cannot fail a decision."""
 
     class _BoomSink:
         def emit(self, event: Any) -> None:

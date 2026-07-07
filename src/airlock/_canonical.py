@@ -1,12 +1,12 @@
 """Canonical JSON — the ``airlock-canon-1`` rule (PLAN.md section 5.2).
 
 This module is the ONE implementation of canonicalization in the SDK. Key
-derivation (``airlock.idempotency``, P1.2) uses it today, and **P2.2's
-hash-chained audit envelope hashing imports THIS module** — the standalone
-``/contracts/canonical-json.md`` contract formally lands there. Until then,
-the rules are embedded in ``/contracts/idempotency.md``, which depends on
-them. Never fork or "locally tweak" these rules: two canonicalizations is a
-silent contract break (PLAN.md section 10, point 5).
+derivation (``airlock.idempotency``, P1.2) and the hash-chained audit
+envelope (``airlock.audit``, P2.2) both import THIS module. The standalone
+contract of record is ``/contracts/canonical-json.md``;
+``/contracts/idempotency.md`` §3 keeps the byte-for-byte-compatible
+key-derivation subset. Never fork or "locally tweak" these rules: two
+canonicalizations is a silent contract break (PLAN.md section 10, point 5).
 
 The ``airlock-canon-1`` rule
 ============================

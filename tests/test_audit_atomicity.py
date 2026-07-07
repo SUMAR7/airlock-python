@@ -82,6 +82,23 @@ def test_success_path_lands_state_and_audit_row_atomically(
     assert head is not None and head.seq == 1
     verify_chain(store)
 
+    # Physical one-transaction proof: rows written by one transaction share the
+    # same xmin (the writing txid). If finalize ever routed the append through
+    # its own connection/transaction, xmin would differ — the poison injection
+    # above cannot see that (it raises before anything is durable either way),
+    # but Postgres row provenance can.
+    with db.connect() as conn:
+        ledger_xmin = conn.execute(
+            text("SELECT xmin::text FROM commit_records WHERE idempotency_key = :k"), {"k": KEY}
+        ).scalar_one()
+        audit_xmin = conn.execute(
+            text("SELECT xmin::text FROM audit_events WHERE seq = 1")
+        ).scalar_one()
+    assert ledger_xmin == audit_xmin, (
+        f"finalize's terminal UPDATE (xmin {ledger_xmin}) and audit append (xmin {audit_xmin}) "
+        "were written by DIFFERENT transactions — SPEC section 5 step 5 requires one transaction"
+    )
+
 
 def test_aborted_append_aborts_the_terminal_update_too(store: PostgresStore, db: Engine) -> None:
     """THE fault injection: the append raises inside the finalize transaction

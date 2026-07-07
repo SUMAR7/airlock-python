@@ -498,6 +498,52 @@ def test_genesis_row_hash_is_a_frozen_constant() -> None:
     assert hashlib.sha256(b"\x00" * 32 + envelope_bytes).digest() == GENESIS_ROW_HASH
 
 
+def test_row_hash_known_answer_with_nonzero_prev_hash() -> None:
+    """Known-answer vector with a NON-zero ``prev_hash`` — the genesis KAT alone
+    cannot pin the ``prev_hash`` term (genesis prev is all zeros, so an
+    implementation that ignored ``prev_hash`` and hashed ``ZERO_HASH || env``
+    would still reproduce it). This vector freezes the full contract formula
+    ``SHA-256(prev_hash || canonical_bytes(envelope))`` for external verifiers
+    (/contracts/canonical-json.md section 7; PLAN.md 5.2), independent of every
+    airlock.audit helper."""
+    import hashlib
+
+    prev_hash = bytes(range(32))  # 000102...1f — deliberately non-zero, asymmetric
+    envelope_bytes = (
+        b'{"action_type":"refund.create","created_at":"2026-07-06T00:00:00.000000Z",'
+        b'"event_type":"action_event","payload":{"amount":"12.50","invoice":"inv_42"},'
+        b'"run_id":"run_7","seq":41}'
+    )
+    expected = hashlib.sha256(prev_hash + envelope_bytes).digest()
+
+    assert (
+        compute_row_hash(
+            prev_hash,
+            seq=41,
+            run_id="run_7",
+            action_type="refund.create",
+            event_type="action_event",
+            created_at=datetime(2026, 7, 6, tzinfo=UTC),
+            payload={"invoice": "inv_42", "amount": "12.50"},
+        )
+        == expected
+    )
+    # And the prev_hash term genuinely participates: a different prev_hash
+    # (e.g. all zeros) must change the digest.
+    assert (
+        compute_row_hash(
+            b"\x00" * 32,
+            seq=41,
+            run_id="run_7",
+            action_type="refund.create",
+            event_type="action_event",
+            created_at=datetime(2026, 7, 6, tzinfo=UTC),
+            payload={"invoice": "inv_42", "amount": "12.50"},
+        )
+        != expected
+    )
+
+
 def test_compute_row_hash_rejects_bad_prev_hash_length() -> None:
     with pytest.raises(ValueError, match="32 raw bytes"):
         compute_row_hash(

@@ -34,6 +34,7 @@ dev = [
     # Schema (the model <-> schema <-> fixture round-trip, PLAN.md 6.3).
     # Never a runtime dependency — the base import stays pydantic-only.
     "jsonschema",
+    "types-jsonschema",
 ]
 
 [tool.hatch.build.targets.wheel]

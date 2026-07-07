@@ -278,49 +278,50 @@ def verify_chain(
         raise ValueError(f"from_hash must be exactly 32 raw bytes, got {len(from_hash)}")
 
     start_seq = 0 if from_seq is None else from_seq
-    prev_row_hash: bytes | None = None  # None until the anchor row is verified
     last_seq: int | None = None
     last_hash: bytes | None = None
     count = 0
 
-    for row in store.iter_audit(start_seq):
-        if last_seq is None:
-            _verify_anchor(row, from_seq=from_seq, from_hash=from_hash)
-        else:
-            if row.seq != last_seq + 1:
-                raise AuditChainError(
-                    f"audit chain has a seq gap: row {last_seq} is followed by row "
-                    f"{row.seq} (expected {last_seq + 1}) — a row was deleted or the "
-                    "gapless append protocol was bypassed",
-                    seq=row.seq,
-                )
-            if row.prev_hash != last_hash:
-                raise AuditChainError(
-                    f"audit chain link broken at seq {row.seq}: its prev_hash does not "
-                    f"equal row {last_seq}'s row_hash",
-                    seq=row.seq,
-                )
-        recomputed = compute_row_hash(
-            row.prev_hash,
-            seq=row.seq,
-            run_id=row.run_id,
-            action_type=row.action_type,
-            event_type=row.event_type,
-            created_at=row.created_at,
-            payload=row.payload,
-        )
-        if recomputed != row.row_hash:
-            raise AuditChainError(
-                f"audit row {row.seq} is tampered: its stored row_hash does not match "
-                "the hash recomputed from its envelope "
-                "(seq/run_id/action_type/event_type/created_at/payload)",
+    def consume(stream_from: int) -> None:
+        """Verify one streamed span, threading (last_seq, last_hash) through."""
+        nonlocal last_seq, last_hash, count
+        for row in store.iter_audit(stream_from):
+            if last_seq is None:
+                _verify_anchor(row, from_seq=from_seq, from_hash=from_hash)
+            else:
+                if row.seq != last_seq + 1:
+                    raise AuditChainError(
+                        f"audit chain has a seq gap: row {last_seq} is followed by row "
+                        f"{row.seq} (expected {last_seq + 1}) — a row was deleted or the "
+                        "gapless append protocol was bypassed",
+                        seq=row.seq,
+                    )
+                if row.prev_hash != last_hash:
+                    raise AuditChainError(
+                        f"audit chain link broken at seq {row.seq}: its prev_hash does "
+                        f"not equal row {last_seq}'s row_hash",
+                        seq=row.seq,
+                    )
+            recomputed = compute_row_hash(
+                row.prev_hash,
                 seq=row.seq,
+                run_id=row.run_id,
+                action_type=row.action_type,
+                event_type=row.event_type,
+                created_at=row.created_at,
+                payload=row.payload,
             )
-        prev_row_hash = row.row_hash
-        last_seq, last_hash = row.seq, row.row_hash
-        count += 1
+            if recomputed != row.row_hash:
+                raise AuditChainError(
+                    f"audit row {row.seq} is tampered: its stored row_hash does not match "
+                    "the hash recomputed from its envelope "
+                    "(seq/run_id/action_type/event_type/created_at/payload)",
+                    seq=row.seq,
+                )
+            last_seq, last_hash = row.seq, row.row_hash
+            count += 1
 
-    _ = prev_row_hash
+    consume(start_seq)
     if last_seq is None or last_hash is None:
         if from_seq is not None:
             raise AuditChainError(
@@ -341,9 +342,23 @@ def verify_chain(
             "tail-verified; run ensure_schema()",
             seq=last_seq,
         )
-    if head.seq != last_seq or head.row_hash != last_hash:
+    # Catch-up: on a LIVE system rows may be appended while we stream (the row
+    # snapshot is taken at cursor start; the head is read after). A head ahead
+    # of the last streamed row, with the new rows actually present and valid,
+    # is concurrent progress — verify the delta and re-check. The loop
+    # terminates: each pass either advances last_seq or proves the
+    # head-claimed rows are missing (a truncated tail) and falls through to
+    # the mismatch error.
+    while head.seq > last_seq:
+        before = last_seq
+        consume(last_seq + 1)
+        head = store.audit_head()
+        if head is None or last_seq == before:
+            break  # head ahead but rows absent -> the mismatch error below
+    if head is None or head.seq != last_seq or head.row_hash != last_hash:
+        head_desc = "missing" if head is None else f"seq={head.seq}"
         raise AuditChainError(
-            f"audit_chain_head does not match the last row: head says (seq={head.seq}), "
+            f"audit_chain_head does not match the last row: head says ({head_desc}), "
             f"the chain ends at (seq={last_seq}) — trailing rows were deleted or the "
             "head was tampered",
             seq=last_seq,

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from airlock.errors import ActionDenied as ActionDenied
     from airlock.errors import ActionPending as ActionPending
     from airlock.errors import AirlockError as AirlockError
+    from airlock.errors import ApprovalRejected as ApprovalRejected
     from airlock.errors import AtMostOnceWarning as AtMostOnceWarning
     from airlock.errors import AuditChainError as AuditChainError
     from airlock.errors import CanonicalizationError as CanonicalizationError
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
     from airlock.errors import CommitWaitTimeout as CommitWaitTimeout
     from airlock.errors import GateNotSupported as GateNotSupported
     from airlock.errors import PreconditionFailed as PreconditionFailed
+    from airlock.errors import StateVersionError as StateVersionError
+    from airlock.errors import UnknownApprovalRef as UnknownApprovalRef
     from airlock.errors import VerificationUnknown as VerificationUnknown
     from airlock.events import ActionEvent as ActionEvent
     from airlock.events import EventSink as EventSink
@@ -41,13 +44,20 @@ if TYPE_CHECKING:
     from airlock.idempotency import build_arg_map as build_arg_map
     from airlock.idempotency import derive_key as derive_key
     from airlock.idempotency import namespace_user_key as namespace_user_key
+    from airlock.pause import DecisionOutcome as DecisionOutcome
+    from airlock.pause import apply_decision as apply_decision
     from airlock.policy import ActionContext as ActionContext
     from airlock.policy import Policy as Policy
     from airlock.policy import PolicyBackend as PolicyBackend
     from airlock.policy import Rule as Rule
     from airlock.store import Store as Store
     from airlock.store import from_url as from_url
+    from airlock.transport import ApprovalTransport as ApprovalTransport
+    from airlock.transport import PauseRequest as PauseRequest
+    from airlock.transport import SendReceipt as SendReceipt
+    from airlock.transport.console import ConsoleApprovalTransport as ConsoleApprovalTransport
     from airlock.types import ActionOutcome as ActionOutcome
+    from airlock.types import ApprovalDecision as ApprovalDecision
     from airlock.types import AuditEvent as AuditEvent
     from airlock.types import AuditHead as AuditHead
     from airlock.types import AuditRow as AuditRow
@@ -60,6 +70,8 @@ if TYPE_CHECKING:
     from airlock.types import HumanDecision as HumanDecision
     from airlock.types import LedgerState as LedgerState
     from airlock.types import Money as Money
+    from airlock.types import PausedRun as PausedRun
+    from airlock.types import PauseStatus as PauseStatus
     from airlock.types import Reversibility as Reversibility
     from airlock.types import Verification as Verification
 
@@ -76,6 +88,7 @@ _EXPORTS: dict[str, str] = {
     "ActionDenied": "airlock.errors",
     "ActionPending": "airlock.errors",
     "AirlockError": "airlock.errors",
+    "ApprovalRejected": "airlock.errors",
     "AtMostOnceWarning": "airlock.errors",
     "AuditChainError": "airlock.errors",
     "CanonicalizationError": "airlock.errors",
@@ -83,6 +96,8 @@ _EXPORTS: dict[str, str] = {
     "CommitWaitTimeout": "airlock.errors",
     "GateNotSupported": "airlock.errors",
     "PreconditionFailed": "airlock.errors",
+    "StateVersionError": "airlock.errors",
+    "UnknownApprovalRef": "airlock.errors",
     "VerificationUnknown": "airlock.errors",
     "ActionEvent": "airlock.events",
     "EventSink": "airlock.events",
@@ -93,13 +108,20 @@ _EXPORTS: dict[str, str] = {
     "build_arg_map": "airlock.idempotency",
     "derive_key": "airlock.idempotency",
     "namespace_user_key": "airlock.idempotency",
+    "DecisionOutcome": "airlock.pause",
+    "apply_decision": "airlock.pause",
     "ActionContext": "airlock.policy",
     "Policy": "airlock.policy",
     "PolicyBackend": "airlock.policy",
     "Rule": "airlock.policy",
     "Store": "airlock.store",
     "from_url": "airlock.store",
+    "ApprovalTransport": "airlock.transport",
+    "PauseRequest": "airlock.transport",
+    "SendReceipt": "airlock.transport",
+    "ConsoleApprovalTransport": "airlock.transport.console",
     "ActionOutcome": "airlock.types",
+    "ApprovalDecision": "airlock.types",
     "AuditEvent": "airlock.types",
     "AuditHead": "airlock.types",
     "AuditRow": "airlock.types",
@@ -112,6 +134,8 @@ _EXPORTS: dict[str, str] = {
     "HumanDecision": "airlock.types",
     "LedgerState": "airlock.types",
     "Money": "airlock.types",
+    "PauseStatus": "airlock.types",
+    "PausedRun": "airlock.types",
     "Reversibility": "airlock.types",
     "Verification": "airlock.types",
 }

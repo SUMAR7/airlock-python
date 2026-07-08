@@ -6,8 +6,9 @@ ground truth is the effects_log autocommit table). Covers:
 - AUTO actually calls commit_once and commits EXACTLY ONCE (effects_log == 1),
   duplicate calls dedupe, the downstream key is injected via effect.key_param;
 - DENY raises ActionDenied and does NOT execute, before any ledger claim;
-- GATE does NOT execute the side effect and surfaces cleanly (GateNotSupported,
-  a subclass of ActionPending) with no pause built (no paused_runs anywhere);
+- GATE does NOT execute the side effect: it persists a durable proposed
+  paused_runs row (P2.3) and surfaces ActionPending (gate_wait=False here; the
+  wait→apply→resume flow lives in tests/test_guard_pause.py);
 - callable cost / blast_radius resolved per-call from the args (before the pure
   policy sees them);
 - the decision matrix (auto/gate/deny across action_type/cost/reversibility/
@@ -31,7 +32,7 @@ from sqlalchemy import text
 
 from airlock import guard, init
 from airlock.effects import Effect
-from airlock.errors import ActionDenied, ActionPending, AirlockError, GateNotSupported
+from airlock.errors import ActionDenied, ActionPending, AirlockError
 from airlock.policy import Policy, Rule
 from airlock.registry import registry as default_registry
 from airlock.types import BlastRadius, Decision, LedgerState, Money, Reversibility
@@ -126,7 +127,7 @@ def test_auto_callable_cost_and_blast_radius_resolved_from_args(
         rules=[Rule(match="refund.dyn", decision=Decision.AUTO, max_cost=USD("100"))],
         default=Decision.GATE,
     )
-    init(store=store, policy=policy)
+    init(store=store, policy=policy, gate_wait=False)
 
     def cost_of(amount: str, **_: object) -> Money:
         # Exercise the Decimal-input path of Money (canonicalized on the way in).
@@ -149,8 +150,10 @@ def test_auto_callable_cost_and_blast_radius_resolved_from_args(
     assert do_refund("50")["amount"] == "50"
     assert effects.count("50") == 1
 
-    # $500 → over the ceiling → no rule matches → default GATE, no effect.
-    with pytest.raises(GateNotSupported):
+    # $500 → over the ceiling → no rule matches → default GATE. With
+    # gate_wait=False the durable pause is persisted and ActionPending is raised
+    # without executing (the side effect only runs on approval, exactly once).
+    with pytest.raises(ActionPending):
         do_refund("500")
     assert effects.count("500") == 0
 
@@ -217,36 +220,49 @@ def test_deny_raises_and_does_not_execute(
 
 
 # ---------------------------------------------------------------------------
-# GATE — does not execute, surfaces cleanly, no pause layer built (P2.1).
+# GATE — persists a durable pause, does not execute, surfaces cleanly (P2.3).
 # ---------------------------------------------------------------------------
 
 
-def test_gate_does_not_execute_and_surfaces_cleanly(
+def test_gate_persists_durable_pause_and_raises_action_pending(
     store: PostgresStore, effects: EffectsLog, db: Engine
 ) -> None:
-    """A GATE decision raises GateNotSupported (a subclass of ActionPending
-    that names P2.3), runs no side effect, and creates no ledger row — the
-    durable pause is explicitly NOT built in P2.1."""
-    init(store=store, policy=Policy(default=Decision.GATE))
+    """A GATE decision (gate_wait=False) persists a proposed paused_runs row
+    BEFORE any transport call, runs no side effect, claims no ledger row, and
+    raises ActionPending carrying the run_id + approval_ref (the resume handle).
+    """
+    init(store=store, policy=Policy(default=Decision.GATE), gate_wait=False)
 
     @guard("gated.action", reversibility=Reversibility.IRREVERSIBLE)
     def gated(x: int) -> int:
-        effects.log(str(x))  # must never run
+        effects.log(str(x))  # must never run until approved
         return x
 
-    with pytest.raises(GateNotSupported) as excinfo:
+    with pytest.raises(ActionPending) as excinfo:
         gated(7)
-    # It IS an ActionPending (integrators can catch either).
-    assert isinstance(excinfo.value, ActionPending)
     assert excinfo.value.action_type == "gated.action"
-    assert excinfo.value.run_id is None  # no paused_runs row in P2.1
-    assert "P2.3" in str(excinfo.value)
+    assert excinfo.value.run_id is not None  # the durable pause exists (P2.3)
+    assert excinfo.value.approval_ref is not None
     assert effects.count("7") == 0
+
+    # No ledger row is claimed until an approval reaches apply_decision.
     with db.connect() as conn:
-        count = conn.execute(
+        ledger = conn.execute(
             text("SELECT count(*) FROM commit_records WHERE action_type = 'gated.action'")
         ).scalar_one()
-    assert count == 0
+        pause = conn.execute(
+            text(
+                "SELECT status, approval_ref::text FROM paused_runs"
+                " WHERE action_type = 'gated.action'"
+            )
+        ).one()
+    assert ledger == 0
+    assert pause.status == "proposed"
+    assert pause.approval_ref == excinfo.value.approval_ref
+
+    # The run rehydrates by approval_ref (the only cross-boundary key).
+    run = store.load_paused_by_ref(excinfo.value.approval_ref)
+    assert run is not None and run.run_id == excinfo.value.run_id
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +287,7 @@ def test_decision_matrix_through_the_decorator(
         ],
         default=Decision.GATE,
     )
-    init(store=store, policy=policy)
+    init(store=store, policy=policy, gate_wait=False)
 
     @guard(
         "refund.ok",
@@ -300,7 +316,7 @@ def test_decision_matrix_through_the_decorator(
         payout("acct_1")
     assert effects.count("payout-acct_1") == 0
 
-    with pytest.raises(GateNotSupported):  # default GATE
+    with pytest.raises(ActionPending):  # default GATE → durable pause
         mystery(3)
     assert effects.count("mystery-3") == 0
 
@@ -321,14 +337,14 @@ def test_irreversible_refund_gates_not_autos(
         ],
         default=Decision.GATE,
     )
-    init(store=store, policy=policy)
+    init(store=store, policy=policy, gate_wait=False)
 
     @guard("refund.irr", cost=USD("5"), reversibility=Reversibility.IRREVERSIBLE)
     def refund(invoice: str) -> str:
         effects.log(invoice)
         return invoice
 
-    with pytest.raises(GateNotSupported):
+    with pytest.raises(ActionPending):
         refund("inv_irr")
     assert effects.count("inv_irr") == 0
 
@@ -518,22 +534,27 @@ def test_at_most_once_auto_still_commits_with_warning(
     assert effects.count("v") == 1
 
 
-def test_no_paused_runs_table_is_created(store: PostgresStore, db: Engine) -> None:
-    """Scope fence: P2.1 builds no durable pause. A GATE must not create a
-    paused_runs table or any pause artifact — assert the table does not exist."""
-    init(store=store, policy=Policy(default=Decision.GATE))
+def test_gate_persists_exactly_one_proposed_pause_before_transport(
+    store: PostgresStore, db: Engine
+) -> None:
+    """P2.3 durability: a GATE persists the paused_runs row BEFORE any transport
+    call, so a crash between the persist and the human's decision still leaves a
+    resumable run (scenario 6). Exactly one proposed row per gated call."""
+    init(store=store, policy=Policy(default=Decision.GATE), gate_wait=False)
 
     @guard("scope.gate", reversibility=Reversibility.UNKNOWN)
     def tool() -> None: ...
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        with pytest.raises(GateNotSupported):
+        with pytest.raises(ActionPending):
             tool()
 
     with db.connect() as conn:
-        exists = conn.execute(text("SELECT to_regclass('public.paused_runs')")).scalar_one()
-    assert exists is None  # P2.3 builds paused_runs, not P2.1
+        rows = conn.execute(
+            text("SELECT status FROM paused_runs WHERE action_type = 'scope.gate'")
+        ).all()
+    assert [r.status for r in rows] == ["proposed"]
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +591,7 @@ def test_event_sink_mirrors_auto_and_deny_but_not_gate(
         ],
         default=Decision.GATE,
     )
-    init(store=store, policy=policy, event_sinks=[sink])
+    init(store=store, policy=policy, event_sinks=[sink], gate_wait=False)
 
     @guard(
         "refund.ev",
@@ -594,7 +615,7 @@ def test_event_sink_mirrors_auto_and_deny_but_not_gate(
     refund("inv_ev")
     with pytest.raises(ActionDenied):
         payout("acct")
-    with pytest.raises(GateNotSupported):
+    with pytest.raises(ActionPending):  # gate_wait=False: durable pause, no decision yet
         gate(1)
 
     from airlock.types import ActionOutcome
@@ -603,7 +624,8 @@ def test_event_sink_mirrors_auto_and_deny_but_not_gate(
     assert seen == [
         ("refund.ev", Decision.AUTO, ActionOutcome.COMMITTED),
         ("payout.ev", Decision.DENY, ActionOutcome.DENIED),
-        # gate.ev: nothing — no terminal state exists for a gate until P2.3.
+        # gate.ev: nothing yet — its ONE action_event is emitted at the terminal
+        # transition (approve/reject → apply_decision), not at gate time (PLAN.md 6.3).
     ]
     # The AUTO event carries the resolved risk metadata + the schema-pinned shape.
     auto_event = sink.events[0]

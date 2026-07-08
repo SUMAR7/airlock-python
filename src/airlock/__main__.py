@@ -48,7 +48,14 @@ import sys
 from collections.abc import Sequence
 from datetime import timedelta
 
-from airlock.reconcile import ExecuteWindow, OnAbsent, ReconcileReport, reconcile
+from airlock.reconcile import (
+    ExecuteWindow,
+    OnAbsent,
+    PausedSweepReport,
+    ReconcileReport,
+    reconcile,
+    reconcile_paused,
+)
 from airlock.store import from_url
 
 __all__ = ["main"]
@@ -171,6 +178,13 @@ def _summarize(report: ReconcileReport) -> str:
     return f"reconcile: {report.total} row(s) — " + ", ".join(parts)
 
 
+def _summarize_paused(report: PausedSweepReport) -> str:
+    if report.total == 0:
+        return "reconcile paused: no stale approved runs"
+    parts = [f"{outcome}={count}" for outcome, count in sorted(report.counts.items())]
+    return f"reconcile paused: {report.total} run(s) — " + ", ".join(parts)
+
+
 def _audit_verify(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """The ``audit verify`` subcommand: exit 0 verified / 1 tamper detected."""
     from airlock.audit import verify_chain
@@ -258,12 +272,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             on_absent=OnAbsent(args.on_absent),
             execute_timeout=execute_timeout,
         )
+        # The paused_runs sweep (PLAN.md 4.2): drive stale APPROVED runs whose
+        # commit never landed through apply_decision (ensure-committed). Same
+        # one-shot pass; proposed rows are never swept (no TTL in v1).
+        paused = reconcile_paused(
+            store,
+            older_than=older_than,
+            reconcile_after=older_than,
+            execute_timeout=execute_timeout,
+        )
     finally:
         close = getattr(store, "close", None)
         if callable(close):
             close()
 
     print(_summarize(report))
+    print(_summarize_paused(paused))
     return 0
 
 

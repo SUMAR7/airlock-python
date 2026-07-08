@@ -28,15 +28,19 @@ autocommit connection (ground truth), keyed by the DSN in ``AIRLOCK_TEST_DSN``.
 
 from __future__ import annotations
 
+import io
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 from airlock import guard, init
 from airlock.effects import Effect
+from airlock.errors import ActionPending
 from airlock.policy import Policy
 from airlock.store.postgres import PostgresStore
 from airlock.transport import PauseRequest, SendReceipt
+from airlock.transport.console import ConsoleApprovalTransport
 from airlock.types import (
     ApprovalDecision,
     AuditEvent,
@@ -132,6 +136,34 @@ def run_gate_and_crash_on_send(dsn: str, out_path: str, invoice: str) -> None:
     )
     harness_refund(invoice)  # persist pause → send → os._exit inside send
     os._exit(0)  # pragma: no cover — unreachable when the crash fires
+
+
+def run_gate_console_and_exit(
+    dsn: str, approvals_path: str, ref_out_path: str, invoice: str
+) -> None:
+    """Subprocess target (MVP e2e): gate through a ConsoleApprovalTransport with
+    gate_wait=False, write the SDK-minted approval_ref out, and exit CLEANLY.
+
+    Models a worker that durably paused a gated action and then ended (a deploy).
+    The pause survives; the fresh process resumes it from the console file.
+    """
+    os.environ["AIRLOCK_TEST_DSN"] = dsn
+    store = PostgresStore(dsn)
+    init(
+        store=store,
+        policy=Policy(default=Decision.GATE),
+        transport=ConsoleApprovalTransport(approvals_path, out=io.StringIO()),
+        gate_wait=False,
+    )
+    try:
+        harness_refund(invoice)
+    except ActionPending as pending:
+        Path(ref_out_path).write_text(
+            json.dumps({"approval_ref": pending.approval_ref, "run_id": pending.run_id}),
+            encoding="utf-8",
+        )
+        return  # clean exit 0 — the process "deployed away" with the pause durable
+    raise AssertionError("a gated action must raise ActionPending under gate_wait=False")
 
 
 def run_apply_crash_after_cas(dsn: str, approval_ref: str) -> None:

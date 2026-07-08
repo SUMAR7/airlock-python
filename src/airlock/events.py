@@ -226,6 +226,13 @@ class ActionEventContext:
     which builds the full :class:`ActionEvent` at each terminal transition —
     where the ``outcome`` and ``post_verify`` halves become known — and appends
     it inside the finalize transaction, then mirrors it to ``sinks``.
+
+    ``human_decision`` / ``decided_by`` / ``decision_latency_ms`` are the P2.3
+    approval half: ``apply_decision`` populates them when it drives an
+    approved/rejected pause to its terminal state (the gate's ``action_event``
+    is emitted at that terminal state — PLAN.md 6.3), so the one event carries
+    both the policy verdict and the human decision. They stay ``None`` on the
+    auto/deny paths, exactly as the P2.2 emission matrix pinned.
     """
 
     run_id: str
@@ -233,6 +240,9 @@ class ActionEventContext:
     reversibility: Reversibility
     cost: Money | None = None
     blast_radius: BlastRadius | None = None
+    human_decision: HumanDecision | None = None
+    decided_by: str | None = None
+    decision_latency_ms: int | None = None
     sinks: tuple[EventSink, ...] = ()
 
 
@@ -263,6 +273,9 @@ def build_action_event(
         reversibility=ctx.reversibility,
         blast_radius_estimate=ctx.blast_radius,
         guarantee=guarantee,
+        human_decision=ctx.human_decision,
+        decision_latency_ms=ctx.decision_latency_ms,
+        decided_by=ctx.decided_by,
         outcome=outcome,
         post_verify=post_verify,
     )

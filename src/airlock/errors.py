@@ -20,6 +20,7 @@ __all__ = [
     "ActionDenied",
     "ActionPending",
     "AirlockError",
+    "ApprovalRejected",
     "AtMostOnceWarning",
     "AuditChainError",
     "CanonicalizationError",
@@ -28,6 +29,8 @@ __all__ = [
     "ExecuteTimeout",
     "GateNotSupported",
     "PreconditionFailed",
+    "StateVersionError",
+    "UnknownApprovalRef",
     "VerificationUnknown",
 ]
 
@@ -175,42 +178,124 @@ class ActionDenied(AirlockError):
 
 
 class ActionPending(AirlockError):
-    """The policy returned ``gate``: the action needs human approval (ADR-4).
+    """The policy returned ``gate``: the action is durably paused (ADR-4).
 
-    In P2.1 gating is DELIBERATELY MINIMAL: the durable pause, resume, and
-    approval transport are P2.3. ``@guard`` raises this the moment a GATE
-    decision is reached — AFTER emitting the policy-decision audit record and
-    BEFORE any side effect (fail-safe: a gated action never executes here) —
-    so a gate is surfaced cleanly rather than silently executed or dropped.
-    P2.3 replaces the raise with a durable ``paused_runs`` write + transport
-    send/wait; the seam is documented in ``airlock._guard``.
-
-    ``run_id`` is ``None`` in P2.1 (no ``paused_runs`` row is created yet);
-    the attribute exists so P2.3 can populate it without a signature change.
+    As of P2.3 a GATE decision persists a ``paused_runs`` row BEFORE this is
+    raised, so the pause survives crash/deploy/restart (scenario 6). ``@guard``
+    raises it when the caller is not waiting for the decision inline —
+    ``gate_wait=False``, or ``transport.wait`` timed out — and the run stays
+    ``proposed`` until a decision arrives. Resume later with
+    :meth:`airlock.Airlock.resume` (or any path into
+    :func:`airlock.pause.apply_decision`) using ``approval_ref``. The side
+    effect has NOT executed (fail-safe).
 
     Attributes:
         action_type: the action the policy gated.
-        run_id: the paused-run id — always ``None`` until P2.3.
+        run_id: the persisted paused-run id.
+        approval_ref: the SDK-minted approval reference — the resume handle
+            (and the only cross-boundary key, PLAN.md 6.1).
     """
 
-    def __init__(self, message: str, *, action_type: str, run_id: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        action_type: str,
+        run_id: str | None = None,
+        approval_ref: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.action_type = action_type
         self.run_id = run_id
+        self.approval_ref = approval_ref
 
 
 class GateNotSupported(ActionPending):
-    """A GATE decision was reached but no pause layer is wired (P2.1 default).
+    """A GATE decision was reached but no pause layer is wired.
 
-    A subclass of :class:`ActionPending` (so ``except ActionPending`` catches
-    it) that names P2.3 explicitly: in P2.1 there is no durable pause or
-    transport, so the only honest thing ``@guard`` can do on GATE is refuse to
-    proceed and say why. When P2.3 lands, a configured pause layer supersedes
-    this and the plain :class:`ActionPending` (with a ``run_id``) is raised for
-    async callers instead. The distinct type lets integrators assert "P2.1 did
-    not silently execute a gated action" without conflating it with a real
-    async-pending pause.
+    Historical (P2.1): before the P2.3 durable pause existed, this named the
+    missing layer. As of P2.3 ``init`` always wires a pause layer (the
+    ``ConsoleApprovalTransport`` stub by default), so a normally-configured
+    runtime never raises it; it remains a subclass of :class:`ActionPending`
+    for compatibility with integrators that caught it explicitly.
     """
+
+
+class ApprovalRejected(AirlockError):
+    """A gated action's approval was REJECTED by a human (ADR-4).
+
+    Raised by ``@guard`` (and by re-gates of the same action) when the paused
+    run's recorded outcome is a rejection: the run is ``aborted``, no side
+    effect ran, and the rejection is hash-chain audited. A re-gate with
+    identical args attaches to the SAME run and surfaces this same outcome
+    (collide-and-dedupe, PLAN.md 4.3) — a deliberate second attempt needs a
+    distinguishing arg or a ``key`` override.
+
+    Attributes:
+        action_type: the rejected action.
+        run_id: the paused run.
+        approval_ref: the approval reference the rejection resolved.
+        decided_by: the opaque actor id that rejected, if recorded.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        action_type: str,
+        run_id: str,
+        approval_ref: str,
+        decided_by: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.action_type = action_type
+        self.run_id = run_id
+        self.approval_ref = approval_ref
+        self.decided_by = decided_by
+
+
+class UnknownApprovalRef(AirlockError):
+    """No ``paused_runs`` row exists for the given ``approval_ref``.
+
+    Raised by ``apply_decision`` / ``Airlock.resume`` when the approval
+    reference does not match any persisted pause — a decision for a run this
+    database has never seen (wrong environment, typo, or a fabricated ref).
+    Never a silent no-op: an unmatched decision must be investigated.
+
+    Attributes:
+        approval_ref: the reference that matched nothing.
+    """
+
+    def __init__(self, message: str, *, approval_ref: str) -> None:
+        super().__init__(message)
+        self.approval_ref = approval_ref
+
+
+class StateVersionError(AirlockError):
+    """A ``paused_runs`` row carries an UNKNOWN ``state_version`` — refused loudly.
+
+    Rehydration (scenario 6) reconstructs a call from ``serialized_state``;
+    parsing a serialization this SDK version does not understand could execute
+    a subtly different action than the human approved. So an unknown version
+    is never misparsed and never guessed at: the run is left untouched and this
+    is raised. Upgrade (or downgrade) the SDK to a version that understands
+    ``found``, or migrate the row explicitly.
+
+    Attributes:
+        run_id: the affected paused run.
+        approval_ref: its approval reference.
+        found: the state_version on the row.
+        supported: the version this SDK writes and understands.
+    """
+
+    def __init__(
+        self, message: str, *, run_id: str, approval_ref: str, found: int, supported: int
+    ) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+        self.approval_ref = approval_ref
+        self.found = found
+        self.supported = supported
 
 
 class PreconditionFailed(AirlockError):

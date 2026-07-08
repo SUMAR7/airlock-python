@@ -71,11 +71,11 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import JsonValue
 
@@ -84,16 +84,22 @@ from airlock.registry import Registration, Registry
 from airlock.registry import registry as default_registry
 from airlock.types import AuditEvent, CommitRecord, Guarantee, LedgerState, Verification
 
+if TYPE_CHECKING:
+    from airlock.events import EventSink
+
 __all__ = [
     "RECONCILE_EVENT_TYPE",
     "ExecuteWindow",
     "OnAbsent",
     "Outcome",
+    "PausedSweepAction",
+    "PausedSweepReport",
     "ReconcileAction",
     "ReconcileReport",
     "reconcile",
     "reconcile_key",
     "reconcile_on_startup",
+    "reconcile_paused",
 ]
 
 #: The ``audit_events.event_type`` for reconciler evidence rows (PLAN.md 4.2:
@@ -383,6 +389,123 @@ def reconcile_on_startup(
         now_fn=now_fn,
         registry=registry,
     )
+
+
+@dataclass(frozen=True)
+class PausedSweepAction:
+    """What the paused sweep did to one stale-approved run (tests + observability)."""
+
+    approval_ref: str
+    run_id: str
+    action_type: str
+    #: the run's status AFTER the drive: committed | aborted | approved
+    #: ("approved" = still stranded — apply_decision could not reach a truthful
+    #: terminal this pass, so the run is left for the next one), or "error".
+    outcome: str
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class PausedSweepReport:
+    """The result of one :func:`reconcile_paused` pass (mirrors :class:`ReconcileReport`)."""
+
+    counts: dict[str, int] = field(default_factory=dict)
+    actions: list[PausedSweepAction] = field(default_factory=list)
+
+    def _record(self, action: PausedSweepAction) -> None:
+        self.actions.append(action)
+        self.counts[action.outcome] = self.counts.get(action.outcome, 0) + 1
+
+    def count(self, outcome: str) -> int:
+        return self.counts.get(outcome, 0)
+
+    @property
+    def total(self) -> int:
+        return len(self.actions)
+
+
+def reconcile_paused(
+    store: Any,
+    *,
+    older_than: timedelta,
+    registry: Registry | None = None,
+    event_sinks: Sequence[EventSink] = (),
+    reconcile_after: timedelta | None = None,
+    execute_timeout: timedelta | None = None,
+    now_fn: Callable[[], datetime] = _utcnow,
+) -> PausedSweepReport:
+    """Sweep stale ``approved`` paused runs through ``apply_decision`` (PLAN.md 4.2/4.3).
+
+    Closes the crash-between-approve-CAS-and-commit window (settled decision 3):
+    an approval whose ``commit_once`` never landed sits ``approved`` forever
+    unless something re-drives it. This sweep scans
+    ``store.stale_approved_paused(older_than)`` and drives each row through
+    :func:`airlock.pause.apply_decision` with ``decision=None`` — the
+    ensure-committed mode, which drives the recorded ``approved`` status to
+    ``committed`` (or ``aborted`` if preconditions now fail; scenario 8) exactly
+    once (the commit LEDGER dedupes concurrent appliers). It NEVER invents a
+    decision and NEVER touches ``proposed`` rows — there is no TTL expiry in v1
+    (ADR-4 is locked). This is the ONLY paused_runs reconcile behavior; it is
+    deliberately separate from :func:`reconcile` (the in-flight ledger sweep) so
+    a ``commit_once`` loser's inline reconciliation never pulls the pause layer
+    onto the hot path.
+
+    A run that ``apply_decision`` cannot resolve this pass (a
+    :class:`~airlock.errors.VerificationUnknown`, a fenced wait, an unregistered
+    ``action_type`` in this process, or any raise) is recorded and LEFT
+    ``approved`` for the next pass — the sweep never aborts mid-scan on one bad
+    row, exactly like the in-flight reconciler's best-effort evidence writes.
+
+    Args:
+        store: the customer's Store (paused rows + ledger + audit chain).
+        older_than: the staleness threshold; a run is swept once its
+            ``decided_at`` is older than ``now_fn() - older_than``.
+        registry: the action :class:`Registry` supplying each run's recovery
+            wiring (defaults to the process-wide one).
+        event_sinks: best-effort mirrors for the terminal ``action_event``.
+        reconcile_after / execute_timeout: forwarded to ``apply_decision`` ->
+            ``commit_once`` (inline recovery of a stale in-flight ledger row
+            while resuming; the enforced execute-window ordering still applies).
+        now_fn: the injectable clock, shared with the store.
+
+    Returns:
+        A :class:`PausedSweepReport` — per-run actions plus a tally by outcome.
+    """
+    from airlock.pause import apply_decision  # lazy: avoid a module import cycle
+
+    report = PausedSweepReport()
+    for run in store.stale_approved_paused(older_than):
+        try:
+            outcome = apply_decision(
+                store,
+                run.approval_ref,
+                None,
+                registry=registry,
+                event_sinks=event_sinks,
+                reconcile_after=reconcile_after,
+                execute_timeout=execute_timeout,
+                now_fn=now_fn,
+            )
+        except Exception as exc:
+            report._record(
+                PausedSweepAction(
+                    approval_ref=run.approval_ref,
+                    run_id=run.run_id,
+                    action_type=run.action_type,
+                    outcome="error",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+            )
+            continue
+        report._record(
+            PausedSweepAction(
+                approval_ref=run.approval_ref,
+                run_id=run.run_id,
+                action_type=run.action_type,
+                outcome=outcome.status.value,
+            )
+        )
+    return report
 
 
 _IN_FLIGHT = frozenset({LedgerState.PENDING, LedgerState.EXECUTING})

@@ -32,6 +32,14 @@ side effect:
                      (``airlock.audit.verify_chain``): the head singleton, and
                      a streaming ORDER BY seq scan (server-side cursor,
                      constant memory).
+- ``save_paused``    (P2.3, ADR-4) INSERT ... ON CONFLICT (idempotency_key)
+                     DO NOTHING + read-back — the durable pause; the creation
+                     audit event rides in the same transaction.
+- ``load_paused_by_ref`` plain read by approval_ref (post-restart rehydration).
+- ``transition_paused`` guarded CAS along the ADR-4 DAG + chained audit
+                     event(s), ONE transaction; illegal edges refused in code.
+- ``stale_approved_paused`` (P2.3) FOR UPDATE SKIP LOCKED scan of approved
+                     rows whose commit never landed — the reconciler sweep.
 
 Lost races are detected by guarded-UPDATE rowcount (the epoch fence), never
 by SELECT-then-UPDATE.
@@ -52,7 +60,10 @@ from airlock.audit import compute_row_hash
 from airlock.errors import AirlockError
 from airlock.types import (
     IN_FLIGHT_LEDGER_STATES,
+    PAUSE_TRANSITIONS,
+    RESOLVED_PAUSE_STATUSES,
     TERMINAL_LEDGER_STATES,
+    ApprovalDecision,
     AuditEvent,
     AuditHead,
     AuditRow,
@@ -60,6 +71,9 @@ from airlock.types import (
     CommitRecord,
     Guarantee,
     LedgerState,
+    PauseClaim,
+    PausedRun,
+    PauseStatus,
 )
 
 __all__ = ["PostgresStore", "normalize_postgres_url"]
@@ -165,6 +179,73 @@ _BUMP_EPOCH_SQL = text(
     RETURNING attempts
     """
 )
+
+
+# --- The durable pause (P2.3, ADR-4) ----------------------------------------
+#
+# Same discipline as the ledger: every transition is a guarded UPDATE whose
+# rowcount is the truth about who moved the row (never SELECT-then-UPDATE),
+# and every chained audit event rides INSIDE the transaction that made the
+# transition it evidences (the P2.2 finalize pattern).
+
+_SAVE_PAUSED_SQL = text(
+    """
+    INSERT INTO paused_runs
+        (run_id, idempotency_key, approval_ref, action_type, serialized_state,
+         state_version, status, created_at)
+    VALUES
+        (:run_id, :key, CAST(:approval_ref AS UUID), :action_type,
+         CAST(:serialized_state AS JSONB), :state_version, :proposed, :now)
+    ON CONFLICT (idempotency_key) DO NOTHING
+    RETURNING *
+    """
+).bindparams(proposed=PauseStatus.PROPOSED.value)
+
+_LOAD_PAUSED_BY_KEY_SQL = text("SELECT * FROM paused_runs WHERE idempotency_key = :key")
+
+_LOAD_PAUSED_BY_REF_SQL = text(
+    "SELECT * FROM paused_runs WHERE approval_ref = CAST(:approval_ref AS UUID)"
+)
+
+# The stale-APPROVED sweep scan (PLAN.md 4.2): the decision landed
+# (decided_at) but the commit never did. Oldest decisions first; SKIP LOCKED
+# so two reconcilers never contend on the same row (the partial index
+# paused_runs_approved_idx supports the WHERE + ORDER BY). Durable exclusion
+# among concurrent appliers is the LEDGER's job (commit_once dedupes), so no
+# epoch fence is needed here — apply_decision is idempotent by construction.
+_STALE_APPROVED_SQL = text(
+    f"""
+    SELECT * FROM paused_runs
+     WHERE status = '{PauseStatus.APPROVED.value}'
+       AND decided_at < :cutoff
+     ORDER BY decided_at
+     FOR UPDATE SKIP LOCKED
+    """
+)
+
+
+def _transition_paused_sql(with_decision: bool) -> Any:
+    decision_sets = (
+        """,
+               decided_by = :decided_by,
+               decided_by_display = :decided_by_display,
+               decided_at = :decided_at,
+               decision_latency_ms = :decision_latency_ms"""
+        if with_decision
+        else ""
+    )
+    return text(
+        f"""
+        UPDATE paused_runs
+           SET status = :to_status,
+               resolved_at = :resolved_at{decision_sets}
+         WHERE run_id = :run_id AND status = :from_status
+        """
+    )
+
+
+_TRANSITION_PAUSED_SQL = _transition_paused_sql(with_decision=False)
+_TRANSITION_PAUSED_WITH_DECISION_SQL = _transition_paused_sql(with_decision=True)
 
 
 # --- The audit chain (P2.2, ADR-5) ------------------------------------------
@@ -360,6 +441,137 @@ class PostgresStore:
                 self._append_audit_on(conn, audit)
         return rowcount == 1
 
+    def save_paused(
+        self,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        approval_ref: str,
+        action_type: str,
+        serialized_state: Mapping[str, JsonValue],
+        state_version: int = 1,
+        audit: AuditEvent | None = None,
+    ) -> PauseClaim:
+        """Durably persist the ``proposed`` pause (ADR-4), one transaction.
+
+        ``ON CONFLICT (idempotency_key) DO NOTHING`` + read-back, exactly the
+        ``claim`` pattern: the UNIQUE constraint is the concurrency guard, and
+        a conflicting insert returns the existing row (attach / surface —
+        PLAN.md 4.3). ``serialized_state`` is canonicalized here so a value
+        outside the airlock-canon-1 domain fails BEFORE anything is durable
+        (a float smuggled into the persisted state would rehydrate wrong).
+        The creation ``audit`` event is appended inside this same transaction,
+        only when the insert landed.
+        """
+        with self._engine.begin() as conn:
+            inserted = (
+                conn.execute(
+                    _SAVE_PAUSED_SQL,
+                    {
+                        "run_id": run_id,
+                        "key": idempotency_key,
+                        "approval_ref": approval_ref,
+                        "action_type": action_type,
+                        "serialized_state": canonical_json(dict(serialized_state)),
+                        "state_version": state_version,
+                        "now": self._now_fn(),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+            if inserted is not None:
+                if audit is not None:
+                    self._append_audit_on(conn, audit)
+                return PauseClaim(created=True, run=_row_to_paused(inserted))
+            existing = conn.execute(_LOAD_PAUSED_BY_KEY_SQL, {"key": idempotency_key}).mappings()
+            row = existing.first()
+        if row is None:
+            raise AirlockError(
+                f"save_paused for key {idempotency_key!r} conflicted but the row is gone — "
+                "paused_runs rows must never be deleted (ADR-4)"
+            )
+        return PauseClaim(created=False, run=_row_to_paused(row))
+
+    def load_paused_by_ref(self, approval_ref: str) -> PausedRun | None:
+        with self._engine.begin() as conn:
+            row = (
+                conn.execute(_LOAD_PAUSED_BY_REF_SQL, {"approval_ref": approval_ref})
+                .mappings()
+                .first()
+            )
+        return None if row is None else _row_to_paused(row)
+
+    def transition_paused(
+        self,
+        run_id: str,
+        from_status: PauseStatus,
+        to_status: PauseStatus,
+        *,
+        decision: ApprovalDecision | None = None,
+        audit: AuditEvent | tuple[AuditEvent, ...] | None = None,
+    ) -> bool:
+        """Guarded CAS along the ADR-4 DAG + chained audit, ONE transaction.
+
+        An illegal (from, to) pair raises ``ValueError`` before any SQL — the
+        DAG (``airlock.types.PAUSE_TRANSITIONS``) is enforced in code, and the
+        CAS's ``WHERE status = :from_status`` enforces it against concurrent
+        appliers (rowcount 0 = lost the race; the caller reads back the
+        recorded state). The audit event(s) are appended ONLY when the CAS
+        matched — a fenced transition must not put a false statement on the
+        tamper-evident chain (the P2.2 finalize pattern).
+        """
+        if (from_status, to_status) not in PAUSE_TRANSITIONS:
+            raise ValueError(
+                f"illegal paused_runs transition {from_status.value!r} -> "
+                f"{to_status.value!r}: the ADR-4 state machine allows exactly "
+                f"proposed -> approved|rejected -> committed|aborted (PLAN.md 3.2)"
+            )
+        resolved_at = self._now_fn() if to_status in RESOLVED_PAUSE_STATUSES else None
+        params: dict[str, Any] = {
+            "run_id": run_id,
+            "from_status": from_status.value,
+            "to_status": to_status.value,
+            "resolved_at": resolved_at,
+        }
+        if decision is not None:
+            params.update(
+                {
+                    "decided_by": decision.decided_by,
+                    "decided_by_display": decision.decided_by_display,
+                    "decided_at": (
+                        decision.decided_at if decision.decided_at is not None else self._now_fn()
+                    ),
+                    "decision_latency_ms": decision.decision_latency_ms,
+                }
+            )
+            sql = _TRANSITION_PAUSED_WITH_DECISION_SQL
+        else:
+            sql = _TRANSITION_PAUSED_SQL
+        events: tuple[AuditEvent, ...]
+        if audit is None:
+            events = ()
+        elif isinstance(audit, AuditEvent):
+            events = (audit,)
+        else:
+            events = tuple(audit)
+        with self._engine.begin() as conn:
+            rowcount = conn.execute(sql, params).rowcount
+            if rowcount == 1:
+                for event in events:
+                    self._append_audit_on(conn, event)
+        return rowcount == 1
+
+    def stale_approved_paused(self, older_than: timedelta) -> list[PausedRun]:
+        cutoff = self._now_fn() - older_than
+        # FOR UPDATE SKIP LOCKED for the same reason as stale_inflight: two
+        # concurrent sweeps never hand the same row to two recoverers in one
+        # pass. The lock is released at commit; safety across passes comes
+        # from apply_decision's idempotence (the ledger dedupes appliers).
+        with self._engine.begin() as conn:
+            rows = conn.execute(_STALE_APPROVED_SQL, {"cutoff": cutoff}).mappings().all()
+        return [_row_to_paused(row) for row in rows]
+
     def append_audit(self, event: AuditEvent) -> AuditRow:
         """Append one hash-chained audit row in its own transaction (ADR-5)."""
         with self._engine.begin() as conn:
@@ -476,6 +688,27 @@ def _row_to_audit(row: Mapping[Any, Any]) -> AuditRow:
         prev_hash=bytes(row["prev_hash"]),
         row_hash=bytes(row["row_hash"]),
         created_at=row["created_at"],
+    )
+
+
+def _row_to_paused(row: Mapping[Any, Any]) -> PausedRun:
+    return PausedRun(
+        id=row["id"],
+        run_id=row["run_id"],
+        idempotency_key=row["idempotency_key"],
+        approval_ref=str(row["approval_ref"]),
+        approval_id=row["approval_id"],
+        action_type=row["action_type"],
+        serialized_state=row["serialized_state"],
+        state_version=row["state_version"],
+        status=PauseStatus(row["status"]),
+        approved_action_json=row["approved_action_json"],
+        decided_by=row["decided_by"],
+        decided_by_display=row["decided_by_display"],
+        decided_at=row["decided_at"],
+        decision_latency_ms=row["decision_latency_ms"],
+        created_at=row["created_at"],
+        resolved_at=row["resolved_at"],
     )
 
 

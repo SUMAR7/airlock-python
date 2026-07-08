@@ -24,14 +24,27 @@ from __future__ import annotations
 import socket
 import subprocess
 import sys
-from typing import Any
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from airlock import guard, init
-from airlock.errors import ActionDenied
+from airlock.errors import ActionDenied, ActionPending
 from airlock.policy import ActionContext, Policy, Rule
-from airlock.types import Decision, Money, Reversibility
+from airlock.transport.console import ConsoleApprovalTransport
+from airlock.types import (
+    Decision,
+    Money,
+    PauseClaim,
+    PausedRun,
+    PauseStatus,
+    Reversibility,
+)
+
+if TYPE_CHECKING:
+    from pydantic import JsonValue
 
 
 class _NoSocketAllowed:
@@ -48,23 +61,6 @@ class _NoSocketAllowed:
 def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """Booby-trap socket creation: any socket() call under this fixture fails."""
     monkeypatch.setattr(socket, "socket", _NoSocketAllowed)
-
-
-class _ExplodingStore:
-    """A store sentinel: ANY attribute access is a hot-path violation.
-
-    The GATE decision must be reached WITHOUT touching the store, so handing
-    @guard this object and getting the decision anyway proves no data-plane
-    I/O happened on the block path. (DENY is different as of P2.2: after the
-    pure decision it performs exactly ONE local audit append — PLAN.md 4.4
-    "DENY = decision + one local audit append" — see _DenyAuditOnlyStore.)
-    """
-
-    def __getattr__(self, name: str) -> Any:
-        raise AssertionError(
-            f"the decision path touched the store ({name!r}) — this decision "
-            "must not perform any store I/O (PLAN.md 4.4)"
-        )
 
 
 class _DenyAuditOnlyStore:
@@ -149,26 +145,80 @@ def test_guard_deny_path_no_socket_one_audit_append_only() -> None:
     assert appended.payload["action_type"] == "payout.wire"
 
 
-@pytest.mark.usefixtures("no_network", "guard_isolation")
-def test_guard_gate_path_no_socket_no_store() -> None:
-    """@guard's GATE fail-safe surfaces without a socket and without touching the
-    store: the side effect never runs, and the block is reached purely
-    in-process (no paused_runs is built in P2.1, so no store write happens)."""
-    from airlock.errors import ActionPending, GateNotSupported
+class _PausePersistingStore:
+    """Allows the gate path's data-plane pause write, explodes on the ledger.
 
-    init(store=_ExplodingStore(), policy=Policy(default=Decision.GATE))
+    As of P2.3 a GATE is NOT a pure decision: it persists a ``paused_runs`` row
+    (data-plane I/O to the customer's own store — allowed, like AUTO's ledger
+    writes; a gated action is already waiting on a human, PLAN.md 4.4). What it
+    must NOT do before approval is claim/execute the LEDGER — so ``save_paused``
+    is recorded but every ledger surface (``claim``/``mark_executing``/
+    ``finalize``) explodes. No socket is opened either: the pause is local and
+    the console transport is a stub.
+    """
+
+    def __init__(self) -> None:
+        self.saved: list[str] = []
+
+    def save_paused(
+        self,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        approval_ref: str,
+        action_type: str,
+        serialized_state: Mapping[str, JsonValue],
+        state_version: int = 1,
+        audit: Any = None,
+    ) -> PauseClaim:
+        self.saved.append(approval_ref)
+        return PauseClaim(
+            created=True,
+            run=PausedRun(
+                id=1,
+                run_id=run_id,
+                idempotency_key=idempotency_key,
+                approval_ref=approval_ref,
+                action_type=action_type,
+                serialized_state=dict(serialized_state),
+                state_version=state_version,
+                status=PauseStatus.PROPOSED,
+                created_at=datetime.now(UTC),
+            ),
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(
+            f"the gate path touched the ledger surface ({name!r}) — a gated action "
+            "persists a pause but must NOT claim/execute the ledger before approval"
+        )
+
+
+@pytest.mark.usefixtures("no_network", "guard_isolation")
+def test_guard_gate_path_no_socket_persists_pause_only() -> None:
+    """@guard's GATE persists a durable pause and surfaces ActionPending WITHOUT
+    opening a socket and WITHOUT claiming the ledger: the side effect never runs,
+    the pause is the only store write, and the stub transport touches no network
+    (gate_wait=False, so no inline wait)."""
+    store = _PausePersistingStore()
+    init(
+        store=store,
+        policy=Policy(default=Decision.GATE),
+        transport=ConsoleApprovalTransport("unused.jsonl"),
+        gate_wait=False,
+    )
 
     executed: list[int] = []
 
     @guard("gated.op", reversibility=Reversibility.IRREVERSIBLE)
     def do_gated(x: int) -> int:
-        executed.append(x)  # must never run
+        executed.append(x)  # must never run until approved
         return x
 
-    with pytest.raises(GateNotSupported) as excinfo:
+    with pytest.raises(ActionPending) as excinfo:
         do_gated(1)
-    assert isinstance(excinfo.value, ActionPending)
-    assert excinfo.value.run_id is None  # no paused_runs row (P2.1)
+    assert excinfo.value.run_id is not None  # the durable pause exists (P2.3)
+    assert len(store.saved) == 1  # exactly one pause write; the ledger untouched
     assert executed == []  # no side effect
 
 

@@ -63,10 +63,13 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
 from pydantic import JsonValue
 
+from airlock.audit import rfc3339_utc
 from airlock.effects import Effect
 from airlock.errors import (
     ActionDenied,
+    ActionPending,
     AirlockError,
+    ApprovalRejected,
     CommitFailed,
     GateNotSupported,
     PreconditionFailed,
@@ -79,15 +82,26 @@ from airlock.events import (
     emit_action_event,
 )
 from airlock.idempotency import build_arg_map, derive_key, namespace_user_key
+from airlock.pause import (
+    DecisionOutcome,
+    apply_decision,
+    build_serialized_state,
+    pause_transition_event,
+)
 from airlock.policy import ActionContext, Policy, PolicyBackend
 from airlock.registry import Registry
 from airlock.registry import registry as default_registry
+from airlock.transport import ApprovalTransport, PauseRequest
 from airlock.types import (
     ActionOutcome,
+    ApprovalDecision,
     BlastRadius,
     Decision,
+    HumanDecision,
     LedgerState,
     Money,
+    PausedRun,
+    PauseStatus,
     Reversibility,
 )
 
@@ -105,15 +119,22 @@ R = TypeVar("R")
 _DEFAULT_REVERSIBILITY = Reversibility.IRREVERSIBLE
 
 
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass(frozen=True)
 class _Runtime:
     """The ambient runtime a ``@guard`` call resolves at invocation time.
 
     Set by :func:`init`, read from :data:`_runtime_var`. Holds the store, the
     policy backend, the event sinks, the shared registry, and the recovery
-    knobs ``commit_once`` needs. ``pause`` is the P2.3 seam — ``None`` in P2.1
-    (a GATE decision raises :class:`GateNotSupported`); P2.3 sets it to the
-    durable-pause + transport hook without changing this call site.
+    knobs ``commit_once`` needs. As of P2.3 it also carries the durable-pause
+    layer: the ``transport`` (``None`` disables it and a GATE raises
+    :class:`GateNotSupported`, the P2.1 behavior), ``gate_wait`` (whether the
+    GATE path blocks on ``transport.wait`` inline, else raises
+    :class:`ActionPending`), and ``gate_timeout`` (how long that inline wait
+    polls before giving up — still durable, resumable later).
     """
 
     store: Store
@@ -122,8 +143,10 @@ class _Runtime:
     registry: Registry
     reconcile_after: timedelta | None
     execute_timeout: timedelta | None
-    #: P2.3 seam: the durable-pause/transport hook. None in P2.1 → GATE raises.
-    pause: Callable[..., Any] | None = None
+    transport: ApprovalTransport | None = None
+    gate_wait: bool = True
+    gate_timeout: float = 30.0
+    now_fn: Callable[[], datetime] = _utcnow
 
 
 #: The ambient runtime. A ContextVar (not a module global) so nested/async
@@ -140,9 +163,10 @@ def current_runtime() -> _Runtime | None:
 class Airlock:
     """The handle :func:`init` returns — a thin holder over the ambient runtime.
 
-    Exists so callers have an explicit object to keep (and so P2.3 can hang
-    ``resume``/reconciler helpers off it) without reaching into the contextvar.
-    In P2.1 it just exposes the wired ``store`` and ``policy``.
+    Exposes the wired ``store`` / ``policy`` / ``transport`` and, as of P2.3,
+    :meth:`resume` — the post-restart entry into the ensure-committed core
+    (scenario 6). Keeping it explicit means a caller never reaches into the
+    contextvar to drive an approval home.
     """
 
     _runtime: _Runtime
@@ -155,15 +179,66 @@ class Airlock:
     def policy(self) -> PolicyBackend:
         return self._runtime.policy
 
+    @property
+    def transport(self) -> ApprovalTransport | None:
+        return self._runtime.transport
+
+    def resume(
+        self,
+        approval_ref: str,
+        decision: ApprovalDecision | HumanDecision | None = None,
+    ) -> DecisionOutcome:
+        """Apply a decision to a durably-paused run — the post-restart entry (ADR-4).
+
+        The idempotent, ensure-committed path (PLAN.md 4.3): a FRESH process
+        (a deploy, a crash-recovered worker, a webhook receiver) rehydrates the
+        paused run by ``approval_ref`` via ``load_paused_by_ref`` + the action
+        registry and drives it to its terminal state — committing exactly once
+        no matter how many times the same decision is delivered (scenario 5),
+        re-validating preconditions at commit time (scenario 8), and refusing
+        an unknown ``state_version`` loudly (scenario 6's version gate). This is
+        just :func:`airlock.pause.apply_decision` bound to the runtime's store /
+        registry / sinks / recovery knobs.
+
+        Args:
+            approval_ref: the SDK-minted reference identifying the paused run
+                (the only cross-boundary key, PLAN.md 6.1).
+            decision: the human decision to apply. An
+                :class:`~airlock.types.ApprovalDecision` is used verbatim; a
+                bare :class:`~airlock.types.HumanDecision` is wrapped; ``None``
+                drives the run's CURRENTLY RECORDED status to terminal without a
+                fresh decision (the reconciler-sweep mode — ensure-committed for
+                an already-approved run whose commit never landed).
+
+        Returns:
+            The :class:`~airlock.pause.DecisionOutcome` — the run's terminal
+            status plus the ledger outcome. A duplicate delivery returns the
+            SAME recorded outcome with ``applied=False``.
+        """
+        return apply_decision(
+            self._runtime.store,
+            approval_ref,
+            _coerce_decision(decision),
+            registry=self._runtime.registry,
+            event_sinks=self._runtime.event_sinks,
+            reconcile_after=self._runtime.reconcile_after,
+            execute_timeout=self._runtime.execute_timeout,
+            now_fn=self._runtime.now_fn,
+        )
+
 
 def init(
     *,
     store: Store,
     policy: PolicyBackend | None = None,
+    transport: ApprovalTransport | None = None,
     event_sinks: Sequence[EventSink] = (),
     registry: Registry | None = None,
     reconcile_after: timedelta | None = None,
     execute_timeout: timedelta | None = None,
+    gate_wait: bool = True,
+    gate_timeout: float = 30.0,
+    now_fn: Callable[[], datetime] = _utcnow,
 ) -> Airlock:
     """Wire the ambient runtime for ``@guard`` and return an :class:`Airlock`.
 
@@ -172,27 +247,50 @@ def init(
     without re-decoration.
 
     Args:
-        store: the commit ledger (P1.1). Required in P2.1 — the zero-config
+        store: the commit ledger (P1.1). Required — the zero-config
             SqliteStore default is P4.1 (PLAN.md 3.3 / 10.10), so there is no
             implicit store here.
         policy: the :class:`PolicyBackend`. ``None`` installs
             ``Policy(default=GATE)`` — fail safe: with no rules every action
             gates for a human (PLAN.md 3.3).
+        transport: the :class:`~airlock.transport.ApprovalTransport` a GATE
+            decision reaches a human through. ``None`` installs the default
+            :class:`~airlock.transport.console.ConsoleApprovalTransport` (the
+            file-backed stub — SPEC.md Phase 2). Pass a transport explicitly to
+            direct approvals elsewhere; the HTTP transport is P3.4. Setting it
+            to a sentinel-disabled runtime is not offered — the MVP always has a
+            pause layer.
         event_sinks: best-effort :class:`EventSink` mirrors of the
             ``action_event.v1`` records; the durable hash-chained
             ``audit_events`` row is the record of truth (P2.2).
         registry: the shared action :class:`Registry`; defaults to the
             process-wide one ``@guard`` populates and the reconciler reads.
-        reconcile_after: forwarded to ``commit_once`` on the AUTO path — the
-            inline reconcile staleness threshold (PLAN.md 4.2). ``None`` keeps
-            the P1.1 poll-then-raise loser behavior.
+        reconcile_after: forwarded to ``commit_once`` on the AUTO and resume
+            paths — the inline reconcile staleness threshold (PLAN.md 4.2).
+            ``None`` keeps the P1.1 poll-then-raise loser behavior.
         execute_timeout: forwarded to ``commit_once`` — the owner execute
             deadline, enforced ``< reconcile_after`` (PLAN.md 4.1). Requires
             ``reconcile_after`` when set (``commit_once`` rejects the lone one).
+        gate_wait: whether a GATE decision blocks on ``transport.wait`` inline
+            (default ``True`` — the console/interactive posture). ``False`` (or
+            a wait that times out) persists the pause, calls ``transport.send``,
+            and raises :class:`ActionPending` for an async agent to resume later
+            via :meth:`Airlock.resume`.
+        gate_timeout: seconds the inline gate wait polls the transport before
+            giving up and raising :class:`ActionPending` (default 30). The pause
+            stays durable regardless — a timeout is not a rejection.
+        now_fn: the injectable clock used by the durable-pause path (creation /
+            transition timestamps, decision latency) and forwarded to
+            ``apply_decision``; share it with the store's ``now_fn`` for
+            deterministic tests.
 
     Returns:
         An :class:`Airlock` handle over the runtime just installed.
     """
+    if transport is None:
+        from airlock.transport.console import ConsoleApprovalTransport
+
+        transport = ConsoleApprovalTransport()
     runtime = _Runtime(
         store=store,
         policy=policy if policy is not None else Policy(),
@@ -200,9 +298,22 @@ def init(
         registry=registry if registry is not None else default_registry,
         reconcile_after=reconcile_after,
         execute_timeout=execute_timeout,
+        transport=transport,
+        gate_wait=gate_wait,
+        gate_timeout=gate_timeout,
+        now_fn=now_fn,
     )
     _runtime_var.set(runtime)
     return Airlock(_runtime=runtime)
+
+
+def _coerce_decision(
+    decision: ApprovalDecision | HumanDecision | None,
+) -> ApprovalDecision | None:
+    """Normalize a resume decision to an ``ApprovalDecision`` (or ``None``)."""
+    if decision is None or isinstance(decision, ApprovalDecision):
+        return decision
+    return ApprovalDecision(decision=decision)
 
 
 @dataclass(frozen=True)
@@ -360,10 +471,11 @@ def _invoke(spec: _GuardSpec, args: tuple[Any, ...], kwargs: Mapping[str, Any]) 
         raise AssertionError("unreachable: _handle_deny always raises")  # pragma: no cover
 
     if decision is Decision.GATE:
-        # Fail-safe: surface the gate WITHOUT executing. The durable pause +
-        # transport are P2.3 (see module docstring); the gate's action_event
-        # is emitted at its terminal state, which P2.3 owns.
-        return _handle_gate(runtime, spec, args, kwargs)
+        # Durably pause, deliver to a human, and drive the decision home (ADR-4).
+        # The side effect never runs here; it runs (exactly once) only if an
+        # approval reaches apply_decision. The gate's ONE terminal action_event
+        # is emitted at that terminal transition (PLAN.md 6.3), not here.
+        return _handle_gate(runtime, spec, args, kwargs, resolved_cost, resolved_blast)
 
     # AUTO — commit the effect exactly once (P1.1); the terminal action_event
     # rides inside commit_once's finalize transaction (P2.2).
@@ -431,19 +543,239 @@ def _handle_deny(
 
 
 def _handle_gate(
-    runtime: _Runtime, spec: _GuardSpec, args: tuple[Any, ...], kwargs: Mapping[str, Any]
+    runtime: _Runtime,
+    spec: _GuardSpec,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    resolved_cost: Money | None,
+    resolved_blast: BlastRadius | None,
 ) -> Any:
-    """Surface a GATE decision. P2.1: raise; P2.3 plugs the pause layer in here."""
-    if runtime.pause is not None:  # P2.3 seam — not built in P2.1
-        return runtime.pause(spec, args, kwargs)
-    raise GateNotSupported(
-        f"policy gated action {spec.action_type!r}, but no pause layer is configured: the "
-        "durable pause, resume, and approval transport are P2.3 and are not built in P2.1. "
-        "The side effect was NOT executed (fail-safe) and a policy-decision event was emitted. "
-        "Wire the P2.3 pause layer to resolve gated actions.",
-        action_type=spec.action_type,
-        run_id=None,
+    """Surface a GATE decision through the durable pause layer (P2.3, ADR-4).
+
+    Persist the ``paused_runs`` row (status=proposed) BEFORE any transport call
+    so the pause survives a crash between here and the human's decision
+    (scenario 6), then deliver it and either wait inline for the decision
+    (``gate_wait``) or raise :class:`ActionPending` for an async resume. A
+    runtime with no ``transport`` keeps the P2.1 fail-safe (raise
+    :class:`GateNotSupported`) — but :func:`init` always wires one.
+    """
+    if runtime.transport is None:  # pragma: no cover — init always wires a transport
+        raise GateNotSupported(
+            f"policy gated action {spec.action_type!r}, but no approval transport is "
+            "configured: the side effect was NOT executed (fail-safe). Wire a transport "
+            "via airlock.init(transport=...) to resolve gated actions.",
+            action_type=spec.action_type,
+            run_id=None,
+        )
+    return _durable_pause(runtime, spec, args, kwargs, resolved_cost, resolved_blast)
+
+
+def _durable_pause(
+    runtime: _Runtime,
+    spec: _GuardSpec,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    resolved_cost: Money | None,
+    resolved_blast: BlastRadius | None,
+) -> Any:
+    """Persist the pause, deliver it, and drive it home (ADR-4 / PLAN.md 4.3).
+
+    Order (durability first): build the canonical ``serialized_state`` (arg_map
+    + resolved risk + the propose-time precondition snapshot — scenario 8's
+    "before" evidence), mint the ``approval_ref`` / ``run_id``, and persist the
+    ``proposed`` row with its chained creation event in ONE transaction BEFORE
+    touching the transport. Only then ``transport.send`` (redelivery-safe) and,
+    if ``gate_wait``, ``transport.wait`` -> ``apply_decision``.
+
+    Re-gate of the same key (``save_paused`` hit ``UNIQUE(idempotency_key)``):
+    ATTACH to the existing run rather than mint a second — drive its current
+    status home (``apply_decision(None)``) and surface the outcome; an open
+    ``proposed`` run re-delivers and waits again. A deliberate second attempt
+    needs a distinguishing arg or a ``key`` override (PLAN.md 4.3).
+    """
+    arg_map = _arg_map(spec, args, kwargs)
+    ledger_key = _ledger_key(spec, args, kwargs, arg_map)
+    snapshot = _precondition_snapshot(spec, args, kwargs, runtime.now_fn)
+    serialized_state = build_serialized_state(
+        arg_map,
+        reversibility=spec.reversibility,
+        cost=resolved_cost,
+        blast_radius=resolved_blast,
+        precondition_snapshot=snapshot,
     )
+    approval_ref = str(uuid.uuid4())
+    run_id = f"run_{uuid.uuid4().hex}"
+    creation_event = pause_transition_event(
+        run_id,
+        approval_ref=approval_ref,
+        action_type=spec.action_type,
+        idempotency_key=ledger_key,
+        from_status=None,
+        to_status=PauseStatus.PROPOSED,
+        now_fn=runtime.now_fn,
+        detail={"policy_decision": Decision.GATE.value},
+    )
+    claim = runtime.store.save_paused(
+        run_id=run_id,
+        idempotency_key=ledger_key,
+        approval_ref=approval_ref,
+        action_type=spec.action_type,
+        serialized_state=serialized_state,
+        audit=creation_event,
+    )
+    run = claim.run
+
+    if not claim.created:
+        # Re-gate: a pause for this key already exists. Drive whatever it
+        # recorded to terminal; if it is still open, fall through to deliver.
+        driven = apply_decision(
+            runtime.store,
+            run.approval_ref,
+            None,
+            registry=runtime.registry,
+            event_sinks=runtime.event_sinks,
+            reconcile_after=runtime.reconcile_after,
+            execute_timeout=runtime.execute_timeout,
+            now_fn=runtime.now_fn,
+        )
+        if driven.status in (PauseStatus.COMMITTED, PauseStatus.ABORTED, PauseStatus.REJECTED):
+            return _surface_outcome(spec, ledger_key, driven)
+        # Still open (proposed/approved-not-yet-committed): re-deliver + wait.
+        run = _reload_run(runtime, run.approval_ref)
+
+    return _deliver_and_wait(runtime, spec, run, ledger_key, resolved_cost, resolved_blast)
+
+
+def _deliver_and_wait(
+    runtime: _Runtime,
+    spec: _GuardSpec,
+    run: PausedRun,
+    ledger_key: str,
+    resolved_cost: Money | None,
+    resolved_blast: BlastRadius | None,
+) -> Any:
+    """``transport.send`` then, if ``gate_wait``, ``wait`` -> ``apply_decision``."""
+    assert runtime.transport is not None  # narrowed by the caller
+    request = PauseRequest(
+        approval_ref=run.approval_ref,
+        run_id=run.run_id,
+        action_type=spec.action_type,
+        summary=spec.action_type,
+        requested_at=run.created_at,
+        cost=resolved_cost,
+        reversibility=spec.reversibility,
+        blast_radius_estimate=resolved_blast,
+    )
+    runtime.transport.send(request)
+
+    if not runtime.gate_wait:
+        raise ActionPending(
+            f"action {spec.action_type!r} is durably paused awaiting approval "
+            f"(approval_ref={run.approval_ref}); resume with Airlock.resume(approval_ref, "
+            "decision) once a human decides.",
+            action_type=spec.action_type,
+            run_id=run.run_id,
+            approval_ref=run.approval_ref,
+        )
+
+    decision = runtime.transport.wait(run.approval_ref, runtime.gate_timeout)
+    if decision is None:
+        raise ActionPending(
+            f"action {spec.action_type!r} is durably paused: no decision arrived within "
+            f"{runtime.gate_timeout}s (approval_ref={run.approval_ref}). The pause is still "
+            "durable — resume with Airlock.resume(approval_ref, decision) when it does.",
+            action_type=spec.action_type,
+            run_id=run.run_id,
+            approval_ref=run.approval_ref,
+        )
+
+    outcome = apply_decision(
+        runtime.store,
+        run.approval_ref,
+        decision,
+        registry=runtime.registry,
+        event_sinks=runtime.event_sinks,
+        reconcile_after=runtime.reconcile_after,
+        execute_timeout=runtime.execute_timeout,
+        now_fn=runtime.now_fn,
+    )
+    return _surface_outcome(spec, ledger_key, outcome)
+
+
+def _surface_outcome(spec: _GuardSpec, ledger_key: str, outcome: DecisionOutcome) -> Any:
+    """Map a resolved :class:`DecisionOutcome` to the guarded call's return/raise.
+
+    - committed -> return the tool result (the side effect ran exactly once).
+    - aborted after a REJECTION -> raise :class:`ApprovalRejected`.
+    - aborted after an APPROVAL (preconditions failed at commit — scenario 8, or
+      a non-committed ledger terminal) -> raise :class:`PreconditionFailed`.
+    - still proposed (a decision-less drive) -> raise :class:`ActionPending`.
+    """
+    if outcome.status is PauseStatus.COMMITTED:
+        return outcome.result
+    if outcome.status is PauseStatus.ABORTED:
+        if outcome.human_decision is HumanDecision.REJECTED:
+            raise ApprovalRejected(
+                f"action {spec.action_type!r} was REJECTED by a human "
+                f"(approval_ref={outcome.approval_ref}); no side effect ran (the rejection is "
+                "hash-chain audited).",
+                action_type=spec.action_type,
+                run_id=outcome.run_id,
+                approval_ref=outcome.approval_ref,
+                decided_by=outcome.decided_by,
+            )
+        raise PreconditionFailed(
+            f"action {spec.action_type!r} was approved but ABORTED at commit time: its "
+            "preconditions no longer held (SPEC scenario 8); no side effect ran.",
+            action_type=spec.action_type,
+            key=ledger_key,
+        )
+    # PROPOSED — no decision recorded yet (a decision-less re-gate of an
+    # untouched run); the pause is durable, resume when one arrives.
+    raise ActionPending(
+        f"action {spec.action_type!r} is durably paused awaiting approval "
+        f"(approval_ref={outcome.approval_ref}).",
+        action_type=spec.action_type,
+        run_id=outcome.run_id,
+        approval_ref=outcome.approval_ref,
+    )
+
+
+def _precondition_snapshot(
+    spec: _GuardSpec,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    now_fn: Callable[[], datetime],
+) -> dict[str, Any] | None:
+    """The propose-time precondition evidence (scenario 8's "before" snapshot).
+
+    ``None`` when the action registered no preconditions. A precondition that
+    RAISES is recorded as not-holding (the safe direction) with the error, so
+    the snapshot is always a faithful record of what was true when the human
+    was asked — the commit-time recheck (inside ``apply_decision``) is what
+    actually gates execution.
+    """
+    if spec.preconditions is None:
+        return None
+    try:
+        held = bool(spec.preconditions(*args, **dict(kwargs)))
+    except Exception as exc:
+        return {
+            "held": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "checked_at": rfc3339_utc(now_fn()),
+        }
+    return {"held": held, "checked_at": rfc3339_utc(now_fn())}
+
+
+def _reload_run(runtime: _Runtime, approval_ref: str) -> PausedRun:
+    run = runtime.store.load_paused_by_ref(approval_ref)
+    if run is None:  # pragma: no cover — rows are never deleted (ADR-4)
+        raise AirlockError(
+            f"paused run for approval_ref {approval_ref!r} vanished mid-gate — "
+            "paused_runs rows must never be deleted (ADR-4)"
+        )
+    return run
 
 
 def _commit_auto(

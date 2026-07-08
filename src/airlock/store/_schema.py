@@ -1,4 +1,5 @@
-"""``commit_records`` + ``audit_events`` DDL, exactly per PLAN.md section 5.1.
+"""``commit_records`` + ``paused_runs`` + ``audit_events`` DDL, exactly per
+PLAN.md section 5.1.
 
 Conventions (PLAN.md section 5): TEXT + CHECK over Postgres enums; timestamps
 are SDK-supplied via the injectable ``now_fn`` — never ``DEFAULT now()``; the
@@ -24,7 +25,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from airlock.types import IN_FLIGHT_LEDGER_STATES, Guarantee, LedgerState
+from airlock.types import IN_FLIGHT_LEDGER_STATES, Guarantee, LedgerState, PauseStatus
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
@@ -35,6 +36,7 @@ __all__ = [
     "COMMIT_RECORDS_DDL",
     "DDL_STATEMENTS",
     "INFLIGHT_INDEX_DDL",
+    "PAUSED_RUNS_DDL",
     "create_tables",
     "ensure_schema",
     "seed_genesis",
@@ -76,6 +78,46 @@ CREATE TABLE IF NOT EXISTS commit_records (
 INFLIGHT_INDEX_DDL = f"""
 CREATE INDEX IF NOT EXISTS commit_records_inflight_idx ON commit_records (last_attempt_at)
     WHERE state IN ({_IN_FLIGHT_VALUES})
+"""
+
+# --- The durable pause (P2.3, ADR-4) — DDL exactly per PLAN.md 5.1 -----------
+
+_PAUSE_STATUS_VALUES = _sql_value_list(tuple(status.value for status in PauseStatus))
+
+# The status CHECK list is GENERATED from airlock.types.PauseStatus — exactly
+# the ADR-4 set (proposed/approved/rejected/committed/aborted). There is NO
+# 'expired' value: TTL expiry is not in ADR-4 (PLAN.md 10.9) and adding a
+# status here without a PROPOSAL.md would silently unlock a sixth state.
+PAUSED_RUNS_DDL = f"""
+CREATE TABLE IF NOT EXISTS paused_runs (
+    id                   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id               TEXT        NOT NULL,
+    idempotency_key      TEXT        NOT NULL,
+    approval_ref         UUID        NOT NULL,
+    approval_id          TEXT,
+    action_type          TEXT        NOT NULL,
+    serialized_state     JSONB       NOT NULL,
+    state_version        INT         NOT NULL DEFAULT 1,
+    status               TEXT        NOT NULL DEFAULT '{PauseStatus.PROPOSED.value}'
+                         CHECK (status IN ({_PAUSE_STATUS_VALUES})),
+    approved_action_json JSONB,
+    decided_by           TEXT,
+    decided_by_display   TEXT,
+    decided_at           TIMESTAMPTZ,
+    decision_latency_ms  INT,
+    created_at           TIMESTAMPTZ NOT NULL,
+    resolved_at          TIMESTAMPTZ,
+    CONSTRAINT paused_runs_key_uq UNIQUE (idempotency_key),
+    CONSTRAINT paused_runs_ref_uq UNIQUE (approval_ref)
+)
+"""
+
+# Supports the reconciler's stale-APPROVED sweep (PLAN.md 4.2): approved rows
+# whose decision landed but whose commit never did. Partial, like the ledger's
+# in-flight index — resolved rows never re-enter the scan.
+PAUSED_APPROVED_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS paused_runs_approved_idx ON paused_runs (decided_at)
+    WHERE status = '{PauseStatus.APPROVED.value}'
 """
 
 # --- The audit chain (P2.2, ADR-5) — DDL exactly per PLAN.md 5.1 -------------
@@ -132,6 +174,8 @@ REVOKE UPDATE, DELETE, TRUNCATE ON audit_events FROM PUBLIC
 DDL_STATEMENTS: tuple[str, ...] = (
     COMMIT_RECORDS_DDL,
     INFLIGHT_INDEX_DDL,
+    PAUSED_RUNS_DDL,
+    PAUSED_APPROVED_INDEX_DDL,
     AUDIT_EVENTS_DDL,
     AUDIT_CHAIN_HEAD_DDL,
     AUDIT_APPEND_ONLY_FUNCTION_DDL,

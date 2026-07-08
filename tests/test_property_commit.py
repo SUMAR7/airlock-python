@@ -75,23 +75,30 @@ snapshot used to assert monotonicity (I5).
 - **I5** — terminal ledger states (committed/aborted/failed/unknown) are
   monotone: once terminal, a row never changes state or effect_count.
 
-**I6 (paused_runs DAG) and I7 (action_event validation) are OUT OF SCOPE for
-P1.4** — they need P2.3 ``paused_runs`` and P2.2 events, which do not exist yet.
-See the TODO at the bottom of this module.
+**I6 (paused_runs DAG) and I7 (action_event validation) landed in P2.3.** The
+``propose_gate`` / ``approve`` / ``reject`` / ``duplicate_webhook`` rules drive
+the durable pause through ``apply_decision``; **I6** asserts every observed
+``paused_runs.status`` transition is a legal ADR-4 edge (and the DB agrees with
+the model), and **I7** schema-validates every emitted ``action_event`` against
+``/contracts/events/action_event.v1.json`` and pins EXACTLY ONE per terminal
+gate resolution (a double-delivered approval must not emit a second).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 import warnings
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
+from jsonschema import Draft202012Validator
 from pydantic import JsonValue
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
@@ -106,19 +113,58 @@ from airlock.errors import (
     ExecuteTimeout,
     VerificationUnknown,
 )
-from airlock.events import ActionEventContext
+from airlock.events import ActionEvent, ActionEventContext
+from airlock.pause import apply_decision, build_serialized_state
 from airlock.reconcile import OnAbsent, reconcile
 from airlock.registry import Registry
 from airlock.store._schema import ensure_schema, seed_genesis
 from airlock.store.postgres import PostgresStore, normalize_postgres_url
 from airlock.types import (
+    PAUSE_TRANSITIONS,
     TERMINAL_LEDGER_STATES,
+    ApprovalDecision,
     Decision,
     Guarantee,
+    HumanDecision,
     LedgerState,
+    PauseStatus,
     Reversibility,
     Verification,
 )
+
+# The action_event.v1 JSON Schema — I7 validates every emitted event against it.
+_SCHEMA_PATH = Path(__file__).parent.parent / "contracts" / "events" / "action_event.v1.json"
+_ACTION_EVENT_VALIDATOR = Draft202012Validator(json.loads(_SCHEMA_PATH.read_text()))
+
+# The five legal ADR-4 status edges, as string pairs.
+_LEGAL_PAUSE_EDGES: frozenset[tuple[str, str]] = frozenset(
+    (a.value, b.value) for a, b in PAUSE_TRANSITIONS
+)
+
+
+def _pause_reachable_closure() -> dict[str, set[str]]:
+    """DAG reachability over the ADR-4 edges (each status reaches itself + heirs).
+
+    I6 observes paused_runs.status only BETWEEN rules, but one ``apply_decision``
+    call legally walks several edges at once (proposed → approved → committed),
+    so an intermediate status may never be snapshotted. The invariant therefore
+    checks REACHABILITY (status ∈ reachable(prev)), which still forbids every
+    illegal move — an approved→rejected flip, a re-opened terminal row, a
+    resurrected run — while allowing a legal multi-edge drive.
+    """
+    nodes = {s.value for s in PauseStatus}
+    reach: dict[str, set[str]] = {n: {n} for n in nodes}
+    changed = True
+    while changed:
+        changed = False
+        for a, b in _LEGAL_PAUSE_EDGES:
+            if not reach[a] >= reach[b]:
+                reach[a] |= reach[b]
+                changed = True
+    return reach
+
+
+_PAUSE_REACHABLE: dict[str, set[str]] = _pause_reachable_closure()
 
 #: The whole module is the property machine — marker lets CI run it as its own
 #: derandomized leg (``pytest -m property``), separate from concurrency/crash/race.
@@ -302,6 +348,13 @@ class CommitMachine(RuleBasedStateMachine):
         # A unique prefix per machine instance -> globally distinct rows/keys.
         self.prefix = f"{_PROP_PREFIX}{uuid.uuid4().hex}."
         self.action_type = f"{self.prefix}refund"
+        #: The gated action type (P2.3): its runs live in paused_runs and resolve
+        #: through apply_decision, distinct from the AUTO ledger action above.
+        self.gate_action = f"{self.prefix}gate.refund"
+        #: ref -> {run_id, key, status, decision} — the modelled pause state.
+        self.gate_model: dict[str, dict[str, Any]] = {}
+        #: ref -> last DB status observed (I6 watches the actual transitions).
+        self._gate_last_status: dict[str, str] = {}
         self.store = PostgresStore(DATABASE_URL, now_fn=self._now)
         # A raw autocommit engine for schema/scoped-cleanup/inspection (never the
         # store's pool).
@@ -320,6 +373,11 @@ class CommitMachine(RuleBasedStateMachine):
         with self._raw.connect() as conn:
             conn.execute(
                 text("DELETE FROM commit_records WHERE action_type LIKE :like"),
+                {"like": f"{_PROP_PREFIX}%"},
+            )
+            # Paused runs (P2.3) are scoped and cleaned the same way.
+            conn.execute(
+                text("DELETE FROM paused_runs WHERE action_type LIKE :like"),
                 {"like": f"{_PROP_PREFIX}%"},
             )
         # Audit-chain reset (I4, P2.2). The chain is GLOBAL by construction —
@@ -368,6 +426,10 @@ class CommitMachine(RuleBasedStateMachine):
         with self._raw.connect() as conn:
             conn.execute(
                 text("DELETE FROM commit_records WHERE action_type LIKE :like"),
+                {"like": f"{_PROP_PREFIX}%"},
+            )
+            conn.execute(
+                text("DELETE FROM paused_runs WHERE action_type LIKE :like"),
                 {"like": f"{_PROP_PREFIX}%"},
             )
             conn.execute(
@@ -783,6 +845,126 @@ class CommitMachine(RuleBasedStateMachine):
         self.store.close()
         self.store = PostgresStore(DATABASE_URL, now_fn=self._now)
 
+    # --- the durable-pause rules (P2.3): gate / approve / reject / dup webhook --
+
+    def _gate_registry(self) -> Registry:
+        """A registry for the gated action, execute logs the ground-truth effect."""
+        effects = self.effects
+
+        def execute(downstream_key: str | None, *, invoice: str, **_: Any) -> JsonValue:
+            effects.log(invoice)  # invoice == the gate's ledger key
+            return {"refund_id": f"re_{invoice}"}
+
+        reg = Registry()
+        reg.register(self.gate_action, Effect(key_param="idempotency_key"), execute)
+        return reg
+
+    @rule()
+    def propose_gate(self) -> None:
+        """Persist a fresh proposed pause (a gated action awaiting a human).
+
+        Keys are minted from the MODEL's size (deterministic, collision-free), so
+        no draw depends on DB state. serialized_state carries the canonical
+        arg_map the approve rule rehydrates the call from (scenario 6 shape).
+        """
+        n = len(self.gate_model)
+        key = f"{self.prefix}gate:{n}"
+        ref = str(uuid.uuid4())
+        run_id = f"grun_{uuid.uuid4().hex}"
+        state = build_serialized_state(
+            {"invoice": key},
+            reversibility=Reversibility.IRREVERSIBLE,
+            cost=None,
+            blast_radius=None,
+            precondition_snapshot=None,
+        )
+        self.store.save_paused(
+            run_id=run_id,
+            idempotency_key=key,
+            approval_ref=ref,
+            action_type=self.gate_action,
+            serialized_state=state,
+        )
+        self.gate_model[ref] = {
+            "run_id": run_id,
+            "key": key,
+            "status": "proposed",
+            "decision": None,
+        }
+
+    @rule()
+    @precondition(lambda self: any(g["status"] == "proposed" for g in self.gate_model.values()))
+    def approve(self) -> None:
+        """Approve the first proposed gate → apply_decision drives it committed."""
+        ref = self._first_gate("proposed")
+        apply_decision(
+            self.store,
+            ref,
+            ApprovalDecision(decision=HumanDecision.APPROVED, decided_by="usr_prop"),
+            registry=self._gate_registry(),
+            now_fn=self._now,
+        )
+        self.gate_model[ref]["status"] = "committed"
+        self.gate_model[ref]["decision"] = "approved"
+
+    @rule()
+    @precondition(lambda self: any(g["status"] == "proposed" for g in self.gate_model.values()))
+    def reject(self) -> None:
+        """Reject the first proposed gate → apply_decision drives it aborted."""
+        ref = self._first_gate("proposed")
+        apply_decision(
+            self.store,
+            ref,
+            ApprovalDecision(decision=HumanDecision.REJECTED, decided_by="usr_prop"),
+            registry=self._gate_registry(),
+            now_fn=self._now,
+        )
+        self.gate_model[ref]["status"] = "aborted"
+        self.gate_model[ref]["decision"] = "rejected"
+
+    @rule()
+    @precondition(
+        lambda self: any(g["status"] in ("committed", "aborted") for g in self.gate_model.values())
+    )
+    def duplicate_webhook(self) -> None:
+        """Re-deliver the SAME decision to a resolved gate — must be a no-op.
+
+        The double-delivered approval (SPEC scenario 5) at the pause layer: the
+        commit ledger + the terminal pause status make it idempotent — no second
+        effect, no second action_event (I7 asserts exactly one).
+        """
+        ref = next(r for r, g in self.gate_model.items() if g["status"] in ("committed", "aborted"))
+        gm = self.gate_model[ref]
+        decision = (
+            HumanDecision.APPROVED if gm["decision"] == "approved" else HumanDecision.REJECTED
+        )
+        apply_decision(
+            self.store,
+            ref,
+            ApprovalDecision(decision=decision, decided_by="usr_prop"),
+            registry=self._gate_registry(),
+            now_fn=self._now,
+        )
+        # The model is UNCHANGED — a duplicate delivery resolves nothing new.
+
+    def _first_gate(self, status: str) -> str:
+        return next(r for r, g in self.gate_model.items() if g["status"] == status)
+
+    def _gate_rows(self) -> dict[str, str]:
+        with self._raw.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT approval_ref::text AS ref, status FROM paused_runs"
+                        " WHERE action_type = :a"
+                    ),
+                    {"a": self.gate_action},
+                )
+                .mappings()
+                .all()
+            )
+        return {row["ref"]: row["status"] for row in rows}
+
     # --- helpers ---------------------------------------------------------------
 
     def _some_key(self) -> str:
@@ -943,6 +1125,103 @@ class CommitMachine(RuleBasedStateMachine):
                         f"{km.terminal_effect_count} -> {count}"
                     )
 
+    @invariant()
+    def i6_paused_status_follows_the_adr4_dag(self) -> None:
+        """I6 (P2.3): every paused_runs.status transition observed in the DB is a
+        legal ADR-4 edge, and the DB agrees with the model.
+
+        This reads the ACTUAL DB status of each gated run after every step and,
+        whenever it changes from the previously-observed one, asserts the edge is
+        one of the five ADR-4 transitions (proposed → approved|rejected →
+        committed|aborted). A store that landed any other status — a resurrected
+        run, an approved→rejected flip, a terminal row re-opened — reddens here.
+        It also pins the DB against the model's expected status, so a divergence
+        (the store advancing a run the model never drove) is caught too.
+        """
+        rows = self._gate_rows()
+        valid = {s.value for s in PauseStatus}
+        for ref, status in rows.items():
+            assert status in valid, f"I6 VIOLATED: unknown pause status {status!r}"
+            prev = self._gate_last_status.get(ref)
+            if prev is not None and prev != status:
+                # Reachability, not a single edge: one apply_decision call legally
+                # walks proposed→approved→committed between two snapshots.
+                assert status in _PAUSE_REACHABLE[prev], (
+                    f"I6 VIOLATED: unreachable pause transition {prev!r} -> {status!r} for {ref}"
+                )
+            self._gate_last_status[ref] = status
+            gm = self.gate_model.get(ref)
+            if gm is not None:
+                assert status == gm["status"], (
+                    f"I6 VIOLATED: DB status {status!r} != model {gm['status']!r} for {ref}"
+                )
+
+    @invariant()
+    def i7_every_terminal_call_emits_exactly_one_schema_valid_event(self) -> None:
+        """I7 (P2.3, REAL): every action_event this machine produced validates
+        against /contracts/events/action_event.v1.json, and every terminally-
+        decided gate produced EXACTLY ONE action_event matching its decision.
+
+        (a) Global validity: each ``action_event`` row (AUTO commits and gate
+        resolutions alike) parses as :class:`ActionEvent` AND validates against
+        the frozen JSON Schema — a malformed or forked event reddens here.
+
+        (b) Exactly-one per gate: a committed/aborted gated run has one and only
+        one action_event keyed by its run_id, with policy_decision=gate, the
+        human_decision the model recorded, and the matching outcome; the effect
+        count matches (1 committed, 0 aborted). A double delivery
+        (duplicate_webhook) that emitted a second event, or a resolution that
+        emitted none, reddens here.
+        """
+        with self._raw.connect() as conn:
+            payloads = (
+                conn.execute(
+                    text(
+                        "SELECT payload_json FROM audit_events"
+                        " WHERE event_type = 'action_event' AND action_type LIKE :like"
+                    ),
+                    {"like": f"{self.prefix}%"},
+                )
+                .scalars()
+                .all()
+            )
+        for payload in payloads:
+            _ACTION_EVENT_VALIDATOR.validate(payload)  # schema
+            ActionEvent.model_validate(payload)  # and the pydantic model
+
+        for ref, gm in self.gate_model.items():
+            if gm["status"] not in ("committed", "aborted"):
+                continue
+            with self._raw.connect() as conn:
+                events = (
+                    conn.execute(
+                        text(
+                            "SELECT payload_json FROM audit_events"
+                            " WHERE event_type = 'action_event' AND run_id = :r"
+                        ),
+                        {"r": gm["run_id"]},
+                    )
+                    .scalars()
+                    .all()
+                )
+            assert len(events) == 1, (
+                f"I7 VIOLATED: gate {ref} ({gm['status']}) has {len(events)} action_events "
+                "(expected exactly one per terminal gate resolution)"
+            )
+            event = events[0]
+            assert event["policy_decision"] == "gate"
+            expected_human = "approved" if gm["decision"] == "approved" else "rejected"
+            assert event["human_decision"] == expected_human, (
+                f"I7 VIOLATED: gate {ref} action_event human_decision "
+                f"{event['human_decision']!r} != {expected_human!r}"
+            )
+            expected_outcome = "committed" if gm["status"] == "committed" else "aborted"
+            assert event["outcome"] == expected_outcome
+            count = self.effects.count(gm["key"])
+            assert count == (1 if gm["status"] == "committed" else 0), (
+                f"I7 VIOLATED: gate {ref} ({gm['status']}) has effect_count={count}"
+            )
+
 
 # The Hypothesis test the machine compiles to. Settings (max_examples, deadline,
 # derandomize, the suppressed DB-backed health checks) come from the active
@@ -952,21 +1231,9 @@ TestCommitMachine = CommitMachine.TestCase
 
 
 # ---------------------------------------------------------------------------
-# I6 / I7 — OUT OF SCOPE here (do NOT stub).
-#
-# TODO(P2.3): I6 — paused_runs.status follows the ADR-4 DAG only
-#   (proposed -> approved|rejected -> committed|aborted). Needs the paused_runs
-#   table and apply_decision, which land in P2.3. Add a `propose_gate` /
-#   `approve` / `reject` / `duplicate_webhook` rule set and an I6 invariant then.
-#
-# TODO(P2.3): I7 — every terminal call produced exactly one schema-valid
-#   action_event. The action_event.v1 model/schema/audit rows exist as of P2.2
-#   (and the emission matrix incl. schema round-trips is pinned in
-#   tests/test_guard_events.py + tests/test_events_contract.py), but the
-#   machine-level "exactly one per terminal call INCLUDING gate resolutions"
-#   invariant needs the P2.3 pause/resume rules to be meaningful — it lands
-#   with I6 per PLAN.md section 8 (P2.3 row: "invariants I6-I7").
-#
-# Leaving these as named TODOs (not empty rules/invariants) so the machine never
-# gives false confidence about properties it does not yet exercise.
+# I6 / I7 — LANDED (P2.3). The gate/approve/reject/duplicate_webhook rules drive
+# the durable pause through apply_decision; I6 watches every paused_runs.status
+# transition against the ADR-4 DAG, and I7 schema-validates every action_event
+# and pins exactly one per terminal gate resolution (a double-delivered approval
+# via duplicate_webhook must not emit a second). See the invariant methods above.
 # ---------------------------------------------------------------------------

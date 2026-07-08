@@ -99,8 +99,8 @@ class ConsoleApprovalTransport:
         *,
         out: TextIO | None = None,
         poll_interval: float = 0.2,
-        sleep_fn: Callable[[float], None] = time.sleep,
-        monotonic_fn: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] | None = None,
+        monotonic_fn: Callable[[], float] | None = None,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError(f"poll_interval must be > 0, got {poll_interval!r}")
@@ -112,8 +112,23 @@ class ConsoleApprovalTransport:
         self._path = Path(resolved)
         self._out = out if out is not None else sys.stdout
         self._poll_interval = poll_interval
-        self._sleep = sleep_fn
-        self._monotonic = monotonic_fn
+        # ``None`` means "use the live time module": the poll then resolves
+        # ``time.sleep`` / ``time.monotonic`` dynamically at each call, so
+        # production sleeps for real while the test suite's no-time.sleep guard
+        # governs any accidental blocking wait (a gate that waits with no
+        # decision fails fast in tests instead of hanging). Injected hooks (the
+        # console unit tests) bypass both deterministically.
+        self._sleep_fn = sleep_fn
+        self._monotonic_fn = monotonic_fn
+
+    def _monotonic(self) -> float:
+        return self._monotonic_fn() if self._monotonic_fn is not None else time.monotonic()
+
+    def _do_sleep(self, seconds: float) -> None:
+        if self._sleep_fn is not None:
+            self._sleep_fn(seconds)
+        else:
+            time.sleep(seconds)  # live: production sleeps; the test guard governs it
 
     @property
     def approvals_path(self) -> Path:
@@ -162,7 +177,7 @@ class ConsoleApprovalTransport:
                 return decision
             if self._monotonic() >= deadline:
                 return None
-            self._sleep(self._poll_interval)
+            self._do_sleep(self._poll_interval)
 
     def record_decision(
         self,

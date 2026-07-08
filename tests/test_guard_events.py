@@ -19,7 +19,7 @@ from sqlalchemy import text
 from airlock import guard, init
 from airlock.audit import verify_chain
 from airlock.effects import Effect
-from airlock.errors import ActionDenied, CommitFailed, GateNotSupported, PreconditionFailed
+from airlock.errors import ActionDenied, ActionPending, CommitFailed, PreconditionFailed
 from airlock.events import ActionEvent
 from airlock.policy import Policy, Rule
 from airlock.types import Decision, Money, Reversibility, Verification
@@ -319,20 +319,23 @@ def test_deny_with_broken_audit_store_still_denies_loudly(
     assert any("audit append failed" in note for note in getattr(excinfo.value, "__notes__", []))
 
 
-def test_gate_appends_nothing_in_p22(store: PostgresStore, db: Engine) -> None:
-    """GATE has no terminal state until P2.3 — no audit row, no mirror
-    (airlock.events: emitting a fabricated decision-time event would
-    double-count the call once the pause layer lands)."""
+def test_gate_emits_no_action_event_at_propose_time(store: PostgresStore, db: Engine) -> None:
+    """A GATE emits NO action_event when it pauses (gate_wait=False here): the
+    ONE terminal action_event is emitted at the terminal transition
+    (approve/reject → apply_decision), never at propose time (PLAN.md 6.3).
+    Emitting a fabricated decision-time event would double-count the call. The
+    durable pause DOES append its chained creation pause_transition event, but
+    that is not an action_event and the sink mirrors only action_events."""
     sink = _RecordingSink()
-    init(store=store, policy=Policy(default=Decision.GATE), event_sinks=[sink])
+    init(store=store, policy=Policy(default=Decision.GATE), event_sinks=[sink], gate_wait=False)
 
     @guard("gated.audit", reversibility=Reversibility.UNKNOWN)
     def gated(x: int) -> int:
         return x
 
-    with pytest.raises(GateNotSupported):
+    with pytest.raises(ActionPending):
         gated(1)
-    assert _action_event_rows(db, "gated.audit") == []
+    assert _action_event_rows(db, "gated.audit") == []  # no action_event yet
     assert sink.events == []
     verify_chain(store)
 

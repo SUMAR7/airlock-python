@@ -7,7 +7,7 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "airlock"
+name = "airlock-sdk"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [

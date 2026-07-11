@@ -2,17 +2,55 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# The import name is `airlock` (the package is src/airlock); the PyPI
+# distribution is `airlock-sdk` (the bare `airlock` name is taken on PyPI). So
+# users `pip install airlock-sdk` and then `import airlock`. The real-PyPI
+# publish + trusted-publisher registration are a separate release step, HELD
+# until after this PR merges — this file only sets launch-quality metadata.
 [project]
-name = "airlock"
+name = "airlock-sdk"
 version = "0.0.1"
 description = "Agent-action safety SDK: gate irreversible actions, commit exactly once, tamper-evident audit."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
+authors = [{ name = "Airlock" }]
+keywords = [
+    "agent",
+    "ai-agents",
+    "llm",
+    "tool-use",
+    "idempotency",
+    "exactly-once",
+    "human-in-the-loop",
+    "approval",
+    "audit-log",
+    "safety",
+    "guardrails",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
 dependencies = [
     "pydantic>=2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/SUMAR7/airlock-python"
+Repository = "https://github.com/SUMAR7/airlock-python"
+Issues = "https://github.com/SUMAR7/airlock-python/issues"
+Changelog = "https://github.com/SUMAR7/airlock-python/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 postgres = [

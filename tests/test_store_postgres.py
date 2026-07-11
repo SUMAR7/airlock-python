@@ -290,10 +290,10 @@ def test_from_url_rejects_non_dsn() -> None:
 
 
 def test_from_url_missing_extra_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without the postgres extra, from_url points at pip install airlock[postgres]."""
+    """Without the postgres extra, from_url points at pip install airlock-sdk[postgres]."""
     monkeypatch.delitem(sys.modules, "airlock.store.postgres", raising=False)
     monkeypatch.setitem(sys.modules, "sqlalchemy", None)  # makes `import sqlalchemy` raise
-    with pytest.raises(ImportError, match=r"airlock\[postgres\]"):
+    with pytest.raises(ImportError, match=r"airlock-sdk\[postgres\]"):
         from_url("postgresql://localhost/airlock_test")
 
 

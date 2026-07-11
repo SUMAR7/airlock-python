@@ -227,9 +227,54 @@ class Airlock:
         )
 
 
+#: The zero-config dev-store path (PLAN.md 3.3): ``airlock.init()`` with no
+#: store lands here — a local SQLite file in the working directory.
+_DEFAULT_SQLITE_PATH = "./airlock.db"
+
+#: One-shot latch so the "dev store; use Postgres in production" warning fires
+#: exactly ONCE per process, however many times ``init()`` is called.
+_dev_store_warned = False
+
+
+def _resolve_store(store: Store | str | None) -> Store:
+    """Resolve the ``init(store=...)`` argument to a live :class:`Store`.
+
+    - a :class:`Store` -> used as-is.
+    - a DSN ``str`` -> :func:`airlock.store.from_url` (``postgresql://`` or
+      ``sqlite://``).
+    - ``None`` -> the zero-config quickstart default: a
+      :class:`~airlock.store.sqlite.SqliteStore` on ``./airlock.db`` (schema
+      auto-created), with a LOUD one-time warning that it is a single-host dev
+      store and production should use Postgres (PLAN.md 3.3 / 3.7).
+    """
+    if store is None:
+        global _dev_store_warned
+        from airlock.store.sqlite import SqliteStore
+
+        sqlite_store = SqliteStore(_DEFAULT_SQLITE_PATH)
+        sqlite_store.ensure_schema()
+        if not _dev_store_warned:
+            warnings.warn(
+                f"airlock.init() with no store is using a local SQLite dev store at "
+                f"{_DEFAULT_SQLITE_PATH!r}. This is the zero-config quickstart: it enforces "
+                "the SAME exactly-once / durable-pause / audit-chain guarantees as Postgres, "
+                "but only on a SINGLE HOST (one machine, one volume). For production — "
+                "anything multi-host — use Postgres: airlock.init(store='postgresql://...') "
+                "(pip install 'airlock[postgres]').",
+                stacklevel=3,
+            )
+            _dev_store_warned = True
+        return sqlite_store
+    if isinstance(store, str):
+        from airlock.store import from_url
+
+        return from_url(store)
+    return store
+
+
 def init(
     *,
-    store: Store,
+    store: Store | str | None = None,
     policy: PolicyBackend | None = None,
     transport: ApprovalTransport | None = None,
     event_sinks: Sequence[EventSink] = (),
@@ -247,9 +292,14 @@ def init(
     without re-decoration.
 
     Args:
-        store: the commit ledger (P1.1). Required — the zero-config
-            SqliteStore default is P4.1 (PLAN.md 3.3 / 10.10), so there is no
-            implicit store here.
+        store: the commit ledger. A :class:`Store` is used as-is; a DSN
+            ``str`` is built via :func:`airlock.store.from_url`
+            (``postgresql://`` or ``sqlite://``); ``None`` (the zero-config
+            quickstart, PLAN.md 3.3 / 3.7) installs a
+            :class:`~airlock.store.sqlite.SqliteStore` on ``./airlock.db`` and
+            warns ONCE that it is a single-host dev store (use Postgres in
+            production). The SQLite default enforces the SAME ADR-1/4/5
+            guarantees — the only limit is single-host scope.
         policy: the :class:`PolicyBackend`. ``None`` installs
             ``Policy(default=GATE)`` — fail safe: with no rules every action
             gates for a human (PLAN.md 3.3).
@@ -287,12 +337,13 @@ def init(
     Returns:
         An :class:`Airlock` handle over the runtime just installed.
     """
+    resolved_store = _resolve_store(store)
     if transport is None:
         from airlock.transport.console import ConsoleApprovalTransport
 
         transport = ConsoleApprovalTransport()
     runtime = _Runtime(
-        store=store,
+        store=resolved_store,
         policy=policy if policy is not None else Policy(),
         event_sinks=tuple(event_sinks),
         registry=registry if registry is not None else default_registry,

@@ -268,9 +268,20 @@ def test_from_url_dispatches_postgres(database_url: str) -> None:
     built.close()
 
 
+def test_from_url_dispatches_sqlite(tmp_path: pytest.TempPathFactory) -> None:
+    """P4.1: sqlite:// now builds a SqliteStore (stdlib, no extra) with schema."""
+    from airlock.store.sqlite import SqliteStore
+
+    built = from_url(f"sqlite:///{tmp_path}/airlock.db")
+    assert isinstance(built, SqliteStore)
+    # ensure_schema ran: the chain head exists, so an append works.
+    assert built.audit_head() is not None
+    built.close()
+
+
 def test_from_url_rejects_unknown_scheme() -> None:
-    with pytest.raises(NotImplementedError, match=r"P4\.1"):
-        from_url("sqlite:///airlock.db")
+    with pytest.raises(NotImplementedError, match="no Store backend"):
+        from_url("mysql://host/db")
 
 
 def test_from_url_rejects_non_dsn() -> None:

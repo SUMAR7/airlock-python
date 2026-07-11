@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
     from airlock.store.postgres import PostgresStore
 
+pytestmark = pytest.mark.matrix
+
 CRASH_ACTION = "crash.refund"
 DEADLINE = 60.0
 OLDER_THAN = timedelta(seconds=60)
@@ -83,7 +85,7 @@ def _spawn_crash(dsn: str, key: str, crashpoint: str, guarantee: Guarantee) -> i
 @pytest.mark.parametrize("crashpoint", CRASHPOINTS)
 def test_crash_leaves_expected_durable_state(
     db: Engine,
-    database_url: str,
+    store_dsn: str,
     effects: EffectsLog,
     crashpoint: str,
 ) -> None:
@@ -94,7 +96,7 @@ def test_crash_leaves_expected_durable_state(
     from after_effect on; committed after the finalize write lands.
     """
     key = f"k-crash-state-{crashpoint}"
-    exitcode = _spawn_crash(database_url, key, crashpoint, Guarantee.VERIFIABLE)
+    exitcode = _spawn_crash(store_dsn, key, crashpoint, Guarantee.VERIFIABLE)
     assert exitcode == CRASH_EXIT_CODE, (
         f"expected os._exit({CRASH_EXIT_CODE}) at {crashpoint!r}, got {exitcode} "
         "(a clean 0 means the crashpoint never fired)"
@@ -132,7 +134,7 @@ _EXECUTING_WITH_EFFECT = [
 @pytest.mark.parametrize("crashpoint", _EXECUTING_WITH_EFFECT)
 def test_scenario_3_executing_with_effect_probe_present_recovers_committed(
     db: Engine,
-    database_url: str,
+    store_dsn: str,
     effects: EffectsLog,
     clock_store: PostgresStore,
     fake_clock: FakeClock,
@@ -142,7 +144,7 @@ def test_scenario_3_executing_with_effect_probe_present_recovers_committed(
     the row is executing. Verify PRESENT -> committed, effect_count stays 1
     (never re-executed), recovery evidence recorded."""
     key = f"k-crash-s3-{crashpoint}"
-    assert _spawn_crash(database_url, key, crashpoint, Guarantee.VERIFIABLE) == CRASH_EXIT_CODE
+    assert _spawn_crash(store_dsn, key, crashpoint, Guarantee.VERIFIABLE) == CRASH_EXIT_CODE
 
     row = read_row(db, key)
     assert row.state == LedgerState.EXECUTING.value
@@ -186,7 +188,7 @@ def test_scenario_3_executing_with_effect_probe_present_recovers_committed(
 @pytest.mark.parametrize("crashpoint", ["after_claim", "after_executing_mark"])
 def test_scenario_4_crash_before_effect_retry_gives_exactly_one_effect(
     db: Engine,
-    database_url: str,
+    store_dsn: str,
     effects: EffectsLog,
     clock_store: PostgresStore,
     fake_clock: FakeClock,
@@ -201,7 +203,7 @@ def test_scenario_4_crash_before_effect_retry_gives_exactly_one_effect(
       recovery treats it as effect-free and retries -> exactly one effect.
     """
     key = f"k-crash-s4-{crashpoint}"
-    assert _spawn_crash(database_url, key, crashpoint, Guarantee.VERIFIABLE) == CRASH_EXIT_CODE
+    assert _spawn_crash(store_dsn, key, crashpoint, Guarantee.VERIFIABLE) == CRASH_EXIT_CODE
 
     row = read_row(db, key)
     assert row.state == expected_state_after_crash(crashpoint).value
@@ -246,7 +248,7 @@ def test_scenario_4_crash_before_effect_retry_gives_exactly_one_effect(
 @pytest.mark.crash
 def test_crash_after_finalize_write_is_already_terminal(
     db: Engine,
-    database_url: str,
+    store_dsn: str,
     effects: EffectsLog,
     clock_store: PostgresStore,
     fake_clock: FakeClock,
@@ -258,7 +260,7 @@ def test_crash_after_finalize_write_is_already_terminal(
     alone."""
     key = "k-crash-after-finalize"
     assert (
-        _spawn_crash(database_url, key, "after_finalize_write", Guarantee.VERIFIABLE)
+        _spawn_crash(store_dsn, key, "after_finalize_write", Guarantee.VERIFIABLE)
         == CRASH_EXIT_CODE
     )
 

@@ -33,16 +33,16 @@ import signal
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import create_engine, text
-
-from airlock.store.postgres import PostgresStore, normalize_postgres_url
+from airlock.store import from_url
 from airlock.types import Guarantee, LedgerState
-from tests.conftest import EffectsLog, read_row
+from tests.conftest import EffectsLog, make_effects_for_dsn, read_row
 
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
     from sqlalchemy.engine import Engine
+
+pytestmark = pytest.mark.matrix
 
 SIGKILL_ACTION = "sigkill.refund"
 DEADLINE = 60.0
@@ -78,15 +78,11 @@ def _sigkill_worker(dsn: str, key: str, boundary_class: str, ready: Event) -> No
     parent's ``SIGKILL`` cannot interrupt it. The final ``wait()`` blocks until
     the parent kills the process — no clean exit path.
     """
-    store = PostgresStore(dsn)
-    effects_engine = create_engine(normalize_postgres_url(dsn), isolation_level="AUTOCOMMIT")
+    store = from_url(dsn)
+    effects = make_effects_for_dsn(dsn)
 
     def log_effect() -> None:
-        with effects_engine.connect() as conn:
-            conn.execute(
-                text("INSERT INTO effects_log (idempotency_key, worker_pid) VALUES (:key, :pid)"),
-                {"key": key, "pid": os.getpid()},
-            )
+        effects.log(key)
 
     store.claim(key, SIGKILL_ACTION, Guarantee.VERIFIABLE, {"invoice": key}, None)
     if boundary_class == _EFFECT_FREE:
@@ -121,7 +117,7 @@ def _block_forever() -> None:
 @pytest.mark.parametrize("boundary_class", _BOUNDARY_CLASSES)
 def test_real_sigkill_matches_os_exit_durability(
     db: Engine,
-    database_url: str,
+    store_dsn: str,
     effects: EffectsLog,
     boundary_class: str,
 ) -> None:
@@ -134,7 +130,7 @@ def test_real_sigkill_matches_os_exit_durability(
     ready = ctx.Event()
     proc = ctx.Process(
         target=_sigkill_worker,
-        args=(database_url, key, boundary_class, ready),
+        args=(store_dsn, key, boundary_class, ready),
         daemon=True,
     )
     proc.start()

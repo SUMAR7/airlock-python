@@ -55,17 +55,29 @@ control flow end to end.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
-from datetime import datetime
+from collections.abc import Callable, Iterator, Mapping
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from pydantic import JsonValue
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from airlock.commit import commit_once
 from airlock.effects import Effect
-from airlock.store.postgres import PostgresStore, normalize_postgres_url
-from airlock.types import Claim, Guarantee, LedgerState
+from airlock.store import Store, from_url
+from airlock.types import (
+    ApprovalDecision,
+    AuditEvent,
+    AuditHead,
+    AuditRow,
+    Claim,
+    CommitRecord,
+    Guarantee,
+    LedgerState,
+    PauseClaim,
+    PausedRun,
+    PauseStatus,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
@@ -118,36 +130,35 @@ def effect_applied_at_crash(crashpoint: str) -> bool:
 
 
 class EffectLogger:
-    """Ground-truth side-effect counter on a dedicated autocommit connection.
+    """Ground-truth side-effect counter, built from a DSN alone (both backends).
 
-    Mirrors ``tests.conftest.EffectsLog`` but is self-contained so a spawn
-    subprocess (which re-imports this module fresh, WITHOUT the pytest fixture
-    graph) can construct one from a DSN alone.
+    Self-contained so a spawn subprocess (which re-imports this module fresh,
+    WITHOUT the pytest fixture graph) can construct one from a DSN — dispatched
+    by scheme to Postgres or SQLite via ``tests.conftest.make_effects_for_dsn``.
     """
 
     def __init__(self, dsn: str) -> None:
-        self._engine = create_engine(normalize_postgres_url(dsn), isolation_level="AUTOCOMMIT")
+        from tests.conftest import make_effects_for_dsn
+
+        self._effects = make_effects_for_dsn(dsn)
 
     def log(self, key: str) -> None:
-        with self._engine.connect() as conn:
-            conn.execute(
-                text("INSERT INTO effects_log (idempotency_key, worker_pid) VALUES (:key, :pid)"),
-                {"key": key, "pid": os.getpid()},
-            )
+        self._effects.log(key)
 
     def dispose(self) -> None:
-        self._engine.dispose()
+        self._effects.dispose()
 
 
-class CrashInjectingStore(PostgresStore):
-    """A ``PostgresStore`` that ``os._exit``es at named crash boundaries.
+class CrashInjectingStore:
+    """A :class:`~airlock.store.Store` that ``os._exit``es at named crash boundaries.
 
-    Deterministic like a mock, real like SIGKILL: the ``os._exit`` skips all
-    Python cleanup and drops the DB connection mid-transaction. Only the four
-    store-bracketed boundaries live here; ``after_effect`` / ``after_verify``
-    are fired by the caller's ``execute`` / ``verify`` callables. The wrapper
-    NEVER changes the store's behavior when its boundary is not the configured
-    ``crashpoint`` — it is a pass-through the rest of the time.
+    Backend-neutral (P4.1): wraps whatever store ``from_url(dsn)`` builds —
+    Postgres or SQLite — and delegates every Store method to it, intercepting
+    only the four store-bracketed boundaries with ``os._exit``. Deterministic
+    like a mock, real like SIGKILL: ``os._exit`` skips all Python cleanup and
+    drops the DB connection mid-transaction. ``after_effect`` / ``after_verify``
+    are fired by the caller's ``execute`` / ``verify`` callables. It is a plain
+    pass-through the rest of the time.
 
     ``after_claim`` fires only when the claim is WON (a fresh ``pending`` row):
     a loser has nothing to crash after, and the harness's contract is "die with
@@ -155,9 +166,9 @@ class CrashInjectingStore(PostgresStore):
     """
 
     def __init__(self, dsn: str, crashpoint: str) -> None:
-        super().__init__(dsn)
         if crashpoint not in CRASHPOINTS:
             raise ValueError(f"unknown crashpoint {crashpoint!r}; expected one of {CRASHPOINTS}")
+        self._inner: Store = from_url(dsn)
         self._crashpoint = crashpoint
 
     def claim(
@@ -168,13 +179,13 @@ class CrashInjectingStore(PostgresStore):
         args_json: Mapping[str, JsonValue],
         downstream_key: str | None,
     ) -> Claim:
-        claim = super().claim(key, action_type, guarantee, args_json, downstream_key)
+        claim = self._inner.claim(key, action_type, guarantee, args_json, downstream_key)
         if self._crashpoint == "after_claim" and claim.won:
             os._exit(CRASH_EXIT_CODE)  # row is durably 'pending'
         return claim
 
     def mark_executing(self, key: str, epoch: int) -> bool:
-        marked = super().mark_executing(key, epoch)
+        marked = self._inner.mark_executing(key, epoch)
         if self._crashpoint == "after_executing_mark" and marked:
             os._exit(CRASH_EXIT_CODE)  # row is durably 'executing', no effect yet
         return marked
@@ -189,10 +200,84 @@ class CrashInjectingStore(PostgresStore):
     ) -> bool:
         if self._crashpoint == "before_finalize_write":
             os._exit(CRASH_EXIT_CODE)  # about to finalize; the write never happens
-        ok = super().finalize(key, epoch, state, result_json, audit)
+        ok = self._inner.finalize(key, epoch, state, result_json, audit)
         if self._crashpoint == "after_finalize_write":
             os._exit(CRASH_EXIT_CODE)  # finalize COMMITTED durably; die before returning
         return ok
+
+    # -- plain delegation for the rest of the Store protocol ------------------
+
+    def record_error(self, key: str, epoch: int, error_json: JsonValue) -> bool:
+        return self._inner.record_error(key, epoch, error_json)
+
+    def load(self, key: str) -> CommitRecord | None:
+        return self._inner.load(key)
+
+    def stale_inflight(self, older_than: timedelta) -> list[CommitRecord]:
+        return self._inner.stale_inflight(older_than)
+
+    def bump_epoch(self, key: str, older_than: timedelta) -> int | None:
+        return self._inner.bump_epoch(key, older_than)
+
+    def save_paused(
+        self,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        approval_ref: str,
+        action_type: str,
+        serialized_state: Mapping[str, JsonValue],
+        state_version: int = 1,
+        audit: AuditEvent | None = None,
+    ) -> PauseClaim:
+        return self._inner.save_paused(
+            run_id=run_id,
+            idempotency_key=idempotency_key,
+            approval_ref=approval_ref,
+            action_type=action_type,
+            serialized_state=serialized_state,
+            state_version=state_version,
+            audit=audit,
+        )
+
+    def load_paused_by_ref(self, approval_ref: str) -> PausedRun | None:
+        return self._inner.load_paused_by_ref(approval_ref)
+
+    def transition_paused(
+        self,
+        run_id: str,
+        from_status: PauseStatus,
+        to_status: PauseStatus,
+        *,
+        decision: ApprovalDecision | None = None,
+        audit: AuditEvent | tuple[AuditEvent, ...] | None = None,
+    ) -> bool:
+        return self._inner.transition_paused(
+            run_id, from_status, to_status, decision=decision, audit=audit
+        )
+
+    def stale_approved_paused(self, older_than: timedelta) -> list[PausedRun]:
+        return self._inner.stale_approved_paused(older_than)
+
+    def set_approval_id(self, run_id: str, approval_id: str) -> bool:
+        return self._inner.set_approval_id(run_id, approval_id)
+
+    def stale_polled_paused(self, older_than: timedelta) -> list[PausedRun]:
+        return self._inner.stale_polled_paused(older_than)
+
+    def append_audit(self, event: AuditEvent) -> AuditRow:
+        return self._inner.append_audit(event)
+
+    def audit_head(self) -> AuditHead | None:
+        return self._inner.audit_head()
+
+    def iter_audit(self, start_seq: int = 0) -> Iterator[AuditRow]:
+        return self._inner.iter_audit(start_seq)
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if close is not None:
+            close()
 
 
 def run_commit_to_crashpoint(
@@ -281,11 +366,21 @@ def rebase_last_attempt(engine: Engine, key: str, when: datetime) -> None:
     on the fake clock. Aligning ``last_attempt_at`` keeps the staleness trigger
     deterministic (advance the clock, never sleep). State/attempts/effects are
     untouched — only the timeline the stale scan reads.
+
+    Backend-neutral: on SQLite the ``last_attempt_at`` column is TEXT, so we bind
+    the store's canonical RFC3339 rendering (a bare datetime would be stored in
+    a different textual format and break the TEXT staleness comparison); on
+    Postgres we bind the ``datetime`` for the ``TIMESTAMPTZ`` column.
     """
+    bound: Any = when
+    if engine.dialect.name == "sqlite":
+        from airlock.store.sqlite import sqlite_dt_to_text
+
+        bound = sqlite_dt_to_text(when)
     with engine.begin() as conn:
         rowcount = conn.execute(
             text("UPDATE commit_records SET last_attempt_at = :when WHERE idempotency_key = :key"),
-            {"when": when, "key": key},
+            {"when": bound, "key": key},
         ).rowcount
     if rowcount != 1:
         raise AssertionError(f"expected exactly one row to rebase for {key!r}, got {rowcount}")

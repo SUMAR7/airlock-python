@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from airlock.store.postgres import PostgresStore
     from tests.conftest import FakeClock
 
+pytestmark = pytest.mark.matrix
+
 OLDER_THAN = timedelta(seconds=60)
 
 
@@ -40,7 +42,21 @@ def _reconcile_rows(db: Engine) -> list[dict[str, Any]]:
             .mappings()
             .all()
         )
-    return [dict(row) for row in rows]
+    import json as _json
+
+    from airlock.store.sqlite import sqlite_text_to_dt
+
+    out = []
+    for row in rows:
+        d = dict(row)
+        if isinstance(d.get("payload_json"), str):
+            d["payload_json"] = _json.loads(d["payload_json"])
+        # SQLite stores created_at as TEXT; normalize to the tz-aware datetime
+        # the tests compare against (Postgres TIMESTAMPTZ already yields one).
+        if isinstance(d.get("created_at"), str):
+            d["created_at"] = sqlite_text_to_dt(d["created_at"])
+        out.append(d)
+    return out
 
 
 def _stage_executing(store: PostgresStore, key: str, action: str, guarantee: Guarantee) -> None:

@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
     from airlock.store.postgres import PostgresStore
 
+pytestmark = pytest.mark.matrix
+
 ACTION = "refund.create"
 ARGS: dict[str, JsonValue] = {"invoice": "inv_42", "amount": "12.50"}
 OLDER_THAN = timedelta(seconds=60)

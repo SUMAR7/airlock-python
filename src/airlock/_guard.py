@@ -260,7 +260,7 @@ def _resolve_store(store: Store | str | None) -> Store:
                 "the SAME exactly-once / durable-pause / audit-chain guarantees as Postgres, "
                 "but only on a SINGLE HOST (one machine, one volume). For production — "
                 "anything multi-host — use Postgres: airlock.init(store='postgresql://...') "
-                "(pip install 'airlock[postgres]').",
+                "(pip install 'airlock-sdk[postgres]').",
                 stacklevel=3,
             )
             _dev_store_warned = True

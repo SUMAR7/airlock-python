@@ -326,7 +326,7 @@ def from_url(url: str) -> Store:
         except ImportError as exc:
             raise ImportError(
                 "the Postgres store needs the 'postgres' extra "
-                "(sqlalchemy + psycopg): pip install 'airlock[postgres]'"
+                "(sqlalchemy + psycopg): pip install 'airlock-sdk[postgres]'"
             ) from exc
         return PostgresStore(url)
     if dialect == "sqlite":

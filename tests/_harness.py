@@ -149,27 +149,18 @@ class EffectLogger:
         self._effects.dispose()
 
 
-class CrashInjectingStore:
-    """A :class:`~airlock.store.Store` that ``os._exit``es at named crash boundaries.
+class _DelegatingStore:
+    """A backend-neutral :class:`~airlock.store.Store` wrapper over ``from_url``.
 
-    Backend-neutral (P4.1): wraps whatever store ``from_url(dsn)`` builds —
-    Postgres or SQLite — and delegates every Store method to it, intercepting
-    only the four store-bracketed boundaries with ``os._exit``. Deterministic
-    like a mock, real like SIGKILL: ``os._exit`` skips all Python cleanup and
-    drops the DB connection mid-transaction. ``after_effect`` / ``after_verify``
-    are fired by the caller's ``execute`` / ``verify`` callables. It is a plain
-    pass-through the rest of the time.
-
-    ``after_claim`` fires only when the claim is WON (a fresh ``pending`` row):
-    a loser has nothing to crash after, and the harness's contract is "die with
-    the row in state X", which requires having created it.
+    Wraps whatever store ``from_url(dsn)`` builds (Postgres or SQLite) and
+    delegates every Store-protocol method to it. Test wrappers that need to
+    intercept a few methods (crash injection, claim reporting) subclass this and
+    override just those — the rest delegate unchanged, and the wrapper stays a
+    structural ``Store`` (mypy-clean when passed to ``commit_once``).
     """
 
-    def __init__(self, dsn: str, crashpoint: str) -> None:
-        if crashpoint not in CRASHPOINTS:
-            raise ValueError(f"unknown crashpoint {crashpoint!r}; expected one of {CRASHPOINTS}")
+    def __init__(self, dsn: str) -> None:
         self._inner: Store = from_url(dsn)
-        self._crashpoint = crashpoint
 
     def claim(
         self,
@@ -179,16 +170,10 @@ class CrashInjectingStore:
         args_json: Mapping[str, JsonValue],
         downstream_key: str | None,
     ) -> Claim:
-        claim = self._inner.claim(key, action_type, guarantee, args_json, downstream_key)
-        if self._crashpoint == "after_claim" and claim.won:
-            os._exit(CRASH_EXIT_CODE)  # row is durably 'pending'
-        return claim
+        return self._inner.claim(key, action_type, guarantee, args_json, downstream_key)
 
     def mark_executing(self, key: str, epoch: int) -> bool:
-        marked = self._inner.mark_executing(key, epoch)
-        if self._crashpoint == "after_executing_mark" and marked:
-            os._exit(CRASH_EXIT_CODE)  # row is durably 'executing', no effect yet
-        return marked
+        return self._inner.mark_executing(key, epoch)
 
     def finalize(
         self,
@@ -198,14 +183,7 @@ class CrashInjectingStore:
         result_json: JsonValue,
         audit: object | None,
     ) -> bool:
-        if self._crashpoint == "before_finalize_write":
-            os._exit(CRASH_EXIT_CODE)  # about to finalize; the write never happens
-        ok = self._inner.finalize(key, epoch, state, result_json, audit)
-        if self._crashpoint == "after_finalize_write":
-            os._exit(CRASH_EXIT_CODE)  # finalize COMMITTED durably; die before returning
-        return ok
-
-    # -- plain delegation for the rest of the Store protocol ------------------
+        return self._inner.finalize(key, epoch, state, result_json, audit)
 
     def record_error(self, key: str, epoch: int, error_json: JsonValue) -> bool:
         return self._inner.record_error(key, epoch, error_json)
@@ -278,6 +256,61 @@ class CrashInjectingStore:
         close = getattr(self._inner, "close", None)
         if close is not None:
             close()
+
+
+class CrashInjectingStore(_DelegatingStore):
+    """A :class:`Store` that ``os._exit``es at named crash boundaries.
+
+    Backend-neutral (P4.1): intercepts only the four store-bracketed boundaries
+    with ``os._exit``; everything else delegates via :class:`_DelegatingStore`.
+    Deterministic like a mock, real like SIGKILL: ``os._exit`` skips all Python
+    cleanup and drops the DB connection mid-transaction. ``after_effect`` /
+    ``after_verify`` are fired by the caller's ``execute`` / ``verify``.
+
+    ``after_claim`` fires only when the claim is WON (a fresh ``pending`` row):
+    a loser has nothing to crash after, and the harness's contract is "die with
+    the row in state X", which requires having created it.
+    """
+
+    def __init__(self, dsn: str, crashpoint: str) -> None:
+        if crashpoint not in CRASHPOINTS:
+            raise ValueError(f"unknown crashpoint {crashpoint!r}; expected one of {CRASHPOINTS}")
+        super().__init__(dsn)
+        self._crashpoint = crashpoint
+
+    def claim(
+        self,
+        key: str,
+        action_type: str,
+        guarantee: Guarantee,
+        args_json: Mapping[str, JsonValue],
+        downstream_key: str | None,
+    ) -> Claim:
+        claim = self._inner.claim(key, action_type, guarantee, args_json, downstream_key)
+        if self._crashpoint == "after_claim" and claim.won:
+            os._exit(CRASH_EXIT_CODE)  # row is durably 'pending'
+        return claim
+
+    def mark_executing(self, key: str, epoch: int) -> bool:
+        marked = self._inner.mark_executing(key, epoch)
+        if self._crashpoint == "after_executing_mark" and marked:
+            os._exit(CRASH_EXIT_CODE)  # row is durably 'executing', no effect yet
+        return marked
+
+    def finalize(
+        self,
+        key: str,
+        epoch: int,
+        state: LedgerState,
+        result_json: JsonValue,
+        audit: object | None,
+    ) -> bool:
+        if self._crashpoint == "before_finalize_write":
+            os._exit(CRASH_EXIT_CODE)  # about to finalize; the write never happens
+        ok = self._inner.finalize(key, epoch, state, result_json, audit)
+        if self._crashpoint == "after_finalize_write":
+            os._exit(CRASH_EXIT_CODE)  # finalize COMMITTED durably; die before returning
+        return ok
 
 
 def run_commit_to_crashpoint(

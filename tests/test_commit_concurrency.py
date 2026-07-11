@@ -25,18 +25,22 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import JsonValue
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from airlock.commit import commit_once
 from airlock.effects import Effect
-from airlock.store.postgres import PostgresStore, normalize_postgres_url
 from airlock.types import IN_FLIGHT_LEDGER_STATES, Claim, Guarantee, LedgerState, Verification
-from tests.conftest import EffectsLog
+from tests._harness import _DelegatingStore
+from tests.conftest import EffectsLog, make_effects_for_dsn
 
 if TYPE_CHECKING:
     from multiprocessing.queues import Queue
     from multiprocessing.synchronize import Barrier, Event
+
+import json
+
+pytestmark = pytest.mark.matrix
 
 WORKERS = 8
 KEY = "scenario-2-one-key"
@@ -75,7 +79,7 @@ def _poll_until(predicate: Callable[[], bool], deadline_s: float) -> bool:
     return predicate()
 
 
-class _ClaimReportingStore(PostgresStore):
+class _ClaimReportingStore(_DelegatingStore):
     """PostgresStore that reports each claim outcome the instant it resolves.
 
     The parent holds the winner gated until all eight reports are in, which
@@ -110,19 +114,13 @@ def _scenario2_worker(
 ) -> None:
     """One competing client process. Runs in a spawn child."""
     store = _ClaimReportingStore(dsn, claim_reports)
-    effects_engine = create_engine(normalize_postgres_url(dsn), isolation_level="AUTOCOMMIT")
+    effects = make_effects_for_dsn(dsn)
     try:
 
         def execute(downstream_key: str | None) -> dict[str, Any]:
-            # Ground truth on the separate autocommit connection: the effect
-            # is counted the instant it happens (PLAN.md section 7).
-            with effects_engine.connect() as conn:
-                conn.execute(
-                    text(
-                        "INSERT INTO effects_log (idempotency_key, worker_pid) VALUES (:key, :pid)"
-                    ),
-                    {"key": KEY, "pid": os.getpid()},
-                )
+            # Ground truth on a separate connection: the effect is counted
+            # the instant it happens (PLAN.md section 7).
+            effects.log(KEY)
             winner_inside.set()
             # Gate: hold the winner mid-effect until the parent has collected
             # every claim report and finished its mid-flight assertions.
@@ -146,12 +144,12 @@ def _scenario2_worker(
         results.put({"pid": os.getpid(), "error": repr(exc)})
     finally:
         store.close()
-        effects_engine.dispose()
+        effects.dispose()
 
 
 @pytest.mark.concurrency
 def test_scenario_2_eight_processes_one_effect(
-    db: Engine, database_url: str, effects: EffectsLog
+    db: Engine, store_dsn: str, effects: EffectsLog
 ) -> None:
     ctx = multiprocessing.get_context("spawn")
     barrier = ctx.Barrier(WORKERS)
@@ -164,7 +162,7 @@ def test_scenario_2_eight_processes_one_effect(
         ctx.Process(
             target=_scenario2_worker,
             args=(
-                database_url,
+                store_dsn,
                 barrier,
                 winner_inside,
                 release,
@@ -266,5 +264,8 @@ def test_scenario_2_eight_processes_one_effect(
     assert row["idempotency_key"] == KEY
     assert row["state"] == LedgerState.COMMITTED.value
     assert row["attempts"] == 1
-    assert row["result_json"] == first_result
+    stored_result = row["result_json"]
+    if isinstance(stored_result, str):
+        stored_result = json.loads(stored_result)
+    assert stored_result == first_result
     assert row["committed_at"] is not None

@@ -46,7 +46,9 @@ class FakePaymentAPI:
         if idempotency_key is not None and idempotency_key in self._by_key:
             return self._by_key[idempotency_key]
         # Otherwise this is a NEW side effect: money moves, and we record it.
-        refund = Refund(id=f"re_{self.total_calls:04d}", charge_id=charge_id, amount_cents=amount_cents)
+        refund = Refund(
+            id=f"re_{self.total_calls:04d}", charge_id=charge_id, amount_cents=amount_cents
+        )
         self._refunds.setdefault(charge_id, []).append(refund)
         if idempotency_key is not None:
             self._by_key[idempotency_key] = refund

@@ -26,8 +26,10 @@ import airlock._guard as _guard
 _DEMO_DIR = Path(__file__).resolve().parents[1] / "examples" / "double_refund"
 sys.path.insert(0, str(_DEMO_DIR))
 
-import demo  # noqa: E402  (import after sys.path mutation, by design)
-from fake_payment_api import FakePaymentAPI  # noqa: E402
+# mypy cannot see these runtime-path modules (they live under examples/, not on
+# the package path); the sys.path.insert above makes them importable at runtime.
+import demo  # type: ignore[import-not-found]  # noqa: E402
+from fake_payment_api import FakePaymentAPI  # type: ignore[import-not-found]  # noqa: E402
 
 
 def test_fake_api_dedupes_on_idempotency_key() -> None:

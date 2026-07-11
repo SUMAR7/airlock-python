@@ -29,11 +29,11 @@ from typing import NamedTuple
 # script (its directory is already sys.path[0]) or imported by the test suite.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fake_payment_api import FakePaymentAPI
+
 import airlock
 from airlock import Decision, Effect, Money, Policy, Reversibility, Rule
 from airlock.store.sqlite import SqliteStore
-
-from fake_payment_api import FakePaymentAPI
 
 #: The charge we refund and the amount ($50.00), shared by both acts.
 CHARGE_ID = "ch_demo_ABC123"
@@ -72,7 +72,11 @@ def issue_refund(
     refund = payment_api.refund(charge_id, amount_cents, idempotency_key=idempotency_key)
     # Return a JSON-safe dict: Airlock records it on the commit ledger, and a
     # deduped retry gets THIS exact result back without re-running the tool.
-    return {"refund_id": refund.id, "charge_id": refund.charge_id, "amount_cents": refund.amount_cents}
+    return {
+        "refund_id": refund.id,
+        "charge_id": refund.charge_id,
+        "amount_cents": refund.amount_cents,
+    }
 
 
 def act1_without_airlock() -> FakePaymentAPI:

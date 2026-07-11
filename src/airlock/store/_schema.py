@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING
 from airlock.types import IN_FLIGHT_LEDGER_STATES, Guarantee, LedgerState, PauseStatus
 
 if TYPE_CHECKING:
+    import sqlite3
+
     from sqlalchemy.engine import Engine
 
 __all__ = [
@@ -39,9 +41,12 @@ __all__ = [
     "PAUSED_APPROVED_INDEX_DDL",
     "PAUSED_POLLED_INDEX_DDL",
     "PAUSED_RUNS_DDL",
+    "SQLITE_DDL_STATEMENTS",
     "create_tables",
     "ensure_schema",
+    "ensure_sqlite_schema",
     "seed_genesis",
+    "seed_genesis_sqlite",
 ]
 
 
@@ -259,6 +264,214 @@ def ensure_schema(engine: Engine) -> None:
         for statement in DDL_STATEMENTS:
             conn.execute(text(statement))
     seed_genesis(engine)
+
+
+# ---------------------------------------------------------------------------
+# SQLite dialect (P4.1, PLAN.md 3.7 / 10.10) — "one schema, two dialects".
+#
+# The SAME tables, CHECKs, partial indexes, genesis row and chain head as the
+# Postgres DDL above, rendered for stdlib ``sqlite3`` (no sqlalchemy — the base
+# install has no extra). The type mapping (PLAN.md 3.7):
+#
+#   BIGINT GENERATED ALWAYS AS IDENTITY  ->  INTEGER PRIMARY KEY AUTOINCREMENT
+#   TIMESTAMPTZ                          ->  TEXT (RFC3339 UTC, µs; see sqlite.py)
+#   JSONB                                ->  TEXT (canonical/plain JSON)
+#   UUID                                 ->  TEXT
+#   BYTEA                                ->  BLOB
+#   BOOL                                 ->  INTEGER (0/1)
+#
+# The CHECK value lists are the SAME generated strings the Postgres DDL uses
+# (``_STATE_VALUES`` / ``_GUARANTEE_VALUES`` / ``_IN_FLIGHT_VALUES`` /
+# ``_PAUSE_STATUS_VALUES``) — one vocabulary source (PLAN.md 10.5), so the two
+# dialects can never drift. Partial indexes are supported by SQLite. The one
+# guarantee SQLite cannot express the Postgres way is the audit append-only
+# REVOKE (SQLite has no roles): the BEFORE UPDATE/DELETE triggers below deliver
+# the SAME end guarantee (any UPDATE/DELETE on ``audit_events`` raises), and the
+# hash chain is the tamper EVIDENCE either way (``airlock.audit.verify_chain``).
+
+SQLITE_COMMIT_RECORDS_DDL = f"""
+CREATE TABLE IF NOT EXISTS commit_records (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key  TEXT    NOT NULL,
+    action_type      TEXT    NOT NULL,
+    state            TEXT    NOT NULL DEFAULT '{LedgerState.PENDING.value}'
+                     CHECK (state IN ({_STATE_VALUES})),
+    guarantee        TEXT    NOT NULL
+                     CHECK (guarantee IN ({_GUARANTEE_VALUES})),
+    args_json        TEXT    NOT NULL,
+    downstream_key   TEXT,
+    run_id           TEXT,
+    result_json      TEXT,
+    error_json       TEXT,
+    attempts         INTEGER NOT NULL DEFAULT 1,
+    last_attempt_at  TEXT    NOT NULL,
+    created_at       TEXT    NOT NULL,
+    committed_at     TEXT,
+    CONSTRAINT commit_records_key_uq UNIQUE (idempotency_key),
+    CONSTRAINT committed_iff_timestamp
+        CHECK ((state = '{LedgerState.COMMITTED.value}') = (committed_at IS NOT NULL))
+)
+"""
+
+SQLITE_INFLIGHT_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS commit_records_inflight_idx ON commit_records (last_attempt_at)
+    WHERE state IN ({_IN_FLIGHT_VALUES})
+"""
+
+SQLITE_PAUSED_RUNS_DDL = f"""
+CREATE TABLE IF NOT EXISTS paused_runs (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id               TEXT    NOT NULL,
+    idempotency_key      TEXT    NOT NULL,
+    approval_ref         TEXT    NOT NULL,
+    approval_id          TEXT,
+    action_type          TEXT    NOT NULL,
+    serialized_state     TEXT    NOT NULL,
+    state_version        INTEGER NOT NULL DEFAULT 1,
+    status               TEXT    NOT NULL DEFAULT '{PauseStatus.PROPOSED.value}'
+                         CHECK (status IN ({_PAUSE_STATUS_VALUES})),
+    approved_action_json TEXT,
+    decided_by           TEXT,
+    decided_by_display   TEXT,
+    decided_at           TEXT,
+    decision_latency_ms  INTEGER,
+    created_at           TEXT    NOT NULL,
+    resolved_at          TEXT,
+    CONSTRAINT paused_runs_key_uq UNIQUE (idempotency_key),
+    CONSTRAINT paused_runs_ref_uq UNIQUE (approval_ref)
+)
+"""
+
+SQLITE_PAUSED_APPROVED_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS paused_runs_approved_idx ON paused_runs (decided_at)
+    WHERE status = '{PauseStatus.APPROVED.value}'
+"""
+
+SQLITE_PAUSED_POLLED_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS paused_runs_polled_idx ON paused_runs (created_at)
+    WHERE status = '{PauseStatus.PROPOSED.value}' AND approval_id IS NOT NULL
+"""
+
+SQLITE_AUDIT_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS audit_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    seq          INTEGER NOT NULL UNIQUE,
+    run_id       TEXT,
+    action_type  TEXT,
+    event_type   TEXT    NOT NULL,
+    payload_json TEXT    NOT NULL,
+    prev_hash    BLOB    NOT NULL CHECK (length(prev_hash) = 32),
+    row_hash     BLOB    NOT NULL CHECK (length(row_hash) = 32),
+    created_at   TEXT    NOT NULL
+)
+"""
+
+SQLITE_AUDIT_CHAIN_HEAD_DDL = """
+CREATE TABLE IF NOT EXISTS audit_chain_head (
+    singleton INTEGER PRIMARY KEY DEFAULT 1 CHECK (singleton = 1),
+    seq       INTEGER NOT NULL,
+    row_hash  BLOB    NOT NULL CHECK (length(row_hash) = 32)
+)
+"""
+
+# Append-only enforced in the DB (PLAN.md 5.1, the SQLite equivalent of the
+# Postgres trigger + REVOKE): a BEFORE UPDATE and a BEFORE DELETE trigger each
+# RAISE(ABORT), so no UPDATE or DELETE on audit_events can succeed through the
+# SQL surface. SQLite has no roles, so there is no REVOKE — but the triggers
+# cover both UPDATE and DELETE for every writer (SQLite is single-connection-
+# owner by nature), landing at the SAME guarantee: the audit table is
+# append-only, and the hash chain is the tamper evidence a determined owner
+# (who could DROP the trigger) cannot escape.
+SQLITE_AUDIT_NO_UPDATE_TRIGGER_DDL = """
+CREATE TRIGGER IF NOT EXISTS audit_events_no_update
+    BEFORE UPDATE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only (ADR-5): UPDATE is forbidden');
+END
+"""
+
+SQLITE_AUDIT_NO_DELETE_TRIGGER_DDL = """
+CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
+    BEFORE DELETE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only (ADR-5): DELETE is forbidden');
+END
+"""
+
+SQLITE_DDL_STATEMENTS: tuple[str, ...] = (
+    SQLITE_COMMIT_RECORDS_DDL,
+    SQLITE_INFLIGHT_INDEX_DDL,
+    SQLITE_PAUSED_RUNS_DDL,
+    SQLITE_PAUSED_APPROVED_INDEX_DDL,
+    SQLITE_PAUSED_POLLED_INDEX_DDL,
+    SQLITE_AUDIT_EVENTS_DDL,
+    SQLITE_AUDIT_CHAIN_HEAD_DDL,
+    SQLITE_AUDIT_NO_UPDATE_TRIGGER_DDL,
+    SQLITE_AUDIT_NO_DELETE_TRIGGER_DDL,
+)
+
+_SQLITE_GENESIS_INSERT_SQL = """
+INSERT INTO audit_events
+    (seq, run_id, action_type, event_type, payload_json, prev_hash, row_hash, created_at)
+VALUES
+    (0, NULL, NULL, :event_type, :payload, :prev_hash, :row_hash, :created_at)
+ON CONFLICT (seq) DO NOTHING
+"""
+
+_SQLITE_HEAD_INSERT_SQL = """
+INSERT INTO audit_chain_head (singleton, seq, row_hash)
+VALUES (1, 0, :row_hash)
+ON CONFLICT (singleton) DO NOTHING
+"""
+
+
+def seed_genesis_sqlite(conn: sqlite3.Connection) -> None:
+    """Insert the genesis row + chain head if absent (idempotent), on ``conn``.
+
+    The SQLite twin of :func:`seed_genesis`: same universal genesis constant
+    (``seq=0``, ``prev_hash`` 32 zero bytes, the documented payload, the epoch
+    ``created_at``) and the same :data:`airlock.audit.GENESIS_ROW_HASH`, so a
+    SQLite-backed chain and a Postgres-backed chain share byte-identical
+    anchors. ``ON CONFLICT DO NOTHING`` on both inserts, so repeated/concurrent
+    calls never touch an existing chain. Runs inside the caller's ``BEGIN
+    IMMEDIATE`` transaction (the store commits it).
+    """
+    from airlock._canonical import canonical_json
+    from airlock.audit import (
+        GENESIS_CREATED_AT,
+        GENESIS_EVENT_TYPE,
+        GENESIS_PAYLOAD,
+        GENESIS_ROW_HASH,
+        ZERO_HASH,
+    )
+    from airlock.store.sqlite import sqlite_dt_to_text
+
+    conn.execute(
+        _SQLITE_GENESIS_INSERT_SQL,
+        {
+            "event_type": GENESIS_EVENT_TYPE,
+            "payload": canonical_json(GENESIS_PAYLOAD),
+            "prev_hash": ZERO_HASH,
+            "row_hash": GENESIS_ROW_HASH,
+            "created_at": sqlite_dt_to_text(GENESIS_CREATED_AT),
+        },
+    )
+    conn.execute(_SQLITE_HEAD_INSERT_SQL, {"row_hash": GENESIS_ROW_HASH})
+
+
+def ensure_sqlite_schema(conn: sqlite3.Connection) -> None:
+    """Create the ledger + audit schema on a SQLite connection (idempotent).
+
+    Runs every :data:`SQLITE_DDL_STATEMENTS` statement then seeds the genesis
+    row + chain head, all inside one ``BEGIN IMMEDIATE`` transaction the store
+    opens and commits. Safe to re-run (every statement is ``IF NOT EXISTS`` /
+    ``ON CONFLICT DO NOTHING``). The DDL is dialect-rendered here; the store
+    (``airlock.store.sqlite``) owns connection setup (WAL, busy_timeout,
+    foreign_keys, synchronous) and the transaction.
+    """
+    for statement in SQLITE_DDL_STATEMENTS:
+        conn.execute(statement)
+    seed_genesis_sqlite(conn)
 
 
 #: Alias for integrators who expect the conventional name.

@@ -22,6 +22,7 @@ from sqlalchemy import text
 from airlock.audit import verify_chain
 from airlock.effects import Effect
 from airlock.pause import apply_decision, build_serialized_state
+from airlock.store import from_url
 from airlock.registry import Registry
 from airlock.types import (
     ApprovalDecision,
@@ -36,6 +37,8 @@ if TYPE_CHECKING:
 
     from airlock.store.postgres import PostgresStore
     from tests.conftest import EffectsLog
+
+pytestmark = pytest.mark.matrix
 
 ACTION = "race.refund"
 DEADLINE = 120.0
@@ -55,10 +58,8 @@ def _shared_registry(effects: EffectsLog, key: str) -> Registry:
 
 @pytest.mark.concurrency
 def test_scenario_5_barrier_raced_double_delivery_one_effect(
-    store: PostgresStore, db: Engine, effects: EffectsLog, database_url: str
+    store: PostgresStore, db: Engine, effects: EffectsLog, store_dsn: str
 ) -> None:
-    from airlock.store.postgres import PostgresStore
-
     key = "k-race-approve"
     ref = str(uuid.uuid4())
     state = build_serialized_state(
@@ -85,7 +86,7 @@ def test_scenario_5_barrier_raced_double_delivery_one_effect(
     lock = threading.Lock()
 
     def worker() -> None:
-        worker_store = PostgresStore(database_url)
+        worker_store = from_url(store_dsn)
         try:
             barrier.wait(timeout=DEADLINE)  # both fire together
             outcome = apply_decision(worker_store, ref, decision, registry=registry)
@@ -139,13 +140,11 @@ def test_scenario_5_barrier_raced_double_delivery_one_effect(
 
 @pytest.mark.concurrency
 def test_scenario_5_barrier_raced_conflicting_decisions_one_wins(
-    store: PostgresStore, db: Engine, effects: EffectsLog, database_url: str
+    store: PostgresStore, db: Engine, effects: EffectsLog, store_dsn: str
 ) -> None:
     """One thread approves, one rejects, released together: the ADR-4 DAG has no
     approved↔rejected flip, so whichever CAS lands first wins and BOTH threads
     converge on that recorded terminal outcome — never a double transition."""
-    from airlock.store.postgres import PostgresStore
-
     key = "k-race-conflict"
     ref = str(uuid.uuid4())
     state = build_serialized_state(
@@ -169,7 +168,7 @@ def test_scenario_5_barrier_raced_conflicting_decisions_one_wins(
     lock = threading.Lock()
 
     def worker(decision: ApprovalDecision) -> None:
-        worker_store = PostgresStore(database_url)
+        worker_store = from_url(store_dsn)
         try:
             barrier.wait(timeout=DEADLINE)
             outcome = apply_decision(worker_store, ref, decision, registry=registry)

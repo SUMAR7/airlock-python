@@ -38,7 +38,7 @@ from airlock import guard, init
 from airlock.effects import Effect
 from airlock.errors import ActionPending
 from airlock.policy import Policy
-from airlock.store.postgres import PostgresStore
+from airlock.store import from_url
 from airlock.transport import PauseRequest, SendReceipt
 from airlock.transport.console import ConsoleApprovalTransport
 from airlock.types import (
@@ -50,7 +50,7 @@ from airlock.types import (
     PauseStatus,
     Reversibility,
 )
-from tests._harness import EffectLogger
+from tests._harness import EffectLogger, _DelegatingStore
 
 GATE_ACTION = "pause.harness.refund"
 CRASH_EXIT_CODE = 137
@@ -98,7 +98,7 @@ class _CrashOnSendTransport:
         raise AssertionError("gate_wait=False: wait must never be called")  # pragma: no cover
 
 
-class _CrashAfterApproveCAS(PostgresStore):
+class _CrashAfterApproveCAS(_DelegatingStore):
     """A Store that ``os._exit``es right after the proposed→approved CAS lands.
 
     The crash falls in the after_approve_cas_before_commit window: the approve
@@ -127,7 +127,7 @@ class _CrashAfterApproveCAS(PostgresStore):
 def run_gate_and_crash_on_send(dsn: str, out_path: str, invoice: str) -> None:
     """Subprocess target: gate the harness tool, crashing inside transport.send."""
     os.environ["AIRLOCK_TEST_DSN"] = dsn
-    store = PostgresStore(dsn)
+    store = from_url(dsn)
     init(
         store=store,
         policy=Policy(default=Decision.GATE),
@@ -148,7 +148,7 @@ def run_gate_console_and_exit(
     The pause survives; the fresh process resumes it from the console file.
     """
     os.environ["AIRLOCK_TEST_DSN"] = dsn
-    store = PostgresStore(dsn)
+    store = from_url(dsn)
     init(
         store=store,
         policy=Policy(default=Decision.GATE),

@@ -26,6 +26,9 @@ Versioning rules by artifact:
 
 ## v1 — initial (P3.1)
 
+- Widen `CreateApprovalResponse.status` from `RequestedStatus` to `ApprovalStatus` (`requested|approved|rejected`): an idempotent replay (200) returns the run's current status, as the endpoint description already stated. Backward-compatible (response enum widening; clients parse tolerantly).
+
+
 The frozen v1 contract set.
 
 - **`openapi.yaml`** — OpenAPI 3.1, the deliberately three-call wire contract

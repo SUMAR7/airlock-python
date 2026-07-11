@@ -86,8 +86,11 @@ gate resolution (a double-delivered approval must not emit a second).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import sqlite3
+import tempfile
 import uuid
 import warnings
 from collections.abc import Callable
@@ -119,6 +122,7 @@ from airlock.reconcile import OnAbsent, reconcile
 from airlock.registry import Registry
 from airlock.store._schema import ensure_schema, seed_genesis
 from airlock.store.postgres import PostgresStore, normalize_postgres_url
+from airlock.store.sqlite import SqliteStore, sqlite_dt_to_text
 from airlock.types import (
     PAUSE_TRANSITIONS,
     TERMINAL_LEDGER_STATES,
@@ -131,6 +135,8 @@ from airlock.types import (
     Reversibility,
     Verification,
 )
+from tests.conftest import EffectsLog as _EffectsLogT
+from tests.conftest import make_effects_for_dsn
 
 # The action_event.v1 JSON Schema — I7 validates every emitted event against it.
 _SCHEMA_PATH = Path(__file__).parent.parent / "contracts" / "events" / "action_event.v1.json"
@@ -263,7 +269,7 @@ class _Downstream:
     effects_log count; ``none`` logs a raw effect on every execute.
     """
 
-    def __init__(self, effects: _EffectsLog) -> None:
+    def __init__(self, effects: _EffectsLogT) -> None:
         self._effects = effects
         # downstream key -> stored response (downstream_idempotent dedup table)
         self._di_responses: dict[str, dict[str, Any]] = {}
@@ -342,6 +348,9 @@ class CommitMachine(RuleBasedStateMachine):
     truth for ``effect_count`` is the ``effects_log`` autocommit table.
     """
 
+    #: Backend under test; the SQLite subclass flips this (P4.1 matrix).
+    SQLITE = False
+
     def __init__(self) -> None:
         super().__init__()
         self._fake_now = datetime(2026, 7, 5, 12, 0, 0, tzinfo=UTC)
@@ -355,44 +364,56 @@ class CommitMachine(RuleBasedStateMachine):
         self.gate_model: dict[str, dict[str, Any]] = {}
         #: ref -> last DB status observed (I6 watches the actual transitions).
         self._gate_last_status: dict[str, str] = {}
-        self.store = PostgresStore(DATABASE_URL, now_fn=self._now)
-        # A raw autocommit engine for schema/scoped-cleanup/inspection (never the
-        # store's pool).
-        self._raw = create_engine(
-            normalize_postgres_url(DATABASE_URL), isolation_level="AUTOCOMMIT"
-        )
-        ensure_schema(self._raw)
-        self._ensure_effects_log()
-        self.effects = _EffectsLog(DATABASE_URL)
+        # Backend selection (P4.1 matrix): Postgres shares the session test
+        # database with a per-example SCOPED reset (unique prefix + TRUNCATE the
+        # global audit chain); SQLite gets a FRESH FILE per example, so its reset
+        # is just "a new empty database" — no DELETE/TRUNCATE needed (and none is
+        # possible: audit_events is append-only). Both start from a seeded
+        # genesis and run the IDENTICAL rules/invariants.
+        if self.SQLITE:
+            self._sqlite_path: str | None = tempfile.mkstemp(prefix="airlock_prop_", suffix=".db")[
+                1
+            ]
+            self._dsn = f"sqlite:///{self._sqlite_path}?busy_timeout_ms=30000"
+            self.store = self._make_store()
+            self.store.ensure_schema()
+            self._raw = create_engine(
+                f"sqlite+pysqlite:///{self._sqlite_path}", connect_args={"timeout": 30}
+            )
+            self._ensure_effects_log()
+            self.effects = make_effects_for_dsn(self._dsn)
+        else:
+            self._sqlite_path = None
+            self._dsn = DATABASE_URL
+            self.store = self._make_store()
+            # A raw autocommit engine for schema/scoped-cleanup/inspection (never
+            # the store's pool).
+            self._raw = create_engine(
+                normalize_postgres_url(DATABASE_URL), isolation_level="AUTOCOMMIT"
+            )
+            ensure_schema(self._raw)
+            self._ensure_effects_log()
+            self.effects = make_effects_for_dsn(DATABASE_URL)
+            # SCOPED cleanup: only this suite's rows (a fresh uuid prefix means
+            # nothing to delete, but the scoped DELETE structurally guarantees the
+            # machine can never wipe another test's rows — PLAN.md 10).
+            with self._raw.connect() as conn:
+                conn.execute(
+                    text("DELETE FROM commit_records WHERE action_type LIKE :like"),
+                    {"like": f"{_PROP_PREFIX}%"},
+                )
+                conn.execute(
+                    text("DELETE FROM paused_runs WHERE action_type LIKE :like"),
+                    {"like": f"{_PROP_PREFIX}%"},
+                )
+            # Audit-chain reset (I4): the chain is GLOBAL, so per-example
+            # isolation is a fresh chain (TRUNCATE + re-seed genesis), the same
+            # reset the db fixture performs per test.
+            with self._raw.connect() as conn:
+                conn.execute(text("TRUNCATE audit_events, audit_chain_head RESTART IDENTITY"))
+            seed_genesis(self._raw)
         self.downstream = _Downstream(self.effects)
         self.model: dict[str, _KeyModel] = {}
-        # SCOPED cleanup: only this suite's rows, and only ones that could linger
-        # from an earlier prop.* example. With a fresh uuid prefix there is
-        # nothing to delete, but the scoped DELETE is the structural guarantee
-        # that the machine can never wipe another test's rows (PLAN.md 10 fix).
-        with self._raw.connect() as conn:
-            conn.execute(
-                text("DELETE FROM commit_records WHERE action_type LIKE :like"),
-                {"like": f"{_PROP_PREFIX}%"},
-            )
-            # Paused runs (P2.3) are scoped and cleaned the same way.
-            conn.execute(
-                text("DELETE FROM paused_runs WHERE action_type LIKE :like"),
-                {"like": f"{_PROP_PREFIX}%"},
-            )
-        # Audit-chain reset (I4, P2.2). The chain is GLOBAL by construction —
-        # one gapless hash chain per database — so per-example isolation cannot
-        # be a scoped DELETE (deleting audit rows is exactly what the chain
-        # exists to detect, and it would corrupt the chain for every later
-        # verify). Instead each example starts a FRESH chain: truncate + re-seed
-        # genesis, the same harness-level reset the db fixture performs per
-        # test. This is safe for the same reason the fixture's TRUNCATE is:
-        # the suite runs examples sequentially against the test database. With
-        # the chain example-scoped, the I4 invariant can verify the FULL chain
-        # after every step at O(example) cost.
-        with self._raw.connect() as conn:
-            conn.execute(text("TRUNCATE audit_events, audit_chain_head RESTART IDENTITY"))
-        seed_genesis(self._raw)
 
     def _ensure_effects_log(self) -> None:
         """Create the ground-truth ``effects_log`` table if missing.
@@ -402,27 +423,53 @@ class CommitMachine(RuleBasedStateMachine):
         the machine ensures it itself — the machine is self-contained under
         ``pytest -m property`` on a fresh database.
         """
-        with self._raw.connect() as conn:
-            conn.execute(
-                text(
-                    "CREATE TABLE IF NOT EXISTS effects_log ("
-                    " id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
-                    " idempotency_key TEXT NOT NULL,"
-                    " worker_pid INT NOT NULL,"
-                    " logged_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-                )
+        if self.SQLITE:
+            ddl = (
+                "CREATE TABLE IF NOT EXISTS effects_log ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " idempotency_key TEXT NOT NULL,"
+                " worker_pid INTEGER NOT NULL,"
+                " logged_at TEXT DEFAULT CURRENT_TIMESTAMP)"
             )
+        else:
+            ddl = (
+                "CREATE TABLE IF NOT EXISTS effects_log ("
+                " id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+                " idempotency_key TEXT NOT NULL,"
+                " worker_pid INT NOT NULL,"
+                " logged_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+        with self._raw.begin() as conn:
+            conn.execute(text(ddl))
 
     def _now(self) -> datetime:
         return self._fake_now
 
+    def _make_store(self) -> Any:
+        """Build a store for the active backend (P4.1 matrix) — used by __init__
+        and the ``restart`` rule, so a simulated restart never switches backend."""
+        if self.SQLITE:
+            assert self._sqlite_path is not None
+            return SqliteStore(self._sqlite_path, now_fn=self._now, busy_timeout_ms=30000)
+        return PostgresStore(DATABASE_URL, now_fn=self._now)
+
     def teardown(self) -> None:
         self.store.close()
         self.effects.dispose()
-        # Scoped cleanup on the way out too, so a killed run leaves no prop.* rows
-        # and this machine's effects_log rows do not accumulate in the shared
-        # table across a session. Both scopes are keyed to this suite / this
-        # machine, never another test's rows (PLAN.md 10).
+        if self.SQLITE:
+            # A fresh file per example: cleanup is just deleting it (and its WAL
+            # sidecars). No scoped DELETE — nothing is shared across examples,
+            # and audit_events is append-only anyway.
+            self._raw.dispose()
+            if self._sqlite_path is not None:
+                for suffix in ("", "-wal", "-shm"):
+                    with contextlib.suppress(OSError):
+                        os.unlink(self._sqlite_path + suffix)
+            return
+        # Postgres shares the session database: scoped cleanup on the way out too,
+        # so a killed run leaves no prop.* rows and this machine's effects_log rows
+        # do not accumulate. Both scopes are keyed to this suite / this machine,
+        # never another test's rows (PLAN.md 10).
         with self._raw.connect() as conn:
             conn.execute(
                 text("DELETE FROM commit_records WHERE action_type LIKE :like"),
@@ -665,6 +712,27 @@ class CommitMachine(RuleBasedStateMachine):
         ``close()`` too, so the abort is issued by us, deterministically — the
         row is durably still 'executing' with no partial finalize.
         """
+        if self.SQLITE:
+            # SQLite equivalent: a FRESH raw sqlite3 connection takes the write
+            # lock (BEGIN IMMEDIATE), issues the same committed UPDATE, then
+            # ROLLBACK + close (the crash). WAL guarantees the aborted write is
+            # never visible; the row stays durably 'executing' with no partial
+            # finalize.
+            assert self._sqlite_path is not None
+            conn = sqlite3.connect(self._sqlite_path, isolation_level=None)
+            try:
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE commit_records SET state = 'committed', "
+                    "result_json = '{\"leaked\": true}', committed_at = :t "
+                    "WHERE idempotency_key = :k AND attempts = :e AND state = 'executing'",
+                    {"t": sqlite_dt_to_text(self._now()), "k": key, "e": epoch},
+                )
+                conn.execute("ROLLBACK")
+            finally:
+                conn.close()
+            return
         engine = create_engine(normalize_postgres_url(DATABASE_URL), poolclass=NullPool)
         try:
             raw = engine.raw_connection()
@@ -843,7 +911,7 @@ class CommitMachine(RuleBasedStateMachine):
     def restart(self) -> None:
         """Discard in-memory owner state, keep the DB (a process restart)."""
         self.store.close()
-        self.store = PostgresStore(DATABASE_URL, now_fn=self._now)
+        self.store = self._make_store()
 
     # --- the durable-pause rules (P2.3): gate / approve / reject / dup webhook --
 
@@ -955,15 +1023,14 @@ class CommitMachine(RuleBasedStateMachine):
             rows = (
                 conn.execute(
                     text(
-                        "SELECT approval_ref::text AS ref, status FROM paused_runs"
-                        " WHERE action_type = :a"
+                        "SELECT approval_ref AS ref, status FROM paused_runs WHERE action_type = :a"
                     ),
                     {"a": self.gate_action},
                 )
                 .mappings()
                 .all()
             )
-        return {row["ref"]: row["status"] for row in rows}
+        return {str(row["ref"]): row["status"] for row in rows}
 
     # --- helpers ---------------------------------------------------------------
 
@@ -1186,6 +1253,7 @@ class CommitMachine(RuleBasedStateMachine):
                 .all()
             )
         for payload in payloads:
+            payload = json.loads(payload) if isinstance(payload, str) else payload
             _ACTION_EVENT_VALIDATOR.validate(payload)  # schema
             ActionEvent.model_validate(payload)  # and the pydantic model
 
@@ -1209,6 +1277,7 @@ class CommitMachine(RuleBasedStateMachine):
                 "(expected exactly one per terminal gate resolution)"
             )
             event = events[0]
+            event = json.loads(event) if isinstance(event, str) else event
             assert event["policy_decision"] == "gate"
             expected_human = "approved" if gm["decision"] == "approved" else "rejected"
             assert event["human_decision"] == expected_human, (
@@ -1228,6 +1297,19 @@ class CommitMachine(RuleBasedStateMachine):
 # profile — "ci" is derandomized with a fixed budget and no deadline (see
 # tests/conftest.py). No per-test override: the profile is the single knob.
 TestCommitMachine = CommitMachine.TestCase
+
+
+class CommitMachineSqlite(CommitMachine):
+    """The SAME property machine (rules + invariants I1-I7) on SqliteStore.
+
+    Single-host, but the full Section-9 property proof holds: each example
+    runs against a fresh SQLite file, so the exactly-once / audit-chain /
+    pause invariants are asserted on the sqlite backend too (P4.1)."""
+
+    SQLITE = True
+
+
+TestCommitMachineSqlite = CommitMachineSqlite.TestCase
 
 
 # ---------------------------------------------------------------------------

@@ -39,10 +39,19 @@ if TYPE_CHECKING:
 
     from airlock.store.postgres import PostgresStore
 
+pytestmark = pytest.mark.matrix
+
 ACTION = "apply.refund"
 
 APPROVE = ApprovalDecision(decision=HumanDecision.APPROVED, decided_by="usr_ok")
 REJECT = ApprovalDecision(decision=HumanDecision.REJECTED, decided_by="usr_no")
+
+
+def _as_obj(payload: Any) -> Any:
+    """JSONB (Postgres) returns a dict; TEXT (SQLite) returns a JSON string."""
+    import json as _json
+
+    return _json.loads(payload) if isinstance(payload, str) else payload
 
 
 def _persist_pause(
@@ -103,7 +112,7 @@ def _action_events(db: Engine, key: str) -> list[dict[str, Any]]:
             .scalars()
             .all()
         )
-    return list(rows)
+    return [_as_obj(r) for r in rows]
 
 
 def _pause_transitions(db: Engine, ref: str) -> list[dict[str, Any]]:
@@ -120,7 +129,7 @@ def _pause_transitions(db: Engine, ref: str) -> list[dict[str, Any]]:
             .scalars()
             .all()
         )
-    return list(rows)
+    return [_as_obj(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +376,25 @@ def test_scenario_8_stale_approval_aborts_with_both_snapshots(
 
 
 def _row_snapshot(db: Engine, ref: str) -> tuple[str, Any]:
-    """(xmin, full row) — xmin changes iff ANY write touched the row."""
+    """A write-detector snapshot of the paused row.
+
+    On Postgres, ``xmin`` (the row's writing txid) changes iff ANY write touched
+    the row, so it is the strongest no-write proof. SQLite has no xmin; the
+    equivalent proof is full-row equality (every column identical before/after)
+    plus the chain-head seq being unchanged (checked by the caller) — together
+    they prove no write occurred.
+    """
+    if db.dialect.name == "sqlite":
+        with db.connect() as conn:
+            row = (
+                conn.execute(
+                    text("SELECT * FROM paused_runs WHERE approval_ref = :ref"),
+                    {"ref": ref},
+                )
+                .mappings()
+                .one()
+            )
+        return "", dict(row)
     with db.connect() as conn:
         row = (
             conn.execute(
@@ -430,13 +457,13 @@ def test_unknown_state_version_is_refused_loudly(
     the run is untouched, and no effect runs — the scenario-6 version gate."""
     key = "k-apply-version"
     ref = _persist_pause(store, key=key)
+    ver_sql = (
+        "UPDATE paused_runs SET state_version = :v WHERE approval_ref = :ref"
+        if db.dialect.name == "sqlite"
+        else "UPDATE paused_runs SET state_version = :v WHERE approval_ref = CAST(:ref AS UUID)"
+    )
     with db.begin() as conn:
-        conn.execute(
-            text(
-                "UPDATE paused_runs SET state_version = :v WHERE approval_ref = CAST(:ref AS UUID)"
-            ),
-            {"v": STATE_VERSION + 1, "ref": ref},
-        )
+        conn.execute(text(ver_sql), {"v": STATE_VERSION + 1, "ref": ref})
     with pytest.raises(StateVersionError) as excinfo:
         apply_decision(store, ref, APPROVE, registry=_registry(effects, key))
     assert excinfo.value.found == STATE_VERSION + 1
@@ -477,38 +504,26 @@ def test_unregistered_action_type_cannot_resume(store: PostgresStore, effects: E
 
 
 def test_latency_recorded_verbatim_when_supplied(
-    db: Engine, database_url: str, fake_clock: FakeClock, effects: EffectsLog
+    clock_store: PostgresStore, fake_clock: FakeClock, effects: EffectsLog
 ) -> None:
-    from airlock.store.postgres import PostgresStore
-
-    store = PostgresStore(database_url, now_fn=fake_clock)
-    try:
-        key = "k-apply-lat-verbatim"
-        ref = _persist_pause(store, key=key)
-        decision = ApprovalDecision(
-            decision=HumanDecision.APPROVED, decided_by="usr_cp", decision_latency_ms=98765
-        )
-        apply_decision(store, ref, decision, registry=_registry(effects, key), now_fn=fake_clock)
-        run = store.load_paused_by_ref(ref)
-        assert run is not None
-        assert run.decision_latency_ms == 98765  # verbatim (PLAN.md 6.2)
-    finally:
-        store.close()
+    key = "k-apply-lat-verbatim"
+    ref = _persist_pause(clock_store, key=key)
+    decision = ApprovalDecision(
+        decision=HumanDecision.APPROVED, decided_by="usr_cp", decision_latency_ms=98765
+    )
+    apply_decision(clock_store, ref, decision, registry=_registry(effects, key), now_fn=fake_clock)
+    run = clock_store.load_paused_by_ref(ref)
+    assert run is not None
+    assert run.decision_latency_ms == 98765  # verbatim (PLAN.md 6.2)
 
 
 def test_latency_computed_from_sdk_clock_pair_when_absent(
-    db: Engine, database_url: str, fake_clock: FakeClock, effects: EffectsLog
+    clock_store: PostgresStore, fake_clock: FakeClock, effects: EffectsLog
 ) -> None:
-    from airlock.store.postgres import PostgresStore
-
-    store = PostgresStore(database_url, now_fn=fake_clock)
-    try:
-        key = "k-apply-lat-local"
-        ref = _persist_pause(store, key=key)  # created_at = T0
-        fake_clock.advance(5)  # the human takes 5 seconds
-        apply_decision(store, ref, APPROVE, registry=_registry(effects, key), now_fn=fake_clock)
-        run = store.load_paused_by_ref(ref)
-        assert run is not None
-        assert run.decision_latency_ms == 5000  # same clock pair, no skew
-    finally:
-        store.close()
+    key = "k-apply-lat-local"
+    ref = _persist_pause(clock_store, key=key)  # created_at = T0
+    fake_clock.advance(5)  # the human takes 5 seconds
+    apply_decision(clock_store, ref, APPROVE, registry=_registry(effects, key), now_fn=fake_clock)
+    run = clock_store.load_paused_by_ref(ref)
+    assert run is not None
+    assert run.decision_latency_ms == 5000  # same clock pair, no skew

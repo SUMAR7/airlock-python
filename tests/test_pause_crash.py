@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from airlock.store.postgres import PostgresStore
     from tests.conftest import EffectsLog, FakeClock
 
-pytestmark = pytest.mark.crash
+pytestmark = [pytest.mark.crash, pytest.mark.matrix]
 
 DEADLINE = 120.0
 OLDER_THAN = timedelta(seconds=60)
@@ -60,7 +60,7 @@ def _spawn(target: object, **kwargs: object) -> int:
 
 
 def test_scenario_6_gate_crash_then_fresh_process_resumes_once(
-    store: PostgresStore, db: Engine, effects: EffectsLog, database_url: str, tmp_path: Path
+    store: PostgresStore, db: Engine, effects: EffectsLog, store_dsn: str, tmp_path: Path
 ) -> None:
     """A subprocess GATES the real @guard tool and os._exit's inside
     transport.send — AFTER the pause is persisted. A FRESH process (this one)
@@ -70,7 +70,7 @@ def test_scenario_6_gate_crash_then_fresh_process_resumes_once(
     invoice = "inv_restart"
 
     exitcode = _spawn(
-        harness.run_gate_and_crash_on_send, dsn=database_url, out_path=str(out), invoice=invoice
+        harness.run_gate_and_crash_on_send, dsn=store_dsn, out_path=str(out), invoice=invoice
     )
     assert exitcode == CRASH_EXIT_CODE, f"expected os._exit({CRASH_EXIT_CODE}), got {exitcode}"
 
@@ -92,7 +92,7 @@ def test_scenario_6_gate_crash_then_fresh_process_resumes_once(
     # process's default registry, so apply_decision can rebuild the call.
     import os
 
-    os.environ["AIRLOCK_TEST_DSN"] = database_url
+    os.environ["AIRLOCK_TEST_DSN"] = store_dsn
     assert GATE_ACTION in default_registry
     outcome = apply_decision(
         store, ref, ApprovalDecision(decision=HumanDecision.APPROVED, decided_by="usr_fresh")
@@ -165,7 +165,7 @@ def _persist_and_capture_ref(store: PostgresStore, key: str, invoice: str) -> st
 
 
 def test_after_approve_cas_before_commit_redelivery_drives_to_committed(
-    store: PostgresStore, db: Engine, effects: EffectsLog, database_url: str
+    store: PostgresStore, db: Engine, effects: EffectsLog, store_dsn: str
 ) -> None:
     """A subprocess applies APPROVE and crashes right after the proposed→approved
     CAS commits, before commit_once. Durable state: approved, ledger empty, no
@@ -173,12 +173,12 @@ def test_after_approve_cas_before_commit_redelivery_drives_to_committed(
     CAS is not a no-op (the ensure-committed proof)."""
     import os
 
-    os.environ["AIRLOCK_TEST_DSN"] = database_url
+    os.environ["AIRLOCK_TEST_DSN"] = store_dsn
     invoice = "inv_cas"
     key = "k-cas-redeliver"
     ref = _persist_and_capture_ref(store, key, invoice)
 
-    exitcode = _spawn(harness.run_apply_crash_after_cas, dsn=database_url, approval_ref=ref)
+    exitcode = _spawn(harness.run_apply_crash_after_cas, dsn=store_dsn, approval_ref=ref)
     assert exitcode == CRASH_EXIT_CODE
 
     # Durable window: approved, but nothing committed and no effect fired.
@@ -203,31 +203,36 @@ def test_after_approve_cas_before_commit_sweep_drives_to_committed(
     fake_clock: FakeClock,
     db: Engine,
     effects: EffectsLog,
-    database_url: str,
+    store_dsn: str,
 ) -> None:
     """The SAME crash window, closed by the reconciler sweep instead of a
     redelivery: no approval ever arrives again, but reconcile_paused finds the
     stale approved row and ensures-committed it (one effect)."""
     import os
 
-    os.environ["AIRLOCK_TEST_DSN"] = database_url
+    os.environ["AIRLOCK_TEST_DSN"] = store_dsn
     invoice = "inv_cas_sweep"
     key = "k-cas-sweep"
     # Persist + approve on the fake-clock store (decided_at = T0), then crash the
     # commit in a subprocess (the subprocess uses a real clock, but only touches
     # the ledger, which it never reaches — it dies right after the approve CAS).
     ref = _persist_and_capture_ref(clock_store, key, invoice)
-    exitcode = _spawn(harness.run_apply_crash_after_cas, dsn=database_url, approval_ref=ref)
+    exitcode = _spawn(harness.run_apply_crash_after_cas, dsn=store_dsn, approval_ref=ref)
     assert exitcode == CRASH_EXIT_CODE
     assert effects.count(effect_key(invoice)) == 0
 
     # The subprocess stamped decided_at from its own real clock; rebase it onto
     # the fake-clock timeline so advancing the clock makes the row stale.
+    if db.dialect.name == "sqlite":
+        from airlock.store.sqlite import sqlite_dt_to_text
+
+        update_sql = "UPDATE paused_runs SET decided_at = :t WHERE approval_ref = :r"
+        bound_t: object = sqlite_dt_to_text(fake_clock())
+    else:
+        update_sql = "UPDATE paused_runs SET decided_at = :t WHERE approval_ref = CAST(:r AS UUID)"
+        bound_t = fake_clock()
     with db.begin() as conn:
-        conn.execute(
-            text("UPDATE paused_runs SET decided_at = :t WHERE approval_ref = CAST(:r AS UUID)"),
-            {"t": fake_clock(), "r": ref},
-        )
+        conn.execute(text(update_sql), {"t": bound_t, "r": ref})
     fake_clock.advance(120)  # past OLDER_THAN → stale approved
 
     report = reconcile_paused(clock_store, older_than=OLDER_THAN, now_fn=fake_clock)

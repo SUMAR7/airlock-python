@@ -22,6 +22,7 @@ import pytest
 from sqlalchemy import text
 
 from airlock.audit import verify_chain
+from airlock.store import from_url
 from airlock.types import AuditEvent
 
 if TYPE_CHECKING:
@@ -31,6 +32,8 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
     from airlock.store.postgres import PostgresStore
+
+pytestmark = pytest.mark.matrix
 
 WORKERS = 8
 APPENDS_PER_WORKER = 5
@@ -45,9 +48,7 @@ def _append_worker(
     results: Queue[dict[str, Any]],
 ) -> None:
     """One appending process. Runs in a spawn child."""
-    from airlock.store.postgres import PostgresStore
-
-    store = PostgresStore(dsn)
+    store = from_url(dsn)
     try:
         barrier.wait(timeout=DEADLINE)  # all 8 released simultaneously
         seqs: list[int] = []
@@ -70,14 +71,14 @@ def _append_worker(
 
 @pytest.mark.concurrency
 def test_concurrent_appenders_produce_one_linear_verifiable_chain(
-    store: PostgresStore, db: Engine, database_url: str
+    store: PostgresStore, db: Engine, store_dsn: str
 ) -> None:
     ctx = multiprocessing.get_context("spawn")
     barrier = ctx.Barrier(WORKERS)
     results_queue: Queue[dict[str, Any]] = ctx.Queue()
 
     processes = [
-        ctx.Process(target=_append_worker, args=(database_url, barrier, results_queue), daemon=True)
+        ctx.Process(target=_append_worker, args=(store_dsn, barrier, results_queue), daemon=True)
         for _ in range(WORKERS)
     ]
     results: list[dict[str, Any]] = []

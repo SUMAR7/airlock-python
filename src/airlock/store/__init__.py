@@ -293,13 +293,28 @@ class Store(Protocol):
         ``airlock.audit.verify_chain`` read path (O(n) single pass)."""
         ...
 
+    def close(self) -> None:
+        """Release the store's resources (connection pool / connections).
+
+        Idempotent-safe to call once when the store is no longer needed; a store
+        is not usable after ``close``. Both backends implement it (PostgresStore
+        disposes the SQLAlchemy pool; SqliteStore closes its per-thread
+        connections)."""
+        ...
+
 
 def from_url(url: str) -> Store:
-    """Build a Store from a DSN. P1.1 dispatches ``postgresql://`` only.
+    """Build a Store from a DSN.
 
-    SQLite is a Phase 4 quickstart deliverable (PLAN.md section 10, point 10)
-    and the in-memory unit-test store lands with the store matrix — neither
-    exists yet, by design.
+    - ``postgresql://`` / ``postgres://`` -> :class:`PostgresStore` (needs the
+      ``postgres`` extra: sqlalchemy + psycopg).
+    - ``sqlite://`` -> :class:`~airlock.store.sqlite.SqliteStore` (stdlib
+      ``sqlite3``, no extra) — the P4.1 quickstart / dev / single-host store
+      (``sqlite:///airlock.db`` relative, ``sqlite:////abs.db`` absolute; an
+      optional ``?busy_timeout_ms=`` tunes lock waiting).
+
+    Any in-memory unit-test store is deliberately NOT selectable here — a
+    test-only store must never be reachable by a production DSN (PLAN.md 3.7).
     """
     if "://" not in url:
         raise ValueError(f"not a DSN: {url!r} (expected e.g. postgresql://host/db)")
@@ -314,7 +329,13 @@ def from_url(url: str) -> Store:
                 "(sqlalchemy + psycopg): pip install 'airlock[postgres]'"
             ) from exc
         return PostgresStore(url)
+    if dialect == "sqlite":
+        from airlock.store.sqlite import SqliteStore
+
+        store = SqliteStore(url)
+        store.ensure_schema()
+        return store
     raise NotImplementedError(
-        f"no Store backend for URL scheme {scheme!r} in P1.1 — Postgres is the substrate "
-        "of record (PLAN.md section 7); SQLite arrives in P4.1 (PLAN.md section 8)."
+        f"no Store backend for URL scheme {scheme!r}: airlock speaks postgresql:// "
+        "(the production substrate) and sqlite:// (the single-host quickstart)."
     )

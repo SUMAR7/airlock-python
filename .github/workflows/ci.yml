@@ -98,48 +98,99 @@ jobs:
       - name: Type check
         run: uv run mypy src tests
 
-      # The full suite once — includes the Hypothesis property machine
-      # (tests/test_property_commit.py, -m property) under the derandomized "ci"
-      # profile selected by CI=true above, plus the no-time.sleep guard applied
-      # to every test (a stray test-level sleep fails here).
-      - name: Test
+      # The full suite once — runs the store-backed suites on BOTH backends
+      # (P4.1: the `matrix`-marked files fan out over postgres + sqlite), the
+      # Hypothesis property machine (both backends, -m property) under the
+      # derandomized "ci" profile selected by CI=true above, plus the
+      # no-time.sleep guard applied to every test.
+      - name: Test (both backends)
         run: uv run pytest
 
-      # P1.4 DoD (PLAN.md 8): raise the determinism gate to 20 CONSECUTIVE runs
-      # for concurrency AND race AND crash — an intermittent failure in any of
-      # these is a live P0 race (SPEC section 9/10: a flaky commit test blocks
-      # merge because flakiness here means a REAL race, never noise). Was 10x in
-      # P1.1/P1.3; P1.4 doubles it and adds the crash leg.
-      - name: Concurrency suite x20
+      # P1.4 DoD (PLAN.md 8): the determinism gate is 20 CONSECUTIVE runs for
+      # concurrency AND race AND crash — an intermittent failure is a live P0
+      # race (SPEC section 9/10). Scoped to the POSTGRES leg here (`-k postgres`)
+      # so this job's budget is unchanged; the sqlite legs get their own 20x gate
+      # in the postgres-free `test-sqlite` job below (P4.1).
+      - name: Concurrency suite x20 (postgres)
         run: |
           for i in $(seq 1 20); do
             echo "--- concurrency run $i/20"
-            uv run pytest -m concurrency || exit 1
+            uv run pytest -m concurrency -k postgres || exit 1
           done
 
-      - name: Race suite x20
+      - name: Race suite x20 (postgres)
         run: |
           for i in $(seq 1 20); do
             echo "--- race run $i/20"
             uv run pytest -m race || exit 1
           done
 
-      - name: Crash suite x20
+      - name: Crash suite x20 (postgres)
         run: |
           for i in $(seq 1 20); do
             echo "--- crash run $i/20"
-            uv run pytest -m crash || exit 1
+            uv run pytest -m crash -k postgres || exit 1
           done
 
-      # The Hypothesis property machine, run several extra times under the
-      # derandomized CI profile as its own leg so a determinism regression in the
-      # property layer (I1-I5) is caught even if the single Test run above passed
-      # by luck of ordering. Kept to a few consecutive runs (the property budget
-      # is minutes, not tens of minutes — PLAN.md 8); the nightly profile
-      # (documented in conftest) explores the large-example space on a cron.
-      - name: Property suite x3 (derandomized)
+      - name: Property suite x3 (postgres, derandomized)
         run: |
           for i in $(seq 1 3); do
             echo "--- property run $i/3"
-            uv run pytest -m property || exit 1
+            uv run pytest -m property -k "not sqlite" || exit 1
+          done
+
+  # P4.1: the SQLite store passes the FULL Section-9 matrix on a SINGLE HOST with
+  # NO Postgres server — this job proves exactly that. It installs sqlalchemy
+  # (only for the test-side raw reads; the store itself is stdlib sqlite3) but
+  # starts NO postgres service, and runs ONLY the sqlite matrix legs (`-k
+  # sqlite`). The determinism gate (concurrency/crash/property x consecutive
+  # runs) is the same brutal gate the postgres job applies — a flake here is a
+  # real race in the sqlite store. SQLite is fast, so this stays cheap.
+  test-sqlite:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    env:
+      CI: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # sqlalchemy (the postgres extra) backs the test-side raw reads only; the
+      # SqliteStore under test uses stdlib sqlite3 and needs no extra. NO postgres
+      # service is provisioned — the sqlite leg must be server-free.
+      - name: Sync dependencies (dev group + postgres + http extras)
+        run: uv sync --locked --extra postgres --extra http
+
+      # The full sqlite matrix once (correctness on the single-host store).
+      - name: Test (sqlite matrix, no postgres server)
+        run: uv run pytest -k sqlite
+
+      - name: Concurrency suite x20 (sqlite)
+        run: |
+          for i in $(seq 1 20); do
+            echo "--- sqlite concurrency run $i/20"
+            uv run pytest -m concurrency -k sqlite || exit 1
+          done
+
+      - name: Crash suite x20 (sqlite)
+        run: |
+          for i in $(seq 1 20); do
+            echo "--- sqlite crash run $i/20"
+            uv run pytest -m crash -k sqlite || exit 1
+          done
+
+      - name: Property suite x3 (sqlite, derandomized)
+        run: |
+          for i in $(seq 1 3); do
+            echo "--- sqlite property run $i/3"
+            uv run pytest -m property -k sqlite || exit 1
           done

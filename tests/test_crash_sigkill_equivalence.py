@@ -33,6 +33,7 @@ import signal
 from typing import TYPE_CHECKING
 
 import pytest
+
 from airlock.store import from_url
 from airlock.types import Guarantee, LedgerState
 from tests.conftest import EffectsLog, make_effects_for_dsn, read_row

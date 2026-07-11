@@ -93,7 +93,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -166,6 +166,11 @@ def sqlite_text_to_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
+def _require_dt(value: str) -> datetime:
+    """Parse a NOT NULL timestamp column (never ``None``) to a tz-aware datetime."""
+    return datetime.fromisoformat(value)
+
+
 def sqlite_path_from_url(url: str) -> str:
     """Extract the database file path (and no query) from a ``sqlite://`` DSN.
 
@@ -228,8 +233,8 @@ def _row_to_record(row: sqlite3.Row) -> CommitRecord:
         result_json=_json_or_none(row["result_json"]),
         error_json=_json_or_none(row["error_json"]),
         attempts=row["attempts"],
-        last_attempt_at=sqlite_text_to_dt(row["last_attempt_at"]),
-        created_at=sqlite_text_to_dt(row["created_at"]),
+        last_attempt_at=_require_dt(row["last_attempt_at"]),
+        created_at=_require_dt(row["created_at"]),
         committed_at=sqlite_text_to_dt(row["committed_at"]),
     )
 
@@ -250,7 +255,7 @@ def _row_to_paused(row: sqlite3.Row) -> PausedRun:
         decided_by_display=row["decided_by_display"],
         decided_at=sqlite_text_to_dt(row["decided_at"]),
         decision_latency_ms=row["decision_latency_ms"],
-        created_at=sqlite_text_to_dt(row["created_at"]),
+        created_at=_require_dt(row["created_at"]),
         resolved_at=sqlite_text_to_dt(row["resolved_at"]),
     )
 
@@ -265,7 +270,7 @@ def _row_to_audit(row: sqlite3.Row) -> AuditRow:
         payload=json.loads(row["payload_json"]),
         prev_hash=bytes(row["prev_hash"]),
         row_hash=bytes(row["row_hash"]),
-        created_at=sqlite_text_to_dt(row["created_at"]),
+        created_at=_require_dt(row["created_at"]),
     )
 
 
@@ -358,7 +363,9 @@ _AUDIT_INSERT_SQL = """
     RETURNING *
 """
 
-_AUDIT_HEAD_UPDATE_SQL = "UPDATE audit_chain_head SET seq = :seq, row_hash = :row_hash WHERE singleton = 1"
+_AUDIT_HEAD_UPDATE_SQL = (
+    "UPDATE audit_chain_head SET seq = :seq, row_hash = :row_hash WHERE singleton = 1"
+)
 
 _AUDIT_ITER_SQL = "SELECT * FROM audit_events WHERE seq >= :start ORDER BY seq"
 
@@ -523,10 +530,8 @@ class SqliteStore:
             conns = list(self._all_conns)
             self._all_conns.clear()
         for conn in conns:
-            try:
+            with suppress(sqlite3.Error):  # best-effort teardown
                 conn.close()
-            except sqlite3.Error:  # pragma: no cover - best-effort teardown
-                pass
         self._local = threading.local()
 
     # -- ledger (ADR-1) -------------------------------------------------------
@@ -679,9 +684,7 @@ class SqliteStore:
                 if audit is not None:
                     self._append_audit_on(conn, audit)
                 return PauseClaim(created=True, run=_row_to_paused(inserted))
-            existing = conn.execute(
-                _LOAD_PAUSED_BY_KEY_SQL, {"key": idempotency_key}
-            ).fetchone()
+            existing = conn.execute(_LOAD_PAUSED_BY_KEY_SQL, {"key": idempotency_key}).fetchone()
         if existing is None:
             raise AirlockError(
                 f"save_paused for key {idempotency_key!r} conflicted but the row is gone — "

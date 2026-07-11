@@ -86,14 +86,15 @@ gate resolution (a double-delivered approval must not emit a second).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import sqlite3
+import tempfile
 import uuid
 import warnings
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-import sqlite3
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -122,7 +123,6 @@ from airlock.registry import Registry
 from airlock.store._schema import ensure_schema, seed_genesis
 from airlock.store.postgres import PostgresStore, normalize_postgres_url
 from airlock.store.sqlite import SqliteStore, sqlite_dt_to_text
-from tests.conftest import make_effects_for_dsn
 from airlock.types import (
     PAUSE_TRANSITIONS,
     TERMINAL_LEDGER_STATES,
@@ -135,6 +135,8 @@ from airlock.types import (
     Reversibility,
     Verification,
 )
+from tests.conftest import EffectsLog as _EffectsLogT
+from tests.conftest import make_effects_for_dsn
 
 # The action_event.v1 JSON Schema — I7 validates every emitted event against it.
 _SCHEMA_PATH = Path(__file__).parent.parent / "contracts" / "events" / "action_event.v1.json"
@@ -267,7 +269,7 @@ class _Downstream:
     effects_log count; ``none`` logs a raw effect on every execute.
     """
 
-    def __init__(self, effects: _EffectsLog) -> None:
+    def __init__(self, effects: _EffectsLogT) -> None:
         self._effects = effects
         # downstream key -> stored response (downstream_idempotent dedup table)
         self._di_responses: dict[str, dict[str, Any]] = {}
@@ -369,7 +371,9 @@ class CommitMachine(RuleBasedStateMachine):
         # possible: audit_events is append-only). Both start from a seeded
         # genesis and run the IDENTICAL rules/invariants.
         if self.SQLITE:
-            self._sqlite_path = tempfile.mkstemp(prefix="airlock_prop_", suffix=".db")[1]
+            self._sqlite_path: str | None = tempfile.mkstemp(prefix="airlock_prop_", suffix=".db")[
+                1
+            ]
             self._dsn = f"sqlite:///{self._sqlite_path}?busy_timeout_ms=30000"
             self.store = self._make_store()
             self.store.ensure_schema()
@@ -445,6 +449,7 @@ class CommitMachine(RuleBasedStateMachine):
         """Build a store for the active backend (P4.1 matrix) — used by __init__
         and the ``restart`` rule, so a simulated restart never switches backend."""
         if self.SQLITE:
+            assert self._sqlite_path is not None
             return SqliteStore(self._sqlite_path, now_fn=self._now, busy_timeout_ms=30000)
         return PostgresStore(DATABASE_URL, now_fn=self._now)
 
@@ -458,10 +463,8 @@ class CommitMachine(RuleBasedStateMachine):
             self._raw.dispose()
             if self._sqlite_path is not None:
                 for suffix in ("", "-wal", "-shm"):
-                    try:
+                    with contextlib.suppress(OSError):
                         os.unlink(self._sqlite_path + suffix)
-                    except OSError:
-                        pass
             return
         # Postgres shares the session database: scoped cleanup on the way out too,
         # so a killed run leaves no prop.* rows and this machine's effects_log rows
@@ -715,6 +718,7 @@ class CommitMachine(RuleBasedStateMachine):
             # ROLLBACK + close (the crash). WAL guarantees the aborted write is
             # never visible; the row stays durably 'executing' with no partial
             # finalize.
+            assert self._sqlite_path is not None
             conn = sqlite3.connect(self._sqlite_path, isolation_level=None)
             try:
                 conn.execute("PRAGMA busy_timeout=30000")
@@ -1019,8 +1023,7 @@ class CommitMachine(RuleBasedStateMachine):
             rows = (
                 conn.execute(
                     text(
-                        "SELECT approval_ref AS ref, status FROM paused_runs"
-                        " WHERE action_type = :a"
+                        "SELECT approval_ref AS ref, status FROM paused_runs WHERE action_type = :a"
                     ),
                     {"a": self.gate_action},
                 )

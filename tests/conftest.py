@@ -36,7 +36,6 @@ if TYPE_CHECKING:
 
     from sqlalchemy.engine import Engine
 
-    from airlock.store.postgres import PostgresStore
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/airlock_test")
 
@@ -236,6 +235,7 @@ def make_effects_for_dsn(dsn: str) -> EffectsLog:
     engine = create_engine(normalize_postgres_url(dsn), isolation_level="AUTOCOMMIT")
     return EffectsLog(engine, use_pg_pid=True, owns_engine=True)
 
+
 # ---------------------------------------------------------------------------
 # Hypothesis profiles (PLAN.md 7 / SPEC.md 9 / P1.4 deliverable 4).
 #
@@ -398,8 +398,7 @@ class EffectsLog:
             else:
                 conn.execute(
                     text(
-                        "INSERT INTO effects_log (idempotency_key, worker_pid)"
-                        " VALUES (:key, :pid)"
+                        "INSERT INTO effects_log (idempotency_key, worker_pid) VALUES (:key, :pid)"
                     ),
                     {"key": key, "pid": os.getpid()},
                 )
@@ -521,13 +520,17 @@ def read_row(engine: Any, key: str) -> _Row:
     from sqlalchemy import text
 
     with engine.connect() as conn:
-        row = conn.execute(
-            text(
-                "SELECT state, guarantee, attempts, downstream_key, result_json, error_json,"
-                " committed_at FROM commit_records WHERE idempotency_key = :key"
-            ),
-            {"key": key},
-        ).mappings().one()
+        row = (
+            conn.execute(
+                text(
+                    "SELECT state, guarantee, attempts, downstream_key, result_json, error_json,"
+                    " committed_at FROM commit_records WHERE idempotency_key = :key"
+                ),
+                {"key": key},
+            )
+            .mappings()
+            .one()
+        )
     return _Row(dict(row))
 
 

@@ -293,6 +293,15 @@ class Store(Protocol):
         ``airlock.audit.verify_chain`` read path (O(n) single pass)."""
         ...
 
+    def close(self) -> None:
+        """Release the store's resources (connection pool / connections).
+
+        Idempotent-safe to call once when the store is no longer needed; a store
+        is not usable after ``close``. Both backends implement it (PostgresStore
+        disposes the SQLAlchemy pool; SqliteStore closes its per-thread
+        connections)."""
+        ...
+
 
 def from_url(url: str) -> Store:
     """Build a Store from a DSN.

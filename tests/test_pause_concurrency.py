@@ -22,8 +22,8 @@ from sqlalchemy import text
 from airlock.audit import verify_chain
 from airlock.effects import Effect
 from airlock.pause import apply_decision, build_serialized_state
-from airlock.store import from_url
 from airlock.registry import Registry
+from airlock.store import from_url
 from airlock.types import (
     ApprovalDecision,
     HumanDecision,

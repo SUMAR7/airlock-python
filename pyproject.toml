@@ -77,4 +77,5 @@ markers = [
     "crash: subprocess crash-injection tests (os._exit / SIGKILL mid-flight) (SPEC section 9)",
     "race: named race tests, e.g. slow-owner-vs-reconciler epoch fence (PLAN section 7)",
     "property: the Hypothesis property machine (I1-I5) — derandomized on CI (PLAN section 7)",
+    "e2e: the cross-repo real-Rails E2E (P3.4) — boots airlock-cloud; skipped where ruby/pg absent",
 ]

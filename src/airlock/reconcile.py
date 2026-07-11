@@ -75,7 +75,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import JsonValue
 
@@ -86,9 +86,11 @@ from airlock.types import AuditEvent, CommitRecord, Guarantee, LedgerState, Veri
 
 if TYPE_CHECKING:
     from airlock.events import EventSink
+    from airlock.types import ApprovalDecision
 
 __all__ = [
     "RECONCILE_EVENT_TYPE",
+    "DecisionPoller",
     "ExecuteWindow",
     "OnAbsent",
     "Outcome",
@@ -96,11 +98,28 @@ __all__ = [
     "PausedSweepReport",
     "ReconcileAction",
     "ReconcileReport",
+    "backstop_poll_paused",
     "reconcile",
     "reconcile_key",
     "reconcile_on_startup",
     "reconcile_paused",
 ]
+
+
+class DecisionPoller(Protocol):
+    """The one method the backstop poll needs from a control-plane transport.
+
+    :class:`~airlock.transport.http.HttpApprovalTransport` satisfies it. Typed
+    structurally (not by import) so :mod:`airlock.reconcile` stays import-light —
+    the httpx-backed transport lives in the ``http`` extra and is never imported
+    here.
+    """
+
+    def fetch_decision(self, approval_id: str) -> ApprovalDecision | None:
+        """One signed poll: the decision for ``approval_id``, or ``None`` if
+        still undecided."""
+        ...
+
 
 #: The ``audit_events.event_type`` for reconciler evidence rows (PLAN.md 4.2:
 #: recovered / escalation events are audit events — chained as of P2.2).
@@ -506,6 +525,100 @@ def reconcile_paused(
             )
         )
     return report
+
+
+def backstop_poll_paused(
+    store: Any,
+    transport: DecisionPoller,
+    *,
+    older_than: timedelta,
+    registry: Registry | None = None,
+    event_sinks: Sequence[EventSink] = (),
+    reconcile_after: timedelta | None = None,
+    execute_timeout: timedelta | None = None,
+    now_fn: Callable[[], datetime] = _utcnow,
+) -> PausedSweepReport:
+    """Poll the control plane for decisions the ``approval.decided`` webhook never
+    delivered, and drive them home (PLAN.md 6.2 — the reconciler backstop).
+
+    The webhook push is the FAST path; this is the backstop that closes the loop
+    when it never arrives (the customer runs no endpoint, or the endpoint was
+    down and the delivery retries exhausted). It scans
+    ``store.stale_polled_paused(older_than)`` — still-``proposed`` runs carrying a
+    hosted ``approval_id`` older than the threshold — and for each one performs a
+    single signed GET (``transport.fetch_decision``); when the control plane
+    reports a decision, it drives that decision through
+    :func:`airlock.pause.apply_decision` (ADR-4 ensure-committed), so the commit
+    LEDGER dedupes against any push that races it — exactly one effect no matter
+    which path wins. A run the control plane still reports ``requested`` (poll
+    returns ``None``) is left ``proposed`` for the next pass: this NEVER invents a
+    decision and NEVER expires a proposed run (no TTL, ADR-4).
+
+    Kept OFF the ``commit_once`` hot path and separate from the in-flight ledger
+    reconciler (:func:`reconcile`): the backstop is an approval-recovery concern,
+    intended for the same cron/startup invocation as :func:`reconcile_paused`.
+
+    A run whose poll raises (transport/network error), whose ``apply_decision``
+    cannot resolve this pass (a :class:`~airlock.errors.VerificationUnknown`, an
+    unregistered ``action_type``, or any raise) is recorded and LEFT for the next
+    pass — one bad row never aborts the sweep mid-scan (best-effort, like the
+    in-flight reconciler's evidence writes).
+
+    Args:
+        store: the customer's Store (paused rows + ledger + audit chain).
+        transport: a :class:`DecisionPoller` (the
+            :class:`~airlock.transport.http.HttpApprovalTransport`) — polled once
+            per stale run for its decision.
+        older_than: the staleness threshold; a proposed run is polled once its
+            ``created_at`` is older than ``now_fn() - older_than``.
+        registry / event_sinks / reconcile_after / execute_timeout / now_fn:
+            forwarded to ``apply_decision`` exactly as :func:`reconcile_paused`.
+
+    Returns:
+        A :class:`PausedSweepReport` — per-run actions (status after the drive,
+        ``"undecided"`` when the poll found no decision, ``"error"`` on a raise)
+        plus a tally by outcome.
+    """
+    from airlock.pause import apply_decision  # lazy: avoid a module import cycle
+
+    report = PausedSweepReport()
+    for run in store.stale_polled_paused(older_than):
+        if run.approval_id is None:  # pragma: no cover — the scan filters these out
+            continue
+        try:
+            decision = transport.fetch_decision(run.approval_id)
+        except Exception as exc:
+            report._record(_poll_action(run, "error", f"poll: {type(exc).__name__}: {exc}"))
+            continue
+        if decision is None:
+            report._record(_poll_action(run, "undecided", "control plane still 'requested'"))
+            continue
+        try:
+            outcome = apply_decision(
+                store,
+                run.approval_ref,
+                decision,
+                registry=registry,
+                event_sinks=event_sinks,
+                reconcile_after=reconcile_after,
+                execute_timeout=execute_timeout,
+                now_fn=now_fn,
+            )
+        except Exception as exc:
+            report._record(_poll_action(run, "error", f"apply: {type(exc).__name__}: {exc}"))
+            continue
+        report._record(_poll_action(run, outcome.status.value))
+    return report
+
+
+def _poll_action(run: Any, outcome: str, detail: str | None = None) -> PausedSweepAction:
+    return PausedSweepAction(
+        approval_ref=run.approval_ref,
+        run_id=run.run_id,
+        action_type=run.action_type,
+        outcome=outcome,
+        detail=detail,
+    )
 
 
 _IN_FLIGHT = frozenset({LedgerState.PENDING, LedgerState.EXECUTING})

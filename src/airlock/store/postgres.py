@@ -223,6 +223,33 @@ _STALE_APPROVED_SQL = text(
     """
 )
 
+# Persist the hosted approval_id (P3.4): the @guard GATE path records the id
+# from the create response so the reconciler backstop poll (GET
+# /api/v1/approvals/{approval_id}) can recover a decision when the webhook never
+# arrives. A plain keyed UPDATE — the paused row is already durable — matching
+# on run_id; rowcount is the truth about whether it landed.
+_SET_APPROVAL_ID_SQL = text(
+    "UPDATE paused_runs SET approval_id = :approval_id WHERE run_id = :run_id"
+)
+
+# The backstop-poll scan (PLAN.md 4.2 / 6.2): still-PROPOSED runs that carry a
+# hosted approval_id and are older than the threshold — a webhook that never
+# landed. The SDK polls each via the HttpApprovalTransport and drives any
+# decision home through apply_decision. Oldest first; SKIP LOCKED so two
+# sweeps never poll the same row (the partial index paused_runs_polled_idx
+# supports it). This NEVER expires/aborts a proposed run (no TTL, ADR-4) — it
+# only pulls a decision the control plane already has.
+_STALE_POLLED_SQL = text(
+    f"""
+    SELECT * FROM paused_runs
+     WHERE status = '{PauseStatus.PROPOSED.value}'
+       AND approval_id IS NOT NULL
+       AND created_at < :cutoff
+     ORDER BY created_at
+     FOR UPDATE SKIP LOCKED
+    """
+)
+
 
 def _transition_paused_sql(with_decision: bool) -> Any:
     decision_sets = (
@@ -570,6 +597,29 @@ class PostgresStore:
         # from apply_decision's idempotence (the ledger dedupes appliers).
         with self._engine.begin() as conn:
             rows = conn.execute(_STALE_APPROVED_SQL, {"cutoff": cutoff}).mappings().all()
+        return [_row_to_paused(row) for row in rows]
+
+    def set_approval_id(self, run_id: str, approval_id: str) -> bool:
+        """Persist the hosted ``approval_id`` on a paused run (P3.4 backstop).
+
+        The GATE path records it from the create response so the reconciler
+        backstop poll can recover a decision by ``approval_id`` when the webhook
+        never arrives. Returns ``False`` if no row matched ``run_id`` (the run
+        vanished — never in normal flow, since paused rows are never deleted).
+        """
+        with self._engine.begin() as conn:
+            rowcount = conn.execute(
+                _SET_APPROVAL_ID_SQL, {"run_id": run_id, "approval_id": approval_id}
+            ).rowcount
+        return rowcount == 1
+
+    def stale_polled_paused(self, older_than: timedelta) -> list[PausedRun]:
+        cutoff = self._now_fn() - older_than
+        # SKIP LOCKED like the other sweeps: two backstop passes never poll the
+        # same row. This scan surfaces still-PROPOSED runs whose decision a
+        # webhook never delivered; the caller polls the control plane for each.
+        with self._engine.begin() as conn:
+            rows = conn.execute(_STALE_POLLED_SQL, {"cutoff": cutoff}).mappings().all()
         return [_row_to_paused(row) for row in rows]
 
     def append_audit(self, event: AuditEvent) -> AuditRow:

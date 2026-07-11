@@ -36,6 +36,8 @@ __all__ = [
     "COMMIT_RECORDS_DDL",
     "DDL_STATEMENTS",
     "INFLIGHT_INDEX_DDL",
+    "PAUSED_APPROVED_INDEX_DDL",
+    "PAUSED_POLLED_INDEX_DDL",
     "PAUSED_RUNS_DDL",
     "create_tables",
     "ensure_schema",
@@ -120,6 +122,14 @@ CREATE INDEX IF NOT EXISTS paused_runs_approved_idx ON paused_runs (decided_at)
     WHERE status = '{PauseStatus.APPROVED.value}'
 """
 
+# Supports the reconciler's backstop-poll sweep (P3.4, PLAN.md 6.2): still-
+# proposed runs carrying a hosted approval_id whose decided webhook never
+# landed. Partial like the approved index — decided rows never re-enter it.
+PAUSED_POLLED_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS paused_runs_polled_idx ON paused_runs (created_at)
+    WHERE status = '{PauseStatus.PROPOSED.value}' AND approval_id IS NOT NULL
+"""
+
 # --- The audit chain (P2.2, ADR-5) — DDL exactly per PLAN.md 5.1 -------------
 
 AUDIT_EVENTS_DDL = """
@@ -176,6 +186,7 @@ DDL_STATEMENTS: tuple[str, ...] = (
     INFLIGHT_INDEX_DDL,
     PAUSED_RUNS_DDL,
     PAUSED_APPROVED_INDEX_DDL,
+    PAUSED_POLLED_INDEX_DDL,
     AUDIT_EVENTS_DDL,
     AUDIT_CHAIN_HEAD_DDL,
     AUDIT_APPEND_ONLY_FUNCTION_DDL,

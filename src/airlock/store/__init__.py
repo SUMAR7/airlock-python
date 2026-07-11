@@ -243,6 +243,29 @@ class Store(Protocol):
         there is no TTL expiry in v1 (ADR-4 is locked)."""
         ...
 
+    def set_approval_id(self, run_id: str, approval_id: str) -> bool:
+        """Persist the hosted ``approval_id`` on a paused run (P3.4 backstop).
+
+        The ``@guard`` GATE path calls this after ``transport.send`` returns the
+        hosted id (PLAN.md 5.1: ``paused_runs.approval_id`` == "backstop-poll
+        URL"), so the reconciler can recover a decision by ``approval_id`` when
+        the ``approval.decided`` webhook never arrives. Keyed on ``run_id``;
+        returns ``False`` if no row matched (rows are never deleted, so this is
+        the vanished case, not normal flow)."""
+        ...
+
+    def stale_polled_paused(self, older_than: timedelta) -> list[PausedRun]:
+        """The reconciler backstop-poll scan (PLAN.md 4.2 / 6.2): still-
+        ``proposed`` runs that carry a hosted ``approval_id`` and whose
+        ``created_at`` is older than ``now_fn() - older_than`` — a decision the
+        ``approval.decided`` webhook never delivered. Selected ``FOR UPDATE SKIP
+        LOCKED`` like the other sweeps; the caller polls the control plane
+        (``HttpApprovalTransport.fetch_decision``) for each and drives any
+        decision through ``apply_decision``. This NEVER expires or aborts a
+        ``proposed`` run (no TTL, ADR-4) — it only pulls a decision the control
+        plane already has."""
+        ...
+
     def append_audit(self, event: AuditEvent) -> AuditRow:
         """Append one hash-chained audit row (ADR-5, PLAN.md 5.1/5.2).
 

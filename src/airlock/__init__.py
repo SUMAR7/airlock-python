@@ -56,6 +56,11 @@ if TYPE_CHECKING:
     from airlock.transport import PauseRequest as PauseRequest
     from airlock.transport import SendReceipt as SendReceipt
     from airlock.transport.console import ConsoleApprovalTransport as ConsoleApprovalTransport
+    from airlock.transport.http import ApprovalRequestWire as ApprovalRequestWire
+    from airlock.transport.http import ApprovalTransportError as ApprovalTransportError
+    from airlock.transport.http import HttpApprovalTransport as HttpApprovalTransport
+    from airlock.transport.http import WebhookReceiver as WebhookReceiver
+    from airlock.transport.http import webhook_app as webhook_app
     from airlock.types import ActionOutcome as ActionOutcome
     from airlock.types import ApprovalDecision as ApprovalDecision
     from airlock.types import AuditEvent as AuditEvent
@@ -120,6 +125,11 @@ _EXPORTS: dict[str, str] = {
     "PauseRequest": "airlock.transport",
     "SendReceipt": "airlock.transport",
     "ConsoleApprovalTransport": "airlock.transport.console",
+    "ApprovalRequestWire": "airlock.transport.http",
+    "ApprovalTransportError": "airlock.transport.http",
+    "HttpApprovalTransport": "airlock.transport.http",
+    "WebhookReceiver": "airlock.transport.http",
+    "webhook_app": "airlock.transport.http",
     "ActionOutcome": "airlock.types",
     "ApprovalDecision": "airlock.types",
     "AuditEvent": "airlock.types",

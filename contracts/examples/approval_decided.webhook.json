@@ -1,0 +1,13 @@
+{
+  "event": "approval.decided",
+  "delivery_id": "dl_01J9ZM7C3QKX8V2N4B6D8F0H1K",
+  "approval_id": "apr_01J9ZKQABCDEF0123456789XYZ0",
+  "approval_ref": "3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b",
+  "run_id": "run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50",
+  "decision": "approved",
+  "decided_by": "usr_01J9ZK3PABQR7VN3WL9TB6DF1S",
+  "decided_by_display": "alice@acme.example",
+  "decided_at": "2026-07-11T04:02:40.000000Z",
+  "decision_latency_ms": 200000,
+  "reason": null
+}

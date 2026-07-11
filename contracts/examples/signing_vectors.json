@@ -1,0 +1,62 @@
+{
+  "$comment": "Cross-language golden vectors for the airlock-v1 request signing scheme (/contracts/signing.md, PLAN.md 6.2). Both airlock-python (airlock._signing) and airlock-cloud (Ruby) MUST reproduce every canonical_string and signature byte-for-byte. These are pinned forever; a change is a new signature version.",
+  "algorithm": "HMAC-SHA256",
+  "canonical_prefix": "airlock-v1",
+  "signature_version": "v1",
+  "replay_window_seconds": 300,
+  "hmac_key_encoding": "UTF-8 bytes of the secret token string, verbatim (no base64/hex decode).",
+  "canonical_string_layout": "airlock-v1\\n{unix_ts}\\n{METHOD}\\n{path_with_query}\\n{sha256_hex(raw_body)} — fields joined by a single LF (0x0A), no trailing newline.",
+  "key_id": "ak_live_7f3a9c2e8b1d4a6f",
+  "secret": "sk_live_airlock_reference_vector_secret_do_not_use",
+  "empty_body_sha256_hex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "vectors": [
+    {
+      "name": "create_approval_post",
+      "description": "SDK -> cloud: POST /api/v1/approvals with the create request body. The frozen allowlist, exactly.",
+      "method": "POST",
+      "path_with_query": "/api/v1/approvals",
+      "timestamp": 1783944000,
+      "raw_body": "{\"approval_ref\":\"3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b\",\"run_id\":\"run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50\",\"action_type\":\"refund.create\",\"action_summary\":\"Refund invoice inv_42 (12.50 EUR) to customer cus_8xq\",\"cost\":{\"amount\":\"12.5\",\"currency\":\"EUR\"},\"reversibility\":\"irreversible\",\"blast_radius_estimate\":\"low\",\"requested_at\":\"2026-07-11T03:59:20.000000Z\",\"sdk_version\":\"0.0.1\"}",
+      "body_sha256_hex": "217ab0d3a5f81bcae71235c3cf91f9281148948a125d76594f6a8f2eda8bf17b",
+      "canonical_string": "airlock-v1\n1783944000\nPOST\n/api/v1/approvals\n217ab0d3a5f81bcae71235c3cf91f9281148948a125d76594f6a8f2eda8bf17b",
+      "headers": {
+        "Airlock-Key": "ak_live_7f3a9c2e8b1d4a6f",
+        "Airlock-Timestamp": "1783944000",
+        "Airlock-Signature": "v1=4167dfe1da0e4bf4791d337b9a536cbcdd9550a9e65603cfbc849707dd57a167"
+      },
+      "signature": "v1=4167dfe1da0e4bf4791d337b9a536cbcdd9550a9e65603cfbc849707dd57a167"
+    },
+    {
+      "name": "get_approval_empty_body",
+      "description": "SDK -> cloud: GET /api/v1/approvals/{approval_id}, no body. The body term is the SHA-256 of the empty string.",
+      "method": "GET",
+      "path_with_query": "/api/v1/approvals/apr_01J9ZKQABCDEF0123456789XYZ0",
+      "timestamp": 1783944000,
+      "raw_body": "",
+      "body_sha256_hex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "canonical_string": "airlock-v1\n1783944000\nGET\n/api/v1/approvals/apr_01J9ZKQABCDEF0123456789XYZ0\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "headers": {
+        "Airlock-Key": "ak_live_7f3a9c2e8b1d4a6f",
+        "Airlock-Timestamp": "1783944000",
+        "Airlock-Signature": "v1=b56ad63353b29df061e5652d531fbd6fd0467af8fe6673852b0def5c5e81cc20"
+      },
+      "signature": "v1=b56ad63353b29df061e5652d531fbd6fd0467af8fe6673852b0def5c5e81cc20"
+    },
+    {
+      "name": "webhook_decided_post",
+      "description": "cloud -> customer: POST {customer.webhook_url} with the approval.decided body. Same scheme, opposite direction, same secret.",
+      "method": "POST",
+      "path_with_query": "/airlock/webhooks",
+      "timestamp": 1783944000,
+      "raw_body": "{\"event\":\"approval.decided\",\"delivery_id\":\"dl_01J9ZM7C3QKX8V2N4B6D8F0H1K\",\"approval_id\":\"apr_01J9ZKQABCDEF0123456789XYZ0\",\"approval_ref\":\"3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b\",\"run_id\":\"run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50\",\"decision\":\"approved\",\"decided_by\":\"usr_01J9ZK3PABQR7VN3WL9TB6DF1S\",\"decided_by_display\":\"alice@acme.example\",\"decided_at\":\"2026-07-11T04:02:40.000000Z\",\"decision_latency_ms\":200000,\"reason\":null}",
+      "body_sha256_hex": "0cca3beb725342340274c1123bd00b9b5e3c319f714bd696caa51c4b8a8c1a7d",
+      "canonical_string": "airlock-v1\n1783944000\nPOST\n/airlock/webhooks\n0cca3beb725342340274c1123bd00b9b5e3c319f714bd696caa51c4b8a8c1a7d",
+      "headers": {
+        "Airlock-Key": "ak_live_7f3a9c2e8b1d4a6f",
+        "Airlock-Timestamp": "1783944000",
+        "Airlock-Signature": "v1=2db8522b3a5124a5d53f7c81cf76b8d268b056f82cf882ab5fb6f7b330d09f42"
+      },
+      "signature": "v1=2db8522b3a5124a5d53f7c81cf76b8d268b056f82cf882ab5fb6f7b330d09f42"
+    }
+  ]
+}

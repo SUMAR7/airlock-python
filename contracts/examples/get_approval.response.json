@@ -1,0 +1,10 @@
+{
+  "approval_id": "apr_01J9ZKQABCDEF0123456789XYZ0",
+  "approval_ref": "3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b",
+  "status": "approved",
+  "decided_by": "usr_01J9ZK3PABQR7VN3WL9TB6DF1S",
+  "decided_by_display": "alice@acme.example",
+  "decided_at": "2026-07-11T04:02:40.000000Z",
+  "decision_latency_ms": 200000,
+  "reason": null
+}

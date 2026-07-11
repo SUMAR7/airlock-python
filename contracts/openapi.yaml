@@ -1,0 +1,543 @@
+openapi: 3.1.0
+
+# =============================================================================
+# Airlock wire contract — the SDK <-> hosted control plane boundary (v1).
+#
+# This is compliance-critical (PLAN.md 6, ADR-7): it defines EXACTLY what
+# crosses the customer boundary. It is deliberately THREE calls (PLAN.md 6.2),
+# HMAC-signed in BOTH directions (see /contracts/signing.md), keyed end to end
+# on the SDK-minted `approval_ref` UUID — the ONLY cross-boundary identifier
+# (PLAN.md 6.1). No implementations live here (no codegen — SPEC.md 2 mandates
+# a hand-written client); airlock-cloud vendors a SHA-256-pinned copy (P3.2).
+#
+# The shared vocabulary (Money, Reversibility, BlastRadius, actor ids) is
+# single-sourced from airlock.types and must stay byte-identical to
+# action_event.v1.json — CI asserts it (PLAN.md 10.5).
+# =============================================================================
+
+info:
+  title: Airlock control-plane wire contract
+  version: "1.0.0"
+  description: |
+    The signed HTTP contract between the Airlock SDK (`airlock-python`, in the
+    customer's process) and the hosted control plane (`airlock-cloud`).
+
+    ## The boundary rule (PLAN.md 6.1 — compliance-critical)
+
+    The SDK-minted `approval_ref` UUID is the **sole cross-boundary identifier**.
+    It appears in the create body, the hosted `UNIQUE(customer_id, approval_ref)`
+    constraint, the decision responses, and the webhook.
+
+    **Transits (the frozen allowlist).** Request → cloud: `approval_ref`,
+    `run_id`, `action_type`, `action_summary`, `cost` (Money|null),
+    `reversibility`, `blast_radius_estimate` (low|medium|high|null),
+    `requested_at`, `sdk_version`. And back → SDK/customer: `approval_id`,
+    `decision`/`status`, `decided_by`, `decided_by_display`, `decided_at`,
+    `decision_latency_ms`, `reason`, `delivery_id`, `inbox_url`.
+
+    **NEVER transits (normative — enforced structurally by the allowlist +
+    `additionalProperties: false` on every request schema).** Tool args /
+    payloads; `idempotency_key` (a digest of the payload — and, with a `key=`
+    override, potentially raw payload fragments); `downstream_key`;
+    `result_json` / `error_json`; `serialized_state`; audit rows / hashes;
+    stack traces. If a field would carry any of these it does not belong on the
+    wire — that is a contract-version decision, not an additive change.
+
+    ## Signing (both directions — /contracts/signing.md)
+
+    Every call below (SDK→cloud AND cloud→customer) carries `Airlock-Key`,
+    `Airlock-Timestamp`, and `Airlock-Signature: v1=<hmac-sha256 hex>` over the
+    canonical string `airlock-v1\n{unix_ts}\n{METHOD}\n{path_with_query}\n
+    {sha256_hex(raw_body)}`, with a ±300s replay window and a constant-time
+    compare on the RAW body before any JSON parse. One secret per customer signs
+    both directions.
+
+    ## Versioning (PLAN.md 6.2)
+
+    Major version in the path (`/api/v1/`). Within v1: the server may add
+    optional response fields (clients ignore unknown fields — tolerant ingress);
+    new optional request fields are server-deploys-first; anything breaking ⇒
+    `/api/v2`. **Strict on egress, tolerant on ingress:** request bodies are
+    `additionalProperties: false`, responses are not.
+
+servers:
+  - url: https://api.airlock.dev
+    description: Hosted control plane (single region in Phase 3).
+
+tags:
+  - name: approvals
+    description: The three-call approval contract.
+
+paths:
+  /api/v1/approvals:
+    post:
+      tags: [approvals]
+      operationId: createApproval
+      summary: Create an approval request (SDK → cloud), idempotent on approval_ref.
+      description: |
+        Call #1 (PLAN.md 6.2). The SDK persists the durable `paused_runs` row
+        FIRST, then calls this. Idempotent on the SDK-minted `approval_ref`
+        (hosted `UNIQUE(customer_id, approval_ref)`): a retried POST with the
+        same `approval_ref` returns `200` with the existing record instead of
+        creating a second one, so `send` is redelivery-safe. The request body is
+        EXACTLY the frozen allowlist and nothing else (`additionalProperties:
+        false` — unknown keys are a `400`).
+      security:
+        - airlockSignature: []
+      parameters:
+        - $ref: '#/components/parameters/AirlockKey'
+        - $ref: '#/components/parameters/AirlockTimestamp'
+        - $ref: '#/components/parameters/AirlockSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApprovalRequest'
+            examples:
+              refund:
+                $ref: '#/components/examples/CreateApprovalRequestExample'
+      responses:
+        "201":
+          description: Approval created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateApprovalResponse'
+              examples:
+                created:
+                  $ref: '#/components/examples/CreateApprovalResponseExample'
+        "200":
+          description: |
+            Idempotent replay — an approval with this `approval_ref` already
+            exists; the existing record is returned (status may already be
+            `approved`/`rejected`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateApprovalResponse'
+        "400":
+          description: Malformed body or an unknown field (egress is strict).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "401":
+          description: Missing/invalid signature, or timestamp outside the ±300s window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "422":
+          description: Well-formed but semantically invalid (e.g. `action_summary` > 500 chars).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/approvals/{approval_id}:
+    get:
+      tags: [approvals]
+      operationId: getApproval
+      summary: Fetch an approval's current decision (SDK → cloud) — the reconciler backstop poll.
+      description: |
+        Call #2 (PLAN.md 6.2). The reconciler's backstop poll: when a webhook is
+        never delivered, the SDK polls this using the `approval_id` it persisted
+        on `paused_runs` from the create response. Read-only and idempotent.
+      security:
+        - airlockSignature: []
+      parameters:
+        - $ref: '#/components/parameters/AirlockKey'
+        - $ref: '#/components/parameters/AirlockTimestamp'
+        - $ref: '#/components/parameters/AirlockSignature'
+        - name: approval_id
+          in: path
+          required: true
+          description: The hosted approval id returned by `createApproval`.
+          schema:
+            $ref: '#/components/schemas/ApprovalId'
+      responses:
+        "200":
+          description: The approval's current status and (if decided) the decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetApprovalResponse'
+              examples:
+                approved:
+                  $ref: '#/components/examples/GetApprovalResponseExample'
+        "401":
+          description: Missing/invalid signature, or timestamp outside the ±300s window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "404":
+          description: No approval with this `approval_id` for the authenticated customer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # Call #3 is a POST to the CUSTOMER's own webhook URL (cloud → customer), not
+  # a hosted path. It is documented here as a webhook operation so the body and
+  # its signing are frozen in the same contract both sides pin. The `{$request}`
+  # runtime-expression form is not used because the URL is customer-configured
+  # out of band; the shape below IS the contract.
+  # ---------------------------------------------------------------------------
+
+webhooks:
+  approvalDecided:
+    post:
+      tags: [approvals]
+      operationId: approvalDecidedWebhook
+      summary: approval.decided push (cloud → customer webhook_url).
+      description: |
+        Call #3 (PLAN.md 6.2). When a human decides, the control plane POSTs this
+        to the customer-configured `webhook_url`, signed with the SAME per-customer
+        secret and the SAME `airlock-v1` scheme (the customer's receiver verifies
+        it). Delivery is at-least-once (Sidekiq retries, P3.3): the receiver MUST
+        dedupe on `approval_ref` — which it does for free, since it drives the
+        decision through `apply_decision` (ADR-4 ensure-committed). `decision`,
+        `decided_by`, and `decision_latency_ms` are recorded verbatim; the SDK
+        never recomputes latency (PLAN.md 6.2 / 10.7).
+      security:
+        - airlockSignature: []
+      parameters:
+        - $ref: '#/components/parameters/AirlockKey'
+        - $ref: '#/components/parameters/AirlockTimestamp'
+        - $ref: '#/components/parameters/AirlockSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalDecidedWebhook'
+            examples:
+              approved:
+                $ref: '#/components/examples/ApprovalDecidedWebhookExample'
+      responses:
+        "200":
+          description: |
+            Receiver accepted (or already had) the decision. Any 2xx is treated
+            as delivered; non-2xx / timeout schedules a retry.
+
+components:
+
+  # --- Signing headers (all three calls, both directions) ------------------
+  parameters:
+    AirlockKey:
+      name: Airlock-Key
+      in: header
+      required: true
+      description: The key id (`ak_live_…`) identifying the per-customer secret.
+      schema:
+        type: string
+        pattern: '^ak_live_[0-9a-zA-Z]+$'
+    AirlockTimestamp:
+      name: Airlock-Timestamp
+      in: header
+      required: true
+      description: Unix seconds; part of the signed string. Rejected if |now - ts| > 300.
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    AirlockSignature:
+      name: Airlock-Signature
+      in: header
+      required: true
+      description: '`v1=<lowercase hex HMAC-SHA256(secret, canonical_string)>` (/contracts/signing.md).'
+      schema:
+        type: string
+        pattern: '^v1=[0-9a-f]{64}$'
+
+  securitySchemes:
+    airlockSignature:
+      type: apiKey
+      in: header
+      name: Airlock-Signature
+      description: |
+        HMAC-SHA256 request signature over `airlock-v1\n{unix_ts}\n{METHOD}\n
+        {path_with_query}\n{sha256_hex(raw_body)}`, verified constant-time on the
+        raw body before parsing, within a ±300s replay window. Accompanied by
+        `Airlock-Key` and `Airlock-Timestamp`. Applies to every call in both
+        directions. Full spec + reference vectors: /contracts/signing.md.
+
+  schemas:
+
+    # --- Shared vocabulary (single-sourced from airlock.types) --------------
+    Money:
+      type: object
+      description: |
+        `{amount: decimal-string, currency: ISO-4217}` — NEVER a JSON float
+        (PLAN.md 3.2). `amount` is the canonical decimal string
+        (airlock.decimal_string): plain fixed-point, no trailing fractional
+        zeros, zero is "0". Identical shape to action_event.v1's `cost`.
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^-?(0|[1-9][0-9]*)(\.[0-9]*[1-9])?$'
+          description: Canonical decimal string. Never a JSON number.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          description: ISO-4217 alphabetic code.
+
+    Reversibility:
+      type: string
+      description: airlock.types.Reversibility (single source).
+      enum: [reversible, irreversible, unknown]
+
+    BlastRadius:
+      type: string
+      description: airlock.types.BlastRadius, ordered low < medium < high.
+      enum: [low, medium, high]
+
+    ApprovalRef:
+      type: string
+      format: uuid
+      description: The SDK-minted UUID — the ONLY cross-boundary key (PLAN.md 6.1).
+
+    ApprovalId:
+      type: string
+      description: Opaque hosted approval id (`apr_…`), assigned by the control plane.
+      pattern: '^apr_[0-9A-Za-z]+$'
+
+    ActorId:
+      type: string
+      description: |
+        Opaque, stable actor id (`usr_…`) minted by the control plane —
+        NEVER an email (PLAN.md 10.6). The email, if any, is `decided_by_display`.
+      pattern: '^usr_[0-9A-Za-z]+$'
+
+    Rfc3339:
+      type: string
+      description: RFC 3339 UTC timestamp with microseconds and a Z suffix (airlock-canon-1).
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$'
+
+    RequestedStatus:
+      type: string
+      enum: [requested]
+      description: Fresh approvals are always `requested`.
+
+    ApprovalStatus:
+      type: string
+      enum: [requested, approved, rejected]
+      description: Mirrors the hosted `approvals.status` CHECK (PLAN.md 5.3).
+
+    Decision:
+      type: string
+      enum: [approved, rejected]
+      description: The terminal human decision carried on the webhook.
+
+    # --- Call #1 request: the FROZEN ALLOWLIST, and nothing else ------------
+    CreateApprovalRequest:
+      type: object
+      description: |
+        The create body — EXACTLY the frozen egress allowlist (PLAN.md 6.1).
+        `additionalProperties: false` is the structural half of the boundary:
+        there is no key here for tool args, `idempotency_key`, `downstream_key`,
+        results, `serialized_state`, or audit data, and unknown keys 400. The
+        Python side builds this only via `ApprovalRequestWire.from_action(...)`
+        (P3.4), which maps every field explicitly.
+      additionalProperties: false
+      required:
+        - approval_ref
+        - run_id
+        - action_type
+        - action_summary
+        - cost
+        - reversibility
+        - blast_radius_estimate
+        - requested_at
+        - sdk_version
+      properties:
+        approval_ref:
+          $ref: '#/components/schemas/ApprovalRef'
+        run_id:
+          type: string
+          minLength: 1
+          description: The guarded invocation id (SDK-minted; joins `paused_runs.run_id`).
+        action_type:
+          type: string
+          minLength: 1
+          description: Stable action identifier (e.g. `refund.create`).
+        action_summary:
+          type: string
+          maxLength: 500
+          description: |
+            Integrator-authored human summary — NEVER `repr(args)` (PLAN.md 6.1).
+            The reviewer reads this; it must not leak payloads. Capped at 500.
+        cost:
+          oneOf:
+            - $ref: '#/components/schemas/Money'
+            - type: 'null'
+          description: Money or null.
+        reversibility:
+          $ref: '#/components/schemas/Reversibility'
+        blast_radius_estimate:
+          oneOf:
+            - $ref: '#/components/schemas/BlastRadius'
+            - type: 'null'
+          description: low|medium|high or null when unclassified.
+        requested_at:
+          $ref: '#/components/schemas/Rfc3339'
+        sdk_version:
+          type: string
+          minLength: 1
+          description: The emitting SDK version (diagnostics; carries no payload).
+
+    CreateApprovalResponse:
+      type: object
+      description: |
+        Create response (201) or idempotent replay (200). Tolerant ingress —
+        the client ignores unknown fields, so this is NOT
+        `additionalProperties: false`.
+      required:
+        - approval_id
+        - approval_ref
+        - status
+        - inbox_url
+      properties:
+        approval_id:
+          $ref: '#/components/schemas/ApprovalId'
+        approval_ref:
+          $ref: '#/components/schemas/ApprovalRef'
+        status:
+          $ref: '#/components/schemas/RequestedStatus'
+        inbox_url:
+          type: string
+          format: uri
+          description: Where a human reviews this approval in the hosted inbox.
+
+    GetApprovalResponse:
+      type: object
+      description: |
+        Poll response (call #2). `decided_by`/`decided_at`/`decision_latency_ms`/
+        `reason` are null until a decision lands. `decision_latency_ms` is
+        computed on the control plane's own clock pair and delivered verbatim
+        (PLAN.md 6.2 / 10.7). Tolerant ingress.
+      required:
+        - approval_id
+        - approval_ref
+        - status
+        - decided_by
+        - decided_by_display
+        - decided_at
+        - decision_latency_ms
+        - reason
+      properties:
+        approval_id:
+          $ref: '#/components/schemas/ApprovalId'
+        approval_ref:
+          $ref: '#/components/schemas/ApprovalRef'
+        status:
+          $ref: '#/components/schemas/ApprovalStatus'
+        decided_by:
+          oneOf:
+            - $ref: '#/components/schemas/ActorId'
+            - type: 'null'
+          description: Opaque actor id or null.
+        decided_by_display:
+          oneOf:
+            - type: string
+            - type: 'null'
+          description: Human-readable actor (e.g. email) or null.
+        decided_at:
+          oneOf:
+            - $ref: '#/components/schemas/Rfc3339'
+            - type: 'null'
+        decision_latency_ms:
+          oneOf:
+            - type: integer
+              minimum: 0
+            - type: 'null'
+          description: Control-plane-computed (decided_at − requested_at); recorded verbatim.
+        reason:
+          oneOf:
+            - type: string
+            - type: 'null'
+          description: Optional free-text reason the human gave.
+
+    # --- Call #3 body: the approval.decided webhook -------------------------
+    ApprovalDecidedWebhook:
+      type: object
+      description: |
+        The `approval.decided` push body (cloud → customer). `additionalProperties:
+        false`: a fixed, boundary-safe field set — identifiers, the decision, and
+        the control-plane-computed latency. No payload, no idempotency_key, no
+        results ever appear here.
+      additionalProperties: false
+      required:
+        - event
+        - delivery_id
+        - approval_id
+        - approval_ref
+        - run_id
+        - decision
+        - decided_by
+        - decided_by_display
+        - decided_at
+        - decision_latency_ms
+        - reason
+      properties:
+        event:
+          type: string
+          const: approval.decided
+        delivery_id:
+          type: string
+          minLength: 1
+          description: Unique per delivery ATTEMPT (dedupe is on `approval_ref`, not this).
+        approval_id:
+          $ref: '#/components/schemas/ApprovalId'
+        approval_ref:
+          $ref: '#/components/schemas/ApprovalRef'
+        run_id:
+          type: string
+          minLength: 1
+        decision:
+          $ref: '#/components/schemas/Decision'
+        decided_by:
+          $ref: '#/components/schemas/ActorId'
+        decided_by_display:
+          oneOf:
+            - type: string
+            - type: 'null'
+        decided_at:
+          $ref: '#/components/schemas/Rfc3339'
+        decision_latency_ms:
+          type: integer
+          minimum: 0
+          description: Control-plane-computed; the SDK records it verbatim (PLAN.md 6.2).
+        reason:
+          oneOf:
+            - type: string
+            - type: 'null'
+
+    Error:
+      type: object
+      description: A problem response. `code` is a stable machine token; `message` is human text.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: e.g. `invalid_signature`, `unknown_field`, `not_found`.
+        message:
+          type: string
+
+  examples:
+    CreateApprovalRequestExample:
+      summary: A gated refund create request.
+      externalValue: ./examples/create_approval.request.json
+    CreateApprovalResponseExample:
+      summary: The created approval.
+      externalValue: ./examples/create_approval.response.json
+    GetApprovalResponseExample:
+      summary: A polled, approved decision.
+      externalValue: ./examples/get_approval.response.json
+    ApprovalDecidedWebhookExample:
+      summary: The approval.decided push.
+      externalValue: ./examples/approval_decided.webhook.json

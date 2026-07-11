@@ -35,6 +35,13 @@ dev = [
     # Never a runtime dependency — the base import stays pydantic-only.
     "jsonschema",
     "types-jsonschema",
+    # Test-only: parses /contracts/openapi.yaml for the wire-contract test
+    # (the 3 paths, the frozen request allowlist, additionalProperties:false,
+    # no forbidden field names — P3.1). Never a runtime dependency; the base
+    # import stays pydantic-only, and the wire client (P3.4) is hand-written
+    # over httpx, never generated from this file (SPEC.md 2).
+    "pyyaml",
+    "types-pyyaml",
 ]
 
 [tool.hatch.build.targets.wheel]

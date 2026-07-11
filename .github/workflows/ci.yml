@@ -136,7 +136,7 @@ jobs:
         run: |
           for i in $(seq 1 3); do
             echo "--- property run $i/3"
-            uv run pytest -m property -k postgres || exit 1
+            uv run pytest -m property -k "not sqlite" || exit 1
           done
 
   # P4.1: the SQLite store passes the FULL Section-9 matrix on a SINGLE HOST with

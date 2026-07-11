@@ -295,6 +295,19 @@ settings.register_profile(
         HealthCheck.filter_too_much,
     ],
 )
+settings.register_profile(
+    "noshrink",
+    max_examples=200,
+    deadline=None,
+    derandomize=False,
+    print_blob=True,
+    phases=(Phase.explicit, Phase.reuse, Phase.generate, Phase.target),  # no shrink
+    suppress_health_check=[
+        HealthCheck.too_slow,
+        HealthCheck.data_too_large,
+        HealthCheck.filter_too_much,
+    ],
+)
 settings.load_profile(
     os.environ.get("HYPOTHESIS_PROFILE") or ("ci" if os.environ.get("CI") else "dev")
 )

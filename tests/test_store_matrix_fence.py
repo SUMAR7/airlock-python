@@ -59,9 +59,7 @@ def test_finalize_is_fenced_by_epoch_bump(clock_store: Store, fake_clock: FakeCl
     assert loaded.attempts == 2  # the reconciler owns it
 
 
-def test_mark_executing_is_fenced_by_epoch_bump(
-    clock_store: Store, fake_clock: FakeClock
-) -> None:
+def test_mark_executing_is_fenced_by_epoch_bump(clock_store: Store, fake_clock: FakeClock) -> None:
     key = "k-fence-mark"
     _stage_stale_executing(clock_store, fake_clock, key)
     assert not clock_store.mark_executing(key, 1)  # fenced owner cannot re-mark

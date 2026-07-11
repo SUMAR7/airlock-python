@@ -32,7 +32,7 @@ ACTION = "fence.matrix"
 OLDER_THAN = timedelta(seconds=60)
 
 
-def _stage_stale_executing(clock_store: "Store", fake_clock: FakeClock, key: str) -> int:
+def _stage_stale_executing(clock_store: Store, fake_clock: FakeClock, key: str) -> int:
     """Claim + mark executing at epoch 1, then advance the clock so the row is
     stale; a reconciler takes over via ``bump_epoch`` and returns the new epoch.
     """
@@ -44,7 +44,7 @@ def _stage_stale_executing(clock_store: "Store", fake_clock: FakeClock, key: str
     return int(new_epoch)
 
 
-def test_finalize_is_fenced_by_epoch_bump(clock_store: "Store", fake_clock: FakeClock) -> None:
+def test_finalize_is_fenced_by_epoch_bump(clock_store: Store, fake_clock: FakeClock) -> None:
     key = "k-fence-finalize"
     _stage_stale_executing(clock_store, fake_clock, key)
 
@@ -60,7 +60,7 @@ def test_finalize_is_fenced_by_epoch_bump(clock_store: "Store", fake_clock: Fake
 
 
 def test_mark_executing_is_fenced_by_epoch_bump(
-    clock_store: "Store", fake_clock: FakeClock
+    clock_store: Store, fake_clock: FakeClock
 ) -> None:
     key = "k-fence-mark"
     _stage_stale_executing(clock_store, fake_clock, key)
@@ -69,7 +69,7 @@ def test_mark_executing_is_fenced_by_epoch_bump(
     assert loaded is not None and loaded.attempts == 2
 
 
-def test_record_error_is_fenced_by_epoch_bump(clock_store: "Store", fake_clock: FakeClock) -> None:
+def test_record_error_is_fenced_by_epoch_bump(clock_store: Store, fake_clock: FakeClock) -> None:
     key = "k-fence-record"
     _stage_stale_executing(clock_store, fake_clock, key)
     assert not clock_store.record_error(key, 1, {"owner": "late"})  # fenced
@@ -79,7 +79,7 @@ def test_record_error_is_fenced_by_epoch_bump(clock_store: "Store", fake_clock: 
     assert loaded.attempts == 2
 
 
-def test_reconciler_epoch_can_finalize(clock_store: "Store", fake_clock: FakeClock) -> None:
+def test_reconciler_epoch_can_finalize(clock_store: Store, fake_clock: FakeClock) -> None:
     """Sanity: the NEW epoch (the reconciler's) is not fenced — it owns the row."""
     key = "k-fence-newepoch"
     new_epoch = _stage_stale_executing(clock_store, fake_clock, key)

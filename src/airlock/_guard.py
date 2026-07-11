@@ -666,7 +666,14 @@ def _deliver_and_wait(
         reversibility=spec.reversibility,
         blast_radius_estimate=resolved_blast,
     )
-    runtime.transport.send(request)
+    receipt = runtime.transport.send(request)
+    # Persist the hosted approval_id (P3.4): a control-plane transport returns
+    # it on the receipt; recording it on the paused row lets the reconciler
+    # backstop poll GET /api/v1/approvals/{approval_id} if the webhook never
+    # arrives (PLAN.md 6.2). Local transports return None here (no-op). Idempotent
+    # under re-gate — the same id re-persists harmlessly. Never raises the gate.
+    if receipt.approval_id is not None and run.approval_id != receipt.approval_id:
+        runtime.store.set_approval_id(run.run_id, receipt.approval_id)
 
     if not runtime.gate_wait:
         raise ActionPending(

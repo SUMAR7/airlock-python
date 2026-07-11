@@ -41,6 +41,10 @@ def test_base_import_is_light() -> None:
         "import airlock.store\n"
         "import airlock.store._schema\n"
         "import airlock.types\n"
+        # The webhook receiver (airlock.transport.http) must be importable with
+        # NO http extra — httpx is lazy-imported inside HttpApprovalTransport's
+        # methods only, so a receive-only customer needs no httpx (P3.4).
+        "import airlock.transport.http\n"
         "assert 'sqlalchemy' not in sys.modules, 'sqlalchemy leaked into the base import'\n"
         "assert 'httpx' not in sys.modules, 'httpx leaked into the base import'\n"
     )

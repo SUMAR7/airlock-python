@@ -81,11 +81,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # The postgres extra is installed so the ledger suite runs against the
-      # postgres:16 service; the extras-UNINSTALLED enforcement of the
-      # import-light core lives in the core-import-light job above.
-      - name: Sync dependencies (dev group + postgres extra)
-        run: uv sync --locked --extra postgres
+      # The postgres extra runs the ledger suite against the postgres:16
+      # service; the http extra (httpx) runs the P3.4 HttpApprovalTransport
+      # suite against a fake in-process control plane (httpx.MockTransport). The
+      # extras-UNINSTALLED enforcement of the import-light core (base import and
+      # the httpx-free webhook receiver) lives in the core-import-light job above.
+      - name: Sync dependencies (dev group + postgres + http extras)
+        run: uv sync --locked --extra postgres --extra http
 
       - name: Lint
         run: uv run ruff check .

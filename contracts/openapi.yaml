@@ -407,7 +407,10 @@ components:
         approval_ref:
           $ref: '#/components/schemas/ApprovalRef'
         status:
-          $ref: '#/components/schemas/RequestedStatus'
+          $ref: '#/components/schemas/ApprovalStatus'
+          description: >-
+            On create (201) this is `requested`; on idempotent replay (200) it is
+            the run's CURRENT status, which may already be `approved`/`rejected`.
         inbox_url:
           type: string
           format: uri

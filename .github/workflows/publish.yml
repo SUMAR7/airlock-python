@@ -1,9 +1,11 @@
-name: Publish
+name: Publish (TestPyPI)
 
+# Manual-only. The real-PyPI release is release.yml (on v* tags); this is an
+# opt-in TestPyPI smoke run from the Actions tab so a tag never double-publishes.
+# NOTE: needs an `airlock-sdk` pending publisher registered on TestPyPI to work
+# (the original TestPyPI publisher was under the old `airlock` dist name).
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch: {}
 
 jobs:
   publish:

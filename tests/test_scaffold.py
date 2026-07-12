@@ -21,7 +21,7 @@ import airlock
 
 
 def test_version() -> None:
-    assert airlock.__version__ == "0.0.1"
+    assert airlock.__version__ == "0.1.0"
 
 
 def test_base_import_is_light() -> None:

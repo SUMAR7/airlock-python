@@ -75,6 +75,10 @@ def guard(
     key_ignore: tuple[str, ...] = (),             # volatile kwargs excluded from the key
     effect: Effect | None = None,                 # ADR-2 passthrough + probe
     preconditions: Callable[..., bool] | None = None,  # re-checked at commit time
+    # reviewer-facing, gate path only (integrator-authored, never from tool args):
+    summary: str | Callable[..., str] | None = None,          # the one-liner the human reads
+    context: Mapping[str, str] | Callable[..., Mapping[str, str]] | None = None,   # curated panel
+    reject_reasons: Mapping[str, str] | Callable[..., Mapping[str, str]] | None = None,  # code->label
 ) -> Callable[[Callable], Callable]: ...
 ```
 
@@ -108,6 +112,39 @@ namespace delimiter for `key` overrides).
 - `preconditions`: re-checked after the claim on AUTO and at commit time on a
   resumed gate (SPEC scenario 8) — a stale approval that no longer holds aborts
   rather than executing.
+
+### Reviewer context and reject reasons (the gate path)
+
+Three optional params shape what a **human** sees and chooses when an action
+gates. They are resolved **only on the gate path** (never on auto/deny, and never
+seen by the pure policy), each accepts a static value or a callable of the same
+args as the tool, and each is **integrator-authored** — Airlock never populates
+them from the tool args, so raw payloads have no path to the approval inbox
+(PLAN §6.1's data/control-plane boundary).
+
+- `summary`: the one-line, human-readable description the reviewer reads first (a
+  `str` or a callable returning one). Defaults to the `action_type`; it is never
+  `repr(args)`. **Capped at 500 chars** at the wire boundary (over-length raises).
+- `context`: a flat, labeled `Mapping[str, str]` panel shown alongside the summary
+  (`{"customer": "acme@co", "charge": "ch_9"}`). **Strings-only, size-capped**
+  (≤ 20 keys, key ≤ 64 chars, value ≤ 500 chars), enforced structurally at the
+  `ApprovalRequestWire` boundary — a non-string or over-limit entry raises there
+  and **nothing is sent**. `None` omits the field.
+- `reject_reasons`: a flat `Mapping[str, str]` of the structured rejection **codes**
+  this action offers a human (`code -> short label`, e.g.
+  `{"needs_more_info": "Needs more information"}`). A reviewer who rejects picks
+  one; the chosen code flows back on
+  [`ApprovalRejected.reason_code`](#errors) so the agent can branch on it.
+  **Strings-only, size-capped** (≤ 20 codes, code ≤ 64 chars, label ≤ 200 chars),
+  enforced at the same boundary. The codes are opaque to the SDK — it carries the
+  reviewer's choice back verbatim and never validates it. `None` omits the field.
+
+These fields ride the `PauseRequest` → `ApprovalRequestWire` shape
+(`action_summary`, `review_context`, `reject_reasons`; `reason_code` on the
+decision), versioned in [`contracts/openapi.yaml`](../contracts/openapi.yaml)
+(v1.2.0). See the README for runnable examples of
+[reviewer context](../README.md#what-the-human-sees-on-a-gate--reviewer-context)
+and [reject reason codes](../README.md#a-rejection-is-control-flow-not-a-dead-end--reason-codes).
 
 See the [README quickstart](../README.md#quickstart) for a full runnable `@guard`.
 
@@ -356,7 +393,7 @@ All Airlock errors subclass `AirlockError`. The ones a `@guard` caller sees:
 |---|---|
 | `ActionDenied` | policy returned `deny` — blocked, no side effect (has `.action_type`) |
 | `ActionPending` | gated and not resolved inline — durably paused (has `.approval_ref`, `.run_id`) |
-| `ApprovalRejected` | a human rejected the gated action — aborted, no side effect |
+| `ApprovalRejected` | a human rejected the gated action — aborted, no side effect (has `.reason_code`, `.reason`, `.decided_by`) |
 | `PreconditionFailed` | preconditions did not hold at commit time (SPEC scenario 8) — aborted |
 | `CommitFailed` | the effect finalized non-`committed` (`failed`/`unknown`) — never blind-retried |
 | `VerificationUnknown` | a live post-verify probe could not prove present/absent |
@@ -364,3 +401,20 @@ All Airlock errors subclass `AirlockError`. The ones a `@guard` caller sees:
 `AtMostOnceWarning` (a `UserWarning`, **not** an error) fires once per action
 type when an AUTO effect runs with `guarantee='none'`. Escalate it in strict
 environments with `-W error::airlock.AtMostOnceWarning`.
+
+`ApprovalRejected` carries the reviewer's **structured choice** so a rejection is
+control flow, not a dead end: `.reason_code` is the code the human picked from the
+set the action offered (`@guard(reject_reasons=...)`), `.reason` is the optional
+free-text note, and `.decided_by` is the opaque actor id (all `None` when the
+transport carried none). Both are persisted on the paused run, so a fresh-process
+resume surfaces the same code — not only the inline path. Branch on it directly:
+
+```python
+try:
+    charge_card(customer_id, amount_cents)
+except airlock.ApprovalRejected as rej:
+    if rej.reason_code == "needs_more_info":
+        ...   # gather more detail and re-submit
+    elif rej.reason_code == "suspected_fraud":
+        ...   # escalate; do not retry
+```

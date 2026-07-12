@@ -21,7 +21,7 @@ A UTF-8 text file of **JSON Lines** — one JSON object per line. Each line is o
 decision::
 
     {"approval_ref": "1b4e...-uuid", "decision": "approved", "decided_by": "usr_ada"}
-    {"approval_ref": "9c2f...-uuid", "decision": "rejected", "reason": "too risky", "reason_code": "not_authorized"}
+    {"approval_ref": "9c2f...-uuid", "decision": "rejected", "reason_code": "not_authorized"}
 
 Recognised keys per line:
 

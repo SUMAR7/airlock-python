@@ -509,9 +509,10 @@ def test_wait_parses_reason_code_out_of_the_decision_response() -> None:
     # An approval with no code leaves reason_code None.
     cp2 = FakeControlPlane()
     t2 = _transport(cp2)
-    t2.send(_pause_request())
+    receipt = t2.send(_pause_request())
+    assert receipt.approval_id is not None
     cp2.decide(_pause_request().approval_ref, "approved")
-    approved = t2.fetch_decision(t2._approval_ids[_pause_request().approval_ref])  # noqa: SLF001
+    approved = t2.fetch_decision(receipt.approval_id)
     assert approved is not None and approved.reason_code is None
 
 

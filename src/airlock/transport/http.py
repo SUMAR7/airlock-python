@@ -349,9 +349,7 @@ class ApprovalRequestWire(BaseModel):
         bytes sent (signing.md §2).
         """
         exclude = {
-            name
-            for name in ("review_context", "reject_reasons")
-            if getattr(self, name) is None
+            name for name in ("review_context", "reject_reasons") if getattr(self, name) is None
         } or None
         return self.model_dump_json(exclude=exclude).encode("utf-8")
 

@@ -332,9 +332,7 @@ def test_reject_with_code_persists_reason_code_and_surfaces_it(
     verify_chain(store)
 
 
-def test_approval_leaves_reason_code_none(
-    store: PostgresStore, effects: EffectsLog
-) -> None:
+def test_approval_leaves_reason_code_none(store: PostgresStore, effects: EffectsLog) -> None:
     """An approval (no rejection) carries no reason_code — it stays None."""
     key = "k-apply-appr-nocode"
     ref = _persist_pause(store, key=key)

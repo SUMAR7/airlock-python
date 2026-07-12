@@ -152,11 +152,18 @@ class ConsoleApprovalTransport:
             if request.blast_radius_estimate is not None
             else "unknown"
         )
+        context_lines = ""
+        if request.review_context:
+            rendered = "\n".join(
+                f"          - {key}: {value}" for key, value in request.review_context.items()
+            )
+            context_lines = f"\n          context:\n{rendered}"
         print(
             f"[airlock] approval requested: {request.summary} "
             f"(action={request.action_type}, cost={cost}, reversibility={reversibility}, "
             f"blast_radius={blast})\n"
-            f"          approval_ref={request.approval_ref} run_id={request.run_id}\n"
+            f"          approval_ref={request.approval_ref} run_id={request.run_id}"
+            f"{context_lines}\n"
             f"          approve/reject by appending a line to {self._path}",
             file=self._out,
         )

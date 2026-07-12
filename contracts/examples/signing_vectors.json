@@ -27,6 +27,22 @@
       "signature": "v1=4167dfe1da0e4bf4791d337b9a536cbcdd9550a9e65603cfbc849707dd57a167"
     },
     {
+      "name": "create_approval_with_context_post",
+      "description": "SDK -> cloud: POST /api/v1/approvals carrying the OPTIONAL review_context (v1.1.0, P3.6). review_context is appended LAST (field order); strings-only, size-capped. Pins the exact with-context wire bytes + signature.",
+      "method": "POST",
+      "path_with_query": "/api/v1/approvals",
+      "timestamp": 1783944000,
+      "raw_body": "{\"approval_ref\":\"3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b\",\"run_id\":\"run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50\",\"action_type\":\"refund.create\",\"action_summary\":\"Refund invoice inv_42 (12.50 EUR) to customer cus_8xq\",\"cost\":{\"amount\":\"12.5\",\"currency\":\"EUR\"},\"reversibility\":\"irreversible\",\"blast_radius_estimate\":\"low\",\"requested_at\":\"2026-07-11T03:59:20.000000Z\",\"sdk_version\":\"0.0.1\",\"review_context\":{\"customer\":\"acme@co\",\"order\":\"#1832\",\"reason\":\"item defective, refund approved by support\"}}",
+      "body_sha256_hex": "3e47c03df7727048f452d2a906ad6fd9e9a01ed1485f54da8dce300dcfbfb24c",
+      "canonical_string": "airlock-v1\n1783944000\nPOST\n/api/v1/approvals\n3e47c03df7727048f452d2a906ad6fd9e9a01ed1485f54da8dce300dcfbfb24c",
+      "headers": {
+        "Airlock-Key": "ak_live_7f3a9c2e8b1d4a6f",
+        "Airlock-Timestamp": "1783944000",
+        "Airlock-Signature": "v1=b99d0cfb0dac76cd8263bf4233ffe8c0a845aef8c13799b80a0e00c9e6f658e5"
+      },
+      "signature": "v1=b99d0cfb0dac76cd8263bf4233ffe8c0a845aef8c13799b80a0e00c9e6f658e5"
+    },
+    {
       "name": "get_approval_empty_body",
       "description": "SDK -> cloud: GET /api/v1/approvals/{approval_id}, no body. The body term is the SHA-256 of the empty string.",
       "method": "GET",

@@ -17,7 +17,7 @@ openapi: 3.1.0
 
 info:
   title: Airlock control-plane wire contract
-  version: "1.0.0"
+  version: "1.1.0"
   description: |
     The signed HTTP contract between the Airlock SDK (`airlock-python`, in the
     customer's process) and the hosted control plane (`airlock-cloud`).
@@ -31,9 +31,11 @@ info:
     **Transits (the frozen allowlist).** Request → cloud: `approval_ref`,
     `run_id`, `action_type`, `action_summary`, `cost` (Money|null),
     `reversibility`, `blast_radius_estimate` (low|medium|high|null),
-    `requested_at`, `sdk_version`. And back → SDK/customer: `approval_id`,
-    `decision`/`status`, `decided_by`, `decided_by_display`, `decided_at`,
-    `decision_latency_ms`, `reason`, `delivery_id`, `inbox_url`.
+    `requested_at`, `sdk_version`, and (optional, v1.1.0) `review_context` — a
+    strings-only, size-capped, integrator-authored labeled-metadata map. And
+    back → SDK/customer: `approval_id`, `decision`/`status`, `decided_by`,
+    `decided_by_display`, `decided_at`, `decision_latency_ms`, `reason`,
+    `delivery_id`, `inbox_url`.
 
     **NEVER transits (normative — enforced structurally by the allowlist +
     `additionalProperties: false` on every request schema).** Tool args /
@@ -341,8 +343,13 @@ components:
         `additionalProperties: false` is the structural half of the boundary:
         there is no key here for tool args, `idempotency_key`, `downstream_key`,
         results, `serialized_state`, or audit data, and unknown keys 400. The
-        Python side builds this only via `ApprovalRequestWire.from_action(...)`
-        (P3.4), which maps every field explicitly.
+        Python side builds this only via `ApprovalRequestWire.from_pause_request(...)`,
+        which maps every field explicitly.
+
+        `review_context` (added in v1.1.0, P3.6) is the sole OPTIONAL field — an
+        additive, backward-compatible widening: it may be absent, and older
+        bodies (without it) stay valid forever. It is strings-only and
+        size-capped so the metadata-only boundary holds (see the field).
       additionalProperties: false
       required:
         - approval_ref
@@ -389,6 +396,26 @@ components:
           type: string
           minLength: 1
           description: The emitting SDK version (diagnostics; carries no payload).
+        review_context:
+          type: object
+          description: |
+            OPTIONAL integrator-authored labeled metadata the reviewer sees
+            (added v1.1.0, P3.6) — e.g. `{"customer": "acme@co", "order":
+            "#1832", "reason": "item defective"}`. STRINGS-ONLY (both keys and
+            values are strings — `additionalProperties.type: string`): no nested
+            objects, no lists, no numbers, so a payload cannot be smuggled
+            through it. Size-capped so it stays metadata, not a payload channel:
+            at most 20 keys, each key ≤ 64 chars, each value ≤ 500 chars. It is
+            integrator-authored ONLY — NEVER derived from the tool args (PLAN.md
+            6.1 / SPEC.md 3). The SDK enforces this at the
+            `ApprovalRequestWire` boundary; the server MUST reject any body that
+            violates it.
+          additionalProperties:
+            type: string
+            maxLength: 500
+          maxProperties: 20
+          propertyNames:
+            maxLength: 64
 
     CreateApprovalResponse:
       type: object

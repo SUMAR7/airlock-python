@@ -38,6 +38,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from airlock.types import ApprovalDecision, BlastRadius, Money, Reversibility
 
 __all__ = ["ApprovalTransport", "PauseRequest", "SendReceipt"]
@@ -53,8 +55,16 @@ class PauseRequest:
     idempotency_key, never results — those fields do not exist here.
 
     ``summary`` is an integrator-facing one-liner (defaults to the
-    action_type); the P3.1 wire contract caps it at 500 chars and forbids
+    action_type); the wire contract caps it at 500 chars and forbids
     ``repr(args)`` — the same posture applies here.
+
+    ``review_context`` is the OPTIONAL integrator-authored labeled metadata the
+    reviewer sees (``{"customer": "acme@co", "order": "#1832"}``). It is a
+    LOOSE ``Mapping`` here on purpose — the strings-only + size-cap boundary is
+    enforced once, structurally, when this is mapped onto ``ApprovalRequestWire``
+    (``from_pause_request``), so a smuggled non-string / oversized value can
+    never reach the wire (PLAN.md 6.1 / SPEC.md 3). It is integrator-authored
+    ONLY: ``@guard`` never populates it from the tool args.
     """
 
     approval_ref: str
@@ -65,6 +75,7 @@ class PauseRequest:
     cost: Money | None = None
     reversibility: Reversibility | None = None
     blast_radius_estimate: BlastRadius | None = None
+    review_context: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)

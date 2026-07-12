@@ -293,11 +293,69 @@ def test_send_produces_a_verifying_signed_request_with_allowlist_body() -> None:
     receipt = transport.send(_pause_request())
     assert receipt.approval_id is not None
     # The server verified the signature (else it 401'd and send would raise);
-    # assert the captured body carries EXACTLY the allowlist keys, nothing more.
+    # assert the captured body carries ONLY allowlisted keys, nothing more. The
+    # optional review_context is absent here, so the body is the required subset.
     method, path, raw = cp.requests[-1]
     assert (method, path) == ("POST", "/api/v1/approvals")
     body = json.loads(raw)
-    assert set(body) == set(WIRE_ALLOWLIST)
+    assert set(body) <= set(WIRE_ALLOWLIST)
+    assert set(body) == set(WIRE_ALLOWLIST) - {"review_context"}
+
+
+def test_send_with_review_context_carries_it_on_the_wire() -> None:
+    """A PauseRequest with review_context reaches the wire body (strings-only)."""
+    cp = FakeControlPlane()
+    transport = _transport(cp)
+    request = PauseRequest(
+        approval_ref="3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b",
+        run_id="run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50",
+        action_type="refund.create",
+        summary="Refund invoice inv_42 (12.50 EUR) to customer cus_8xq",
+        requested_at=datetime(2026, 7, 11, 3, 59, 20, 0, tzinfo=UTC),
+        cost=Money(amount="12.5", currency="EUR"),
+        reversibility=Reversibility.IRREVERSIBLE,
+        blast_radius_estimate=BlastRadius.LOW,
+        review_context={
+            "customer": "acme@co",
+            "order": "#1832",
+            "reason": "item defective, refund approved by support",
+        },
+    )
+    transport.send(request)
+    _method, _path, raw = cp.requests[-1]
+    body = json.loads(raw)
+    assert set(body) <= set(WIRE_ALLOWLIST)
+    assert body["review_context"] == {
+        "customer": "acme@co",
+        "order": "#1832",
+        "reason": "item defective, refund approved by support",
+    }
+
+
+def test_send_with_review_context_reproduces_the_golden_vector() -> None:
+    """The with-context create bytes ARE the /contracts with-context vector."""
+    with open(_contracts_path("examples/signing_vectors.json"), encoding="utf-8") as handle:
+        vectors = json.load(handle)["vectors"]
+    vec = next(v for v in vectors if v["name"] == "create_approval_with_context_post")
+    wire = ApprovalRequestWire.from_pause_request(
+        PauseRequest(
+            approval_ref="3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b",
+            run_id="run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50",
+            action_type="refund.create",
+            summary="Refund invoice inv_42 (12.50 EUR) to customer cus_8xq",
+            requested_at=datetime(2026, 7, 11, 3, 59, 20, 0, tzinfo=UTC),
+            cost=Money(amount="12.5", currency="EUR"),
+            reversibility=Reversibility.IRREVERSIBLE,
+            blast_radius_estimate=BlastRadius.LOW,
+            review_context={
+                "customer": "acme@co",
+                "order": "#1832",
+                "reason": "item defective, refund approved by support",
+            },
+        ),
+        sdk_version="0.0.1",
+    )
+    assert wire.to_json_bytes().decode("utf-8") == vec["raw_body"]
 
 
 def test_send_is_idempotent_200_and_201_both_accepted() -> None:

@@ -38,10 +38,11 @@ latency floor (SPEC.md 3): the auto/deny hot path never imports or calls it.
 from __future__ import annotations
 
 import time as _time
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from airlock import __version__
 from airlock._signing import (
@@ -90,11 +91,20 @@ WIRE_ALLOWLIST = frozenset(
         "blast_radius_estimate",
         "requested_at",
         "sdk_version",
+        "review_context",
     }
 )
 
 #: The ``approval.decided`` webhook body's ``event`` discriminator (openapi.yaml).
 _WEBHOOK_EVENT = "approval.decided"
+
+#: ``action_summary`` / ``review_context`` size caps (PLAN.md 6.1 / openapi.yaml
+#: CreateApprovalRequest). These are the boundary's size guarantees — the
+#: metadata-only contract stays SMALL and human-readable, never a payload dump.
+MAX_ACTION_SUMMARY_CHARS = 500
+MAX_REVIEW_CONTEXT_KEYS = 20
+MAX_REVIEW_CONTEXT_KEY_CHARS = 64
+MAX_REVIEW_CONTEXT_VALUE_CHARS = 500
 
 
 class ApprovalTransportError(AirlockError):
@@ -119,6 +129,66 @@ class ApprovalTransportError(AirlockError):
         self.code = code
 
 
+def _validate_review_context(
+    context: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    """Validate integrator ``review_context`` into a flat ``dict[str, str]`` — the boundary.
+
+    THE structural chokepoint (PLAN.md 6.1 / SPEC.md 3): ``review_context`` is
+    metadata-only, so it MUST be a flat string→string map within the size caps,
+    and this is the single place that guarantee is enforced. Anything else — a
+    non-string key, a non-string value (an int, a nested dict, a list — a
+    smuggled payload object), a bool masquerading as a string, or an over-limit
+    map/key/value — raises a ``ValueError`` at BUILD TIME, before the wire body
+    exists, so a bad shape can NEVER be signed or sent. ``None`` passes through
+    as ``None`` (the field is omitted from the wire).
+
+    Caps (documented in openapi.yaml CreateApprovalRequest): ≤
+    :data:`MAX_REVIEW_CONTEXT_KEYS` keys, each key ≤
+    :data:`MAX_REVIEW_CONTEXT_KEY_CHARS` chars, each value ≤
+    :data:`MAX_REVIEW_CONTEXT_VALUE_CHARS` chars.
+    """
+    if context is None:
+        return None
+    if not isinstance(context, Mapping):
+        raise ValueError(
+            f"review_context must be a flat Mapping[str, str], got {type(context).__name__}"
+        )
+    if len(context) > MAX_REVIEW_CONTEXT_KEYS:
+        raise ValueError(
+            f"review_context has {len(context)} keys, exceeding the cap of "
+            f"{MAX_REVIEW_CONTEXT_KEYS}; it is reviewer metadata, not a payload channel."
+        )
+    validated: dict[str, str] = {}
+    for key, value in context.items():
+        # bool is an int subclass, and str/bytes are not the intended types;
+        # require EXACT str for both key and value — no coercion, no smuggling.
+        if not isinstance(key, str):
+            raise ValueError(
+                f"review_context keys must be strings; got a "
+                f"{type(key).__name__} key ({key!r}). review_context is strings-only "
+                "(no numbers, no nested objects) — that is the metadata-only boundary."
+            )
+        if not isinstance(value, str):
+            raise ValueError(
+                f"review_context[{key!r}] must be a string; got {type(value).__name__} "
+                f"({value!r}). review_context is strings-only — a nested object, list, or "
+                "number is a payload and must NOT cross the boundary (PLAN.md 6.1)."
+            )
+        if len(key) > MAX_REVIEW_CONTEXT_KEY_CHARS:
+            raise ValueError(
+                f"review_context key {key!r} is {len(key)} chars, exceeding the cap of "
+                f"{MAX_REVIEW_CONTEXT_KEY_CHARS}."
+            )
+        if len(value) > MAX_REVIEW_CONTEXT_VALUE_CHARS:
+            raise ValueError(
+                f"review_context[{key!r}] is {len(value)} chars, exceeding the cap of "
+                f"{MAX_REVIEW_CONTEXT_VALUE_CHARS}."
+            )
+        validated[key] = value
+    return validated
+
+
 class ApprovalRequestWire(BaseModel):
     """The ``POST /api/v1/approvals`` body — EXACTLY the frozen allowlist.
 
@@ -140,22 +210,36 @@ class ApprovalRequestWire(BaseModel):
     approval_ref: str
     run_id: str
     action_type: str
-    action_summary: str
+    action_summary: str = Field(max_length=MAX_ACTION_SUMMARY_CHARS)
     cost: Money | None
     reversibility: Reversibility
     blast_radius_estimate: BlastRadius | None
     requested_at: str
     sdk_version: str
+    # OPTIONAL, and LAST in field order so it is appended when present and
+    # excluded when absent (to_json_bytes) — a create with no review_context
+    # serializes byte-for-byte as it did pre-P3.6 (the frozen signing vector).
+    review_context: dict[str, str] | None = None
 
     @classmethod
     def from_pause_request(cls, request: PauseRequest, *, sdk_version: str) -> ApprovalRequestWire:
         """Map a local :class:`~airlock.transport.PauseRequest` onto the wire body.
 
         Every field is mapped explicitly (never a splat). ``summary`` becomes
-        ``action_summary``; a ``None`` reversibility becomes the conservative
-        ``unknown`` (the wire enum has no null); ``requested_at`` is formatted as
-        the airlock-canon-1 RFC 3339 string. There is no branch that could copy
-        an arg, a key, or a result — those do not exist on ``PauseRequest``.
+        ``action_summary`` (capped at 500 chars by the field constraint — an
+        over-length summary raises here, before anything is signed or sent); a
+        ``None`` reversibility becomes the conservative ``unknown`` (the wire
+        enum has no null); ``requested_at`` is formatted as the airlock-canon-1
+        RFC 3339 string.
+
+        ``review_context`` is the ONE place the strings-only + size-cap boundary
+        is enforced (:func:`_validate_review_context`): the loose
+        ``PauseRequest.review_context`` mapping is validated into a flat
+        ``dict[str, str]`` here, so a smuggled non-string / oversized entry
+        raises at BUILD TIME and nothing transits (PLAN.md 6.1 / SPEC.md 3).
+        There is no branch that could copy an arg, a key, or a result — those do
+        not exist on ``PauseRequest``, and ``review_context`` is integrator-
+        authored, never derived from args.
         """
         return cls(
             approval_ref=request.approval_ref,
@@ -171,11 +255,19 @@ class ApprovalRequestWire(BaseModel):
             blast_radius_estimate=request.blast_radius_estimate,
             requested_at=rfc3339_utc(request.requested_at),
             sdk_version=sdk_version,
+            review_context=_validate_review_context(request.review_context),
         )
 
     def to_json_bytes(self) -> bytes:
-        """The exact request-body bytes to sign and send (compact, ordered)."""
-        return self.model_dump_json().encode("utf-8")
+        """The exact request-body bytes to sign and send (compact, ordered).
+
+        ``review_context`` is EXCLUDED when ``None`` so a create without it is
+        byte-identical to the pre-P3.6 body (the frozen signing vector); when
+        present it is appended last (the field order). The bytes signed are the
+        bytes sent (signing.md §2).
+        """
+        exclude = {"review_context"} if self.review_context is None else None
+        return self.model_dump_json(exclude=exclude).encode("utf-8")
 
 
 def _default_time() -> float:

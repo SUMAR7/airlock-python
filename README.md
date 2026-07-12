@@ -476,6 +476,73 @@ on — is **OSS forever**. The hosted tier adds the human-facing approval UI, th
 audit warehouse, and multi-team policy. A core-correctness feature will never
 move behind the paywall.
 
+### Point the SDK at it
+
+Swap the `ConsoleApprovalTransport` for `HttpApprovalTransport`. Everything else
+— `@guard`, the durable pause, `resume` — is identical.
+
+```python
+import airlock
+from airlock import Decision, HttpApprovalTransport, Policy, Rule
+
+transport = HttpApprovalTransport(
+    base_url="https://airlock.example.com",   # your control plane
+    key_id="ak_live_…",                        # from the inbox Settings page
+    secret="sk_live_…",                        # shown once — keep it as a secret
+)
+
+app = airlock.init(
+    store="postgresql://…/airlock",            # durable pauses live here
+    policy=Policy(rules=[Rule(match="payment.*", decision=Decision.GATE)]),
+    transport=transport,
+    gate_wait=False,   # don't block: the gate raises ActionPending; resume later
+)
+```
+
+A gated call POSTs a signed request to the inbox, writes a durable `paused_runs`
+row, and raises `ActionPending`. **There is no expiry** — a human can decide in a
+minute or in three weeks, and the pause simply waits.
+
+### How the decision reaches your agent
+
+When a human approves or rejects, the decision comes back one of two ways — and
+both funnel into the same idempotent `resume`, so the effect runs **exactly
+once** no matter which arrives first or how many times it is delivered.
+
+**Push — a webhook (lowest latency).** Mount the dependency-light receiver at a
+URL; it verifies the HMAC on the raw body *before* parsing, then drives the
+paused run home:
+
+```python
+# asgi.py — serve with uvicorn/hypercorn at your public webhook URL
+from airlock import webhook_app
+from airlock.store import from_url
+
+app = webhook_app(store=from_url("postgresql://…/airlock"), secret="sk_live_…")
+```
+
+Set that URL on the inbox **Settings** page; the control plane then POSTs each
+`approval.decided` to it, retrying for ~25 hours. A redelivery is a safe no-op.
+
+**Pull — a backstop poll (no inbound endpoint).** Run a periodic sweep that asks
+the control plane for decisions still pending locally. It needs no public
+endpoint and covers every gap the push can't — you run no receiver, it was down,
+or the retries were exhausted:
+
+```python
+from datetime import timedelta
+from airlock.reconcile import backstop_poll_paused
+
+# on a cron/scheduler: every few minutes, or hourly for week-long waits
+backstop_poll_paused(app.store, transport, older_than=timedelta(minutes=2))
+```
+
+Leave the Settings webhook URL **blank** to run poll-only — the simplest setup
+and inherently resilient to downtime; add the webhook later purely to cut
+latency. Either way the decision is always readable at
+`GET /api/v1/approvals/{id}`, so nothing is ever lost. Configure the endpoint
+and rotate credentials from the inbox's **Settings** page (no console needed).
+
 ---
 
 ## Status & maturity

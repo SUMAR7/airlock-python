@@ -43,6 +43,22 @@
       "signature": "v1=b99d0cfb0dac76cd8263bf4233ffe8c0a845aef8c13799b80a0e00c9e6f658e5"
     },
     {
+      "name": "create_approval_with_reject_reasons_post",
+      "description": "SDK -> cloud: POST /api/v1/approvals carrying the OPTIONAL reject_reasons (v1.2.0, P3.9) — the offered rejection codes. reject_reasons is appended LAST (after review_context in field order; here review_context is absent so it follows sdk_version); strings-only, size-capped. Pins the exact with-reject_reasons wire bytes + signature.",
+      "method": "POST",
+      "path_with_query": "/api/v1/approvals",
+      "timestamp": 1783944000,
+      "raw_body": "{\"approval_ref\":\"3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b\",\"run_id\":\"run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50\",\"action_type\":\"refund.create\",\"action_summary\":\"Refund invoice inv_42 (12.50 EUR) to customer cus_8xq\",\"cost\":{\"amount\":\"12.5\",\"currency\":\"EUR\"},\"reversibility\":\"irreversible\",\"blast_radius_estimate\":\"low\",\"requested_at\":\"2026-07-11T03:59:20.000000Z\",\"sdk_version\":\"0.0.1\",\"reject_reasons\":{\"needs_more_info\":\"Needs more information\",\"not_authorized\":\"Not authorized for this amount\",\"duplicate\":\"Looks like a duplicate request\"}}",
+      "body_sha256_hex": "ab85ce2ba4e2543a0ea771788bc32192d75aa7513f3e60f2ae410fc9706594e5",
+      "canonical_string": "airlock-v1\n1783944000\nPOST\n/api/v1/approvals\nab85ce2ba4e2543a0ea771788bc32192d75aa7513f3e60f2ae410fc9706594e5",
+      "headers": {
+        "Airlock-Key": "ak_live_7f3a9c2e8b1d4a6f",
+        "Airlock-Timestamp": "1783944000",
+        "Airlock-Signature": "v1=f8367c8d130a8c3d8073a9644539238e1abb53e9f41e4fff2a4a60ada3cff610"
+      },
+      "signature": "v1=f8367c8d130a8c3d8073a9644539238e1abb53e9f41e4fff2a4a60ada3cff610"
+    },
+    {
       "name": "get_approval_empty_body",
       "description": "SDK -> cloud: GET /api/v1/approvals/{approval_id}, no body. The body term is the SHA-256 of the empty string.",
       "method": "GET",

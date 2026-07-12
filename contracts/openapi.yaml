@@ -17,7 +17,7 @@ openapi: 3.1.0
 
 info:
   title: Airlock control-plane wire contract
-  version: "1.1.0"
+  version: "1.2.0"
   description: |
     The signed HTTP contract between the Airlock SDK (`airlock-python`, in the
     customer's process) and the hosted control plane (`airlock-cloud`).
@@ -32,10 +32,13 @@ info:
     `run_id`, `action_type`, `action_summary`, `cost` (Money|null),
     `reversibility`, `blast_radius_estimate` (low|medium|high|null),
     `requested_at`, `sdk_version`, and (optional, v1.1.0) `review_context` — a
-    strings-only, size-capped, integrator-authored labeled-metadata map. And
-    back → SDK/customer: `approval_id`, `decision`/`status`, `decided_by`,
+    strings-only, size-capped, integrator-authored labeled-metadata map, and
+    (optional, v1.2.0) `reject_reasons` — the strings-only, size-capped set of
+    structured rejection codes the action offers a human. And back →
+    SDK/customer: `approval_id`, `decision`/`status`, `decided_by`,
     `decided_by_display`, `decided_at`, `decision_latency_ms`, `reason`,
-    `delivery_id`, `inbox_url`.
+    `reason_code` (optional, v1.2.0 — the code the human chose), `delivery_id`,
+    `inbox_url`.
 
     **NEVER transits (normative — enforced structurally by the allowlist +
     `additionalProperties: false` on every request schema).** Tool args /
@@ -346,10 +349,11 @@ components:
         Python side builds this only via `ApprovalRequestWire.from_pause_request(...)`,
         which maps every field explicitly.
 
-        `review_context` (added in v1.1.0, P3.6) is the sole OPTIONAL field — an
-        additive, backward-compatible widening: it may be absent, and older
-        bodies (without it) stay valid forever. It is strings-only and
-        size-capped so the metadata-only boundary holds (see the field).
+        `review_context` (v1.1.0, P3.6) and `reject_reasons` (v1.2.0, P3.9) are
+        the OPTIONAL fields — additive, backward-compatible widenings: either may
+        be absent, and older bodies (without them) stay valid forever. Both are
+        strings-only and size-capped so the metadata-only boundary holds (see
+        each field).
       additionalProperties: false
       required:
         - approval_ref
@@ -416,6 +420,30 @@ components:
           maxProperties: 20
           propertyNames:
             maxLength: 64
+        reject_reasons:
+          type: object
+          description: |
+            OPTIONAL integrator-authored set of structured rejection CODES this
+            action OFFERS a human (added v1.2.0, P3.9) — a `code -> short human
+            description` map, e.g. `{"needs_more_info": "Needs more
+            information", "not_authorized": "Not authorized for this amount"}`.
+            A human who REJECTS picks one, and the chosen code flows back on the
+            decision response / webhook as `reason_code`, so the calling agent
+            can branch on it. STRINGS-ONLY (both the codes and their
+            descriptions are strings — `additionalProperties.type: string`): no
+            nested objects, no lists, no numbers, so a payload cannot be
+            smuggled through it. Size-capped so it stays metadata, not a payload
+            channel: at most 20 codes, each code ≤ 64 chars, each description ≤
+            200 chars. It is integrator-authored ONLY — NEVER derived from the
+            tool args (PLAN.md 6.1 / SPEC.md 3). The SDK enforces this at the
+            `ApprovalRequestWire` boundary; the server MUST reject any body that
+            violates it.
+          additionalProperties:
+            type: string
+            maxLength: 200
+          maxProperties: 20
+          propertyNames:
+            maxLength: 64
 
     CreateApprovalResponse:
       type: object
@@ -447,9 +475,9 @@ components:
       type: object
       description: |
         Poll response (call #2). `decided_by`/`decided_at`/`decision_latency_ms`/
-        `reason` are null until a decision lands. `decision_latency_ms` is
-        computed on the control plane's own clock pair and delivered verbatim
-        (PLAN.md 6.2 / 10.7). Tolerant ingress.
+        `reason`/`reason_code` are null until a decision lands.
+        `decision_latency_ms` is computed on the control plane's own clock pair
+        and delivered verbatim (PLAN.md 6.2 / 10.7). Tolerant ingress.
       required:
         - approval_id
         - approval_ref
@@ -459,6 +487,7 @@ components:
         - decided_at
         - decision_latency_ms
         - reason
+        - reason_code
       properties:
         approval_id:
           $ref: '#/components/schemas/ApprovalId'
@@ -491,6 +520,16 @@ components:
             - type: string
             - type: 'null'
           description: Optional free-text reason the human gave.
+        reason_code:
+          oneOf:
+            - type: string
+            - type: 'null'
+          description: |
+            The structured rejection CODE the human chose from the set the
+            action offered (`reject_reasons`), or null (added v1.2.0, P3.9).
+            Nullable — null when the reviewer chose no code, when the action
+            offered none, or when the decision is an approval. The SDK surfaces
+            it on `ApprovalRejected.reason_code` so the calling agent can branch.
 
     # --- Call #3 body: the approval.decided webhook -------------------------
     ApprovalDecidedWebhook:
@@ -500,6 +539,11 @@ components:
         false`: a fixed, boundary-safe field set — identifiers, the decision, and
         the control-plane-computed latency. No payload, no idempotency_key, no
         results ever appear here.
+
+        `reason_code` (added v1.2.0, P3.9) is an OPTIONAL field — a new optional
+        request field that ships server-first (PLAN.md 6.2 versioning rule), so
+        a pre-1.2.0 webhook body (without it) stays valid forever. When present
+        it is the structured code the human chose from the offered set.
       additionalProperties: false
       required:
         - event
@@ -546,6 +590,15 @@ components:
           oneOf:
             - type: string
             - type: 'null'
+        reason_code:
+          oneOf:
+            - type: string
+            - type: 'null'
+          description: |
+            OPTIONAL (v1.2.0, P3.9) — the structured rejection code the human
+            chose from the offered set, or null. Ships server-first; a pre-1.2.0
+            body omits it. The SDK records it verbatim onto
+            `ApprovalRejected.reason_code`.
 
     Error:
       type: object

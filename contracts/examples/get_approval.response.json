@@ -6,5 +6,6 @@
   "decided_by_display": "alice@acme.example",
   "decided_at": "2026-07-11T04:02:40.000000Z",
   "decision_latency_ms": 200000,
-  "reason": null
+  "reason": null,
+  "reason_code": null
 }

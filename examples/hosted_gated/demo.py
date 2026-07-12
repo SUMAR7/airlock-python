@@ -55,9 +55,7 @@ paid_out: list[str] = []
     # ledger AND the provider both dedupe, so a re-delivered approval is safe.
     effect=Effect(key_param="idempotency_key"),
     # What the reviewer READS — an integrator-authored one-liner of the args:
-    summary=lambda vendor, amount_cents, **_: (
-        f"Pay {vendor} ${amount_cents / 100:,.2f}"
-    ),
+    summary=lambda vendor, amount_cents, **_: f"Pay {vendor} ${amount_cents / 100:,.2f}",
     # ...and a curated context panel. NOTE what is NOT here: the card number the
     # tool receives never auto-transits — the reviewer sees only what we expose.
     context=lambda vendor, amount_cents, **_: {

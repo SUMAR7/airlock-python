@@ -19,21 +19,25 @@ file land in ``tmp``, never the repo.
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-import airlock
 import airlock._guard as _guard
 
-# The demo is a script, not an installed package: put its directory on sys.path
-# so `import demo` resolves.
+# Load the demo under a UNIQUE module name (not a plain ``import demo``): every
+# example ships a ``demo.py``, so importing them all as top-level ``demo`` would
+# collide in ``sys.modules`` (the first-imported one would shadow the rest). A
+# path-based import with an explicit name keeps this example independent.
 _DEMO_DIR = Path(__file__).resolve().parents[1] / "examples" / "hosted_gated"
-sys.path.insert(0, str(_DEMO_DIR))
-
-import demo  # type: ignore[import-not-found]  # noqa: E402
+_spec = importlib.util.spec_from_file_location("hosted_gated_demo", _DEMO_DIR / "demo.py")
+assert _spec is not None and _spec.loader is not None
+demo = importlib.util.module_from_spec(_spec)
+sys.modules["hosted_gated_demo"] = demo
+_spec.loader.exec_module(demo)
 
 
 def test_act1_approved_commits_exactly_once(
@@ -53,9 +57,7 @@ def test_act1_approved_commits_exactly_once(
         demo.cleanup(result.handle)
 
 
-def test_act1_reviewer_never_sees_raw_args(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_act1_reviewer_never_sees_raw_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The reviewer sees the curated summary/context — never the raw card number."""
     monkeypatch.chdir(tmp_path)
     _guard._dev_store_warned = False

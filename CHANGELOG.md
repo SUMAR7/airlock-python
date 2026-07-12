@@ -12,7 +12,7 @@ The distribution is published as **`airlock-sdk`**; the import name is
 
 ## [Unreleased]
 
-### 0.1.0 — the correctness core, complete and adversarially tested
+## [0.1.0] — 2026-07-12
 
 The first coherent release: the entire local SDK works end to end, and the
 correctness core is proven under concurrency, crash-injection, and property
@@ -53,10 +53,11 @@ testing. Summarized by build phase:
   README + API / event-schema / architecture docs, whose code blocks are executed
   in CI so they cannot drift from the shipped API.
 
+This is the first release published to PyPI as `airlock-sdk`, via GitHub
+trusted publishing (OIDC).
+
 ### Held for a follow-up release
 
-- The real-PyPI publish of `airlock-sdk` and the trusted-publisher (OIDC)
-  registration — a separate release step after the docs land.
 - A `1.0` API-stability commitment.
 
 [Unreleased]: https://github.com/SUMAR7/airlock-python/commits/main

@@ -9,7 +9,7 @@ build-backend = "hatchling.build"
 # until after this PR merges — this file only sets launch-quality metadata.
 [project]
 name = "airlock-sdk"
-version = "0.0.1"
+version = "0.1.0"
 description = "Agent-action safety SDK: gate irreversible actions, commit exactly once, tamper-evident audit."
 readme = "README.md"
 license = "MIT"

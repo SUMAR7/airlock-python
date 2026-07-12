@@ -2,6 +2,13 @@
 
 **Gate irreversible agent actions, commit each one exactly once, and prove what happened.**
 
+[![PyPI](https://img.shields.io/pypi/v/airlock-sdk)](https://pypi.org/project/airlock-sdk/)
+[![Python](https://img.shields.io/pypi/pyversions/airlock-sdk)](https://pypi.org/project/airlock-sdk/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/SUMAR7/airlock-python/actions/workflows/ci.yml/badge.svg)](https://github.com/SUMAR7/airlock-python/actions/workflows/ci.yml)
+
+![Airlock — the same refund, retried once: twice without Airlock, exactly once with @guard](docs/demo.gif)
+
 Airlock is a drop-in Python SDK that wraps an agent's tool calls and makes the
 dangerous ones safe: it classifies each call, auto-runs the safe ones, pauses
 the risky ones for human approval, blocks the forbidden ones — and commits every

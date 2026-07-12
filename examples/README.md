@@ -12,4 +12,9 @@ uses the zero-config SQLite store — no Postgres, no cloud account required).
   both paths: approve → commit exactly once; reject with a code → no effect, the
   code surfaced on `ApprovalRejected`.
 
+- [`integrations/`](integrations/) — drop Airlock into the agent framework you
+  already use. One-line `@guard` under the framework's tool decorator makes a
+  tool call exactly-once. Runnable, no-API-key demos for **LangChain**, the
+  **OpenAI Agents SDK**, and **CrewAI**.
+
 More examples (the audit chain, at-most-once degradation) are on the way.

@@ -24,6 +24,49 @@ Versioning rules by artifact:
   (`idempotency.md`): any rule change is a new domain (`airlock-canon-2`,
   `airlock/v2`) — never in place (it would fork every key and audit hash).
 
+## v1.2.0 — rejection reason codes (P3.9)
+
+- Add `reject_reasons` to `CreateApprovalRequest` (`openapi.yaml`): an OPTIONAL,
+  integrator-authored set of structured rejection CODES the action OFFERS a
+  human — a `code -> short human description` map (e.g. `{"needs_more_info":
+  "Needs more information", "not_authorized": "Not authorized for this
+  amount"}`). A human who REJECTS picks one; the chosen code flows back
+  (see `reason_code` below). **Backward-compatible additive widening within v1**
+  (not a `/api/v2`): the field may be absent, and every pre-1.2.0 create body
+  stays valid forever (the frozen `create_approval.request.json` example and the
+  `create_approval_post` / `create_approval_with_context_post` signing vectors
+  are UNCHANGED — the SDK omits the field from the wire when it is not set, so
+  those bytes are byte-identical; `reject_reasons` serializes LAST, after
+  `review_context`, so a with-context-only body is also byte-identical).
+- Add `reason_code` to the decision response (`GetApprovalResponse`) and the
+  `approval.decided` webhook (`ApprovalDecidedWebhook`): the structured code the
+  human chose from the offered set, NULLABLE (null on an approval, when the
+  action offered no codes, or when the reviewer chose none). The existing
+  free-text `reason` is unchanged and both travel together. On the webhook it is
+  an OPTIONAL field (not in `required`) so the frozen `webhook_decided_post`
+  signing vector — which predates it — stays valid forever; on the tolerant
+  `GetApprovalResponse` it is a normal nullable field. The SDK records it
+  verbatim onto `ApprovalRejected.reason_code`.
+- **Server-deploys-first (PLAN.md 6.2 versioning rule).** `reject_reasons` is on
+  the frozen egress allowlist and the request body is still
+  `additionalProperties: false`, so a server that does not yet know the field
+  would 400 it. `airlock-cloud` MUST re-pin this contract and accept (store +
+  render the offered codes, add the reject-with-code dropdown, deliver
+  `reason_code` on the decision + webhook) BEFORE any SDK is configured to send
+  `reject_reasons`.
+- **Boundary (compliance-critical, SPEC.md 3 / PLAN.md 6.1).** `reject_reasons`
+  is STRINGS-ONLY — `additionalProperties.type: string`, both codes and
+  descriptions strings; no nested objects, lists, or numbers can transit through
+  it — and size-capped (≤ 20 codes, code ≤ 64 chars, description ≤ 200 chars).
+  It is integrator-authored ONLY, never auto-populated from tool args. The SDK
+  enforces the shape + caps structurally at the `ApprovalRequestWire` boundary
+  (`from_pause_request` → `_validate_reject_reasons`), so a smuggled non-string
+  or over-limit value raises at build time and never reaches the wire.
+- New pinned example: `examples/create_approval.request.with_reject_reasons.json`
+  (a create body carrying `reject_reasons`), validated against the schema. A new
+  frozen signing vector `create_approval_with_reject_reasons_post` pins the exact
+  with-reject_reasons wire bytes + signature (generated from the reference impl).
+
 ## v1.1.0 — reviewer context (P3.6)
 
 - Add `review_context` to `CreateApprovalRequest` (`openapi.yaml`): an OPTIONAL,

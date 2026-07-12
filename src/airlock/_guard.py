@@ -382,6 +382,7 @@ class _GuardSpec:
     preconditions: Callable[..., bool] | None
     summary: str | Callable[..., str] | None
     context: Mapping[str, str] | Callable[..., Mapping[str, str]] | None
+    reject_reasons: Mapping[str, str] | Callable[..., Mapping[str, str]] | None
 
 
 def guard(
@@ -396,6 +397,7 @@ def guard(
     preconditions: Callable[..., bool] | None = None,
     summary: str | Callable[..., str] | None = None,
     context: Mapping[str, str] | Callable[..., Mapping[str, str]] | None = None,
+    reject_reasons: Mapping[str, str] | Callable[..., Mapping[str, str]] | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorate a tool fn: decide auto/gate/deny per call, commit AUTO once.
 
@@ -446,6 +448,21 @@ def guard(
             It is INTEGRATOR-authored ONLY: never auto-populated from the tool
             args — the reviewer sees only what the developer chose to expose.
             ``None`` omits the field entirely.
+        reject_reasons: integrator-authored structured rejection CODES this
+            action OFFERS a human — a flat ``code -> short human description``
+            map (e.g. ``{"needs_more_info": "Needs more information",
+            "not_authorized": "Not authorized"}``), surfaced as the
+            ``reject_reasons`` wire field (P3.9). A human who REJECTS picks one,
+            and the chosen code flows back on
+            :attr:`~airlock.errors.ApprovalRejected.reason_code` so the calling
+            agent can branch on it. A flat ``Mapping[str, str]`` or a callable
+            of the args returning one (resolved per call on the GATE path
+            ONLY). STRINGS-ONLY and size-capped (≤20 codes, code key ≤64 chars,
+            description value ≤200 chars), enforced at the
+            ``ApprovalRequestWire`` boundary — a non-string or over-limit entry
+            raises there and NOTHING is sent. Like ``context`` it is
+            INTEGRATOR-authored ONLY: never auto-populated from the tool args.
+            ``None`` omits the field entirely.
 
     Returns:
         A decorator that returns a wrapper with the same call signature; the
@@ -476,6 +493,7 @@ def guard(
             preconditions=preconditions,
             summary=summary,
             context=context,
+            reject_reasons=reject_reasons,
         )
         # The ONLY decoration side effect: register recovery wiring (PLAN.md
         # 3.3 / the P1.3 registry). execute/preconditions are adapted to the
@@ -674,7 +692,10 @@ def _durable_pause(
     # send-time and are NOT persisted in serialized_state (a fresh-process
     # resume never re-sends — it only drives the recorded decision home).
     resolved_summary = _resolve(spec.summary, args, kwargs, "summary", str)
-    resolved_context = _resolve_context(spec.context, args, kwargs)
+    resolved_context = _resolve_str_mapping(spec.context, args, kwargs, "context")
+    resolved_reject_reasons = _resolve_str_mapping(
+        spec.reject_reasons, args, kwargs, "reject_reasons"
+    )
 
     arg_map = _arg_map(spec, args, kwargs)
     ledger_key = _ledger_key(spec, args, kwargs, arg_map)
@@ -735,6 +756,7 @@ def _durable_pause(
         resolved_blast,
         resolved_summary,
         resolved_context,
+        resolved_reject_reasons,
     )
 
 
@@ -747,6 +769,7 @@ def _deliver_and_wait(
     resolved_blast: BlastRadius | None,
     resolved_summary: str | None,
     resolved_context: Mapping[str, str] | None,
+    resolved_reject_reasons: Mapping[str, str] | None,
 ) -> Any:
     """``transport.send`` then, if ``gate_wait``, ``wait`` -> ``apply_decision``."""
     assert runtime.transport is not None  # narrowed by the caller
@@ -762,6 +785,7 @@ def _deliver_and_wait(
         reversibility=spec.reversibility,
         blast_radius_estimate=resolved_blast,
         review_context=resolved_context,
+        reject_reasons=resolved_reject_reasons,
     )
     receipt = runtime.transport.send(request)
     # Persist the hosted approval_id (P3.4): a control-plane transport returns
@@ -827,6 +851,8 @@ def _surface_outcome(spec: _GuardSpec, ledger_key: str, outcome: DecisionOutcome
                 run_id=outcome.run_id,
                 approval_ref=outcome.approval_ref,
                 decided_by=outcome.decided_by,
+                reason_code=outcome.reason_code,
+                reason=outcome.reason,
             )
         raise PreconditionFailed(
             f"action {spec.action_type!r} was approved but ABORTED at commit time: its "
@@ -1139,19 +1165,21 @@ def _resolve[T](
     return value
 
 
-def _resolve_context(
+def _resolve_str_mapping(
     value: Mapping[str, str] | Callable[..., Mapping[str, str]] | None,
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],
+    label: str,
 ) -> Mapping[str, str] | None:
-    """Resolve the static-or-callable ``context=`` arg against the call args.
+    """Resolve a static-or-callable ``Mapping[str, str]`` decorator arg (GATE path).
 
-    A plain mapping is returned as-is; a callable is invoked with the tool's
-    ``*args, **kwargs`` and must return a mapping. Only the mapping SHAPE is
-    checked here — the strings-only + size-cap enforcement is deliberately
-    deferred to the ``ApprovalRequestWire`` boundary (``from_pause_request``),
-    the single structural chokepoint through which nothing bad can reach the
-    wire (PLAN.md 6.1). Resolution happens on the GATE path only.
+    Shared by ``context=`` and ``reject_reasons=`` (P3.6 / P3.9): a plain
+    mapping is returned as-is; a callable is invoked with the tool's ``*args,
+    **kwargs`` and must return a mapping. Only the mapping SHAPE is checked here
+    — the strings-only + size-cap enforcement is deliberately deferred to the
+    ``ApprovalRequestWire`` boundary (``from_pause_request``), the single
+    structural chokepoint through which nothing bad can reach the wire (PLAN.md
+    6.1). Resolution happens on the GATE path only.
     """
     if value is None:
         return None
@@ -1161,7 +1189,7 @@ def _resolve_context(
         produced = value
     if not isinstance(produced, Mapping):
         raise TypeError(
-            f"context for a guarded action must be a Mapping[str, str] (or a callable "
+            f"{label} for a guarded action must be a Mapping[str, str] (or a callable "
             f"returning one), got {type(produced).__name__}"
         )
     return produced

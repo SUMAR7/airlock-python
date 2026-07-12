@@ -541,6 +541,8 @@ class PausedRun(BaseModel):
     decided_by_display: str | None = None
     decided_at: datetime | None = None
     decision_latency_ms: int | None = None
+    reason: str | None = None
+    reason_code: str | None = None
     created_at: datetime
     resolved_at: datetime | None = None
 
@@ -571,6 +573,16 @@ class ApprovalDecision:
     when present (PLAN.md 6.2); a local transport may leave it ``None`` and
     ``apply_decision`` computes it from the SDK's own clock pair instead.
 
+    ``reason`` is the OPTIONAL free-text note a human may attach to a decision;
+    ``reason_code`` is the OPTIONAL structured code the human CHOSE from the set
+    the action declared (``@guard(reject_reasons=...)``, P3.9) — e.g.
+    ``"needs_more_info"``. It flows back INBOUND so the calling agent can branch
+    on it (``except ApprovalRejected as rej: if rej.reason_code == ...``). Both
+    are recorded VERBATIM from the transport; a local transport may leave them
+    ``None``. ``reason_code`` is opaque here (the SDK never validates it against
+    the offered set — the control plane owns that); it is metadata, never a
+    payload channel.
+
     ``edited_args`` is RESERVED (PLAN.md 10.9 / settled decision 9): the field
     exists so the shape is stable, and it is always ``None`` in v1 — no
     transport can carry edits until the edit-before-approve phase. Setting it
@@ -587,6 +599,7 @@ class ApprovalDecision:
     decided_at: datetime | None = None
     decision_latency_ms: int | None = None
     reason: str | None = None
+    reason_code: str | None = None
     edited_args: None = None  # RESERVED — always None in v1
 
     def __post_init__(self) -> None:

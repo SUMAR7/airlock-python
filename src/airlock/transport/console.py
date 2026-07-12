@@ -21,7 +21,7 @@ A UTF-8 text file of **JSON Lines** — one JSON object per line. Each line is o
 decision::
 
     {"approval_ref": "1b4e...-uuid", "decision": "approved", "decided_by": "usr_ada"}
-    {"approval_ref": "9c2f...-uuid", "decision": "rejected", "reason": "too risky"}
+    {"approval_ref": "9c2f...-uuid", "decision": "rejected", "reason_code": "not_authorized"}
 
 Recognised keys per line:
 
@@ -35,6 +35,9 @@ Recognised keys per line:
 - ``decision_latency_ms`` (int, optional) — recorded verbatim if present;
   otherwise ``apply_decision`` computes it from the SDK clock pair (PLAN.md 6.2).
 - ``reason`` (str, optional) — a free-text note.
+- ``reason_code`` (str, optional) — the structured rejection code the human
+  chose from the set the action offered (``@guard(reject_reasons=...)``, P3.9);
+  surfaced on :attr:`~airlock.errors.ApprovalRejected.reason_code`.
 
 The **first** line matching ``approval_ref`` wins; duplicate lines for the same
 ref are harmless (``apply_decision`` is idempotent — writing an approval twice
@@ -195,6 +198,7 @@ class ConsoleApprovalTransport:
         decided_by_display: str | None = None,
         decision_latency_ms: int | None = None,
         reason: str | None = None,
+        reason_code: str | None = None,
     ) -> None:
         """Append one decision line to the approvals file (interactive/test helper).
 
@@ -212,6 +216,8 @@ class ConsoleApprovalTransport:
             line["decision_latency_ms"] = decision_latency_ms
         if reason is not None:
             line["reason"] = reason
+        if reason_code is not None:
+            line["reason_code"] = reason_code
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(line) + "\n")
@@ -251,6 +257,7 @@ class ConsoleApprovalTransport:
                 decided_at=decided_at,
                 decision_latency_ms=_opt_int(obj.get("decision_latency_ms")),
                 reason=_opt_str(obj.get("reason")),
+                reason_code=_opt_str(obj.get("reason_code")),
             )
         return None
 

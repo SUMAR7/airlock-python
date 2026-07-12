@@ -60,12 +60,14 @@ FROZEN_REQUEST_ALLOWLIST = frozenset(
         "requested_at",
         "sdk_version",
         "review_context",
+        "reject_reasons",
     }
 )
 
-# The REQUIRED subset (every allowlisted key except the sole optional one,
-# review_context). A pre-1.1.0 create body carries exactly these.
-FROZEN_REQUEST_REQUIRED = FROZEN_REQUEST_ALLOWLIST - {"review_context"}
+# The REQUIRED subset (every allowlisted key except the OPTIONAL ones,
+# review_context (v1.1.0) and reject_reasons (v1.2.0)). A pre-1.1.0 create body
+# carries exactly these.
+FROZEN_REQUEST_REQUIRED = FROZEN_REQUEST_ALLOWLIST - {"review_context", "reject_reasons"}
 
 # Field names that must NEVER appear structurally in any request schema
 # (PLAN.md 6.1 never-transits list). Checked against property/required KEYS
@@ -131,7 +133,7 @@ def _all_property_names(node: Any) -> set[str]:
 
 def test_openapi_parses_and_is_3_1() -> None:
     assert DOC["openapi"].startswith("3.1")
-    assert DOC["info"]["version"] == "1.1.0"
+    assert DOC["info"]["version"] == "1.2.0"
 
 
 def test_exactly_the_three_calls_are_present() -> None:
@@ -169,6 +171,7 @@ def test_create_request_is_exactly_the_frozen_allowlist() -> None:
     assert set(req["properties"]) == set(FROZEN_REQUEST_ALLOWLIST)
     assert set(req["required"]) == set(FROZEN_REQUEST_REQUIRED)
     assert "review_context" not in req["required"]
+    assert "reject_reasons" not in req["required"]
 
 
 def test_review_context_is_strings_only_and_size_capped() -> None:
@@ -181,6 +184,50 @@ def test_review_context_is_strings_only_and_size_capped() -> None:
     # at most 20 keys, each key <= 64 chars
     assert rc["maxProperties"] == 20
     assert rc["propertyNames"]["maxLength"] == 64
+
+
+def test_reject_reasons_is_strings_only_and_size_capped() -> None:
+    """reject_reasons is metadata-only: flat str->str, size-capped (P3.9)."""
+    rr = _SCHEMAS["CreateApprovalRequest"]["properties"]["reject_reasons"]
+    assert rr["type"] == "object"
+    # values (the descriptions) are strings (never nested/list/number), capped 200
+    assert rr["additionalProperties"]["type"] == "string"
+    assert rr["additionalProperties"]["maxLength"] == 200
+    # at most 20 codes, each code (key) <= 64 chars
+    assert rr["maxProperties"] == 20
+    assert rr["propertyNames"]["maxLength"] == 64
+
+
+def test_create_request_schema_rejects_non_string_reject_reasons_value() -> None:
+    """A smuggled non-string reject_reasons value fails the schema (strings-only)."""
+    good = json.loads((EXAMPLES / "create_approval.request.with_reject_reasons.json").read_text())
+    validator = _validator_for("CreateApprovalRequest")
+    validator.validate(good)  # the honest all-strings body is valid
+    # An int value (a smuggled number) is rejected.
+    smuggled_num = copy.deepcopy(good)
+    smuggled_num["reject_reasons"] = {"amount": 1250}
+    assert not validator.is_valid(smuggled_num)
+    # A nested object (a smuggled payload) is rejected.
+    smuggled_obj = copy.deepcopy(good)
+    smuggled_obj["reject_reasons"] = {"payload": {"card": "4111"}}
+    assert not validator.is_valid(smuggled_obj)
+    # A list value is rejected.
+    smuggled_list = copy.deepcopy(good)
+    smuggled_list["reject_reasons"] = {"items": ["a", "b"]}
+    assert not validator.is_valid(smuggled_list)
+
+
+def test_reason_code_is_nullable_on_decision_response_and_webhook() -> None:
+    """reason_code (v1.2.0) is a nullable field on both inbound decision shapes."""
+    for name in ("GetApprovalResponse", "ApprovalDecidedWebhook"):
+        rc = _SCHEMAS[name]["properties"]["reason_code"]
+        types = {branch.get("type") for branch in rc["oneOf"]}
+        assert types == {"string", "null"}
+    # The GET response promises it (required, like `reason`); the webhook keeps
+    # it OPTIONAL so the frozen webhook signing vector (which predates it) stays
+    # valid forever.
+    assert "reason_code" in _SCHEMAS["GetApprovalResponse"]["required"]
+    assert "reason_code" not in _SCHEMAS["ApprovalDecidedWebhook"]["required"]
 
 
 def test_create_request_schema_rejects_non_string_review_context_value() -> None:
@@ -275,6 +322,7 @@ def test_actor_id_is_opaque_never_email() -> None:
 EXAMPLE_TO_SCHEMA = {
     "create_approval.request.json": "CreateApprovalRequest",
     "create_approval.request.with_context.json": "CreateApprovalRequest",
+    "create_approval.request.with_reject_reasons.json": "CreateApprovalRequest",
     "create_approval.response.json": "CreateApprovalResponse",
     "get_approval.response.json": "GetApprovalResponse",
     "approval_decided.webhook.json": "ApprovalDecidedWebhook",
@@ -307,6 +355,14 @@ def test_signed_vector_bodies_validate_against_request_schemas() -> None:
     assert set(create_ctx) <= set(FROZEN_REQUEST_ALLOWLIST)
     assert "review_context" in create_ctx
     assert all(isinstance(v, str) for v in create_ctx["review_context"].values())
+
+    # The with-reject_reasons vector validates and carries ONLY allowlisted keys,
+    # including reject_reasons (strings-only) — nothing outside the allowlist.
+    create_rr = json.loads(by_name["create_approval_with_reject_reasons_post"]["raw_body"])
+    _validator_for("CreateApprovalRequest").validate(create_rr)
+    assert set(create_rr) <= set(FROZEN_REQUEST_ALLOWLIST)
+    assert "reject_reasons" in create_rr
+    assert all(isinstance(v, str) for v in create_rr["reject_reasons"].values())
 
 
 def test_create_request_rejects_a_forbidden_field() -> None:

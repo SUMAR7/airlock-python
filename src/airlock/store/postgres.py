@@ -257,7 +257,9 @@ def _transition_paused_sql(with_decision: bool) -> Any:
                decided_by = :decided_by,
                decided_by_display = :decided_by_display,
                decided_at = :decided_at,
-               decision_latency_ms = :decision_latency_ms"""
+               decision_latency_ms = :decision_latency_ms,
+               reason = :reason,
+               reason_code = :reason_code"""
         if with_decision
         else ""
     )
@@ -570,6 +572,8 @@ class PostgresStore:
                         decision.decided_at if decision.decided_at is not None else self._now_fn()
                     ),
                     "decision_latency_ms": decision.decision_latency_ms,
+                    "reason": decision.reason,
+                    "reason_code": decision.reason_code,
                 }
             )
             sql = _TRANSITION_PAUSED_WITH_DECISION_SQL
@@ -757,6 +761,8 @@ def _row_to_paused(row: Mapping[Any, Any]) -> PausedRun:
         decided_by_display=row["decided_by_display"],
         decided_at=row["decided_at"],
         decision_latency_ms=row["decision_latency_ms"],
+        reason=row["reason"],
+        reason_code=row["reason_code"],
         created_at=row["created_at"],
         resolved_at=row["resolved_at"],
     )

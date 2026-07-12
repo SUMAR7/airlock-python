@@ -129,6 +129,8 @@ class DecisionOutcome(BaseModel):
     applied: bool
     human_decision: HumanDecision | None = None
     decided_by: str | None = None
+    reason: str | None = None
+    reason_code: str | None = None
     ledger_state: LedgerState | None = None
     result: JsonValue = None
 
@@ -687,6 +689,11 @@ def _outcome(run: PausedRun, *, applied: bool, store: Store) -> DecisionOutcome:
         applied=applied,
         human_decision=_recorded_human_decision(run, ledger_state),
         decided_by=run.decided_by,
+        # The reviewer's structured code + free-text note, persisted on the row
+        # at the decision CAS (transition_paused) — so a fresh-process resume
+        # surfaces them from the row, not only the in-memory decision (P3.9).
+        reason=run.reason,
+        reason_code=run.reason_code,
         ledger_state=ledger_state,
         result=result,
     )

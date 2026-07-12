@@ -138,6 +138,7 @@ class FakeControlPlane:
             "decided_at": None,
             "decision_latency_ms": None,
             "reason": None,
+            "reason_code": None,
         }
         self.by_ref[ref] = row
         self.by_id[row["approval_id"]] = row
@@ -158,6 +159,7 @@ class FakeControlPlane:
         decided_by_display: str | None = "alice@acme.example",
         decision_latency_ms: int = 4200,
         reason: str | None = None,
+        reason_code: str | None = None,
     ) -> dict[str, Any]:
         row = self.by_ref[approval_ref]
         row.update(
@@ -167,6 +169,7 @@ class FakeControlPlane:
             decided_at="2026-07-11T04:02:40.000000Z",
             decision_latency_ms=decision_latency_ms,
             reason=reason,
+            reason_code=reason_code,
         )
         return row
 
@@ -190,6 +193,7 @@ def _get_resp(row: dict[str, Any]) -> dict[str, Any]:
         "decided_at": row["decided_at"],
         "decision_latency_ms": row["decision_latency_ms"],
         "reason": row["reason"],
+        "reason_code": row["reason_code"],
     }
 
 
@@ -299,7 +303,9 @@ def test_send_produces_a_verifying_signed_request_with_allowlist_body() -> None:
     assert (method, path) == ("POST", "/api/v1/approvals")
     body = json.loads(raw)
     assert set(body) <= set(WIRE_ALLOWLIST)
-    assert set(body) == set(WIRE_ALLOWLIST) - {"review_context"}
+    # The optional metadata fields are absent here, so the body is the required
+    # subset (no review_context, no reject_reasons).
+    assert set(body) == set(WIRE_ALLOWLIST) - {"review_context", "reject_reasons"}
 
 
 def test_send_with_review_context_carries_it_on_the_wire() -> None:
@@ -356,6 +362,72 @@ def test_send_with_review_context_reproduces_the_golden_vector() -> None:
         sdk_version="0.0.1",
     )
     assert wire.to_json_bytes().decode("utf-8") == vec["raw_body"]
+
+
+def test_send_with_reject_reasons_carries_it_on_the_wire() -> None:
+    """A PauseRequest with reject_reasons reaches the wire body (strings-only)."""
+    cp = FakeControlPlane()
+    transport = _transport(cp)
+    request = PauseRequest(
+        approval_ref="3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b",
+        run_id="run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50",
+        action_type="refund.create",
+        summary="Refund invoice inv_42 (12.50 EUR) to customer cus_8xq",
+        requested_at=datetime(2026, 7, 11, 3, 59, 20, 0, tzinfo=UTC),
+        cost=Money(amount="12.5", currency="EUR"),
+        reversibility=Reversibility.IRREVERSIBLE,
+        blast_radius_estimate=BlastRadius.LOW,
+        reject_reasons={
+            "needs_more_info": "Needs more information",
+            "not_authorized": "Not authorized for this amount",
+            "duplicate": "Looks like a duplicate request",
+        },
+    )
+    transport.send(request)
+    _method, _path, raw = cp.requests[-1]
+    body = json.loads(raw)
+    assert set(body) <= set(WIRE_ALLOWLIST)
+    assert body["reject_reasons"] == {
+        "needs_more_info": "Needs more information",
+        "not_authorized": "Not authorized for this amount",
+        "duplicate": "Looks like a duplicate request",
+    }
+
+
+def test_send_with_reject_reasons_reproduces_the_golden_vector() -> None:
+    """The with-reject_reasons create bytes ARE the /contracts vector (P3.9)."""
+    with open(_contracts_path("examples/signing_vectors.json"), encoding="utf-8") as handle:
+        vectors = json.load(handle)["vectors"]
+    vec = next(v for v in vectors if v["name"] == "create_approval_with_reject_reasons_post")
+    wire = ApprovalRequestWire.from_pause_request(
+        PauseRequest(
+            approval_ref="3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b",
+            run_id="run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50",
+            action_type="refund.create",
+            summary="Refund invoice inv_42 (12.50 EUR) to customer cus_8xq",
+            requested_at=datetime(2026, 7, 11, 3, 59, 20, 0, tzinfo=UTC),
+            cost=Money(amount="12.5", currency="EUR"),
+            reversibility=Reversibility.IRREVERSIBLE,
+            blast_radius_estimate=BlastRadius.LOW,
+            reject_reasons={
+                "needs_more_info": "Needs more information",
+                "not_authorized": "Not authorized for this amount",
+                "duplicate": "Looks like a duplicate request",
+            },
+        ),
+        sdk_version="0.0.1",
+    )
+    body = wire.to_json_bytes()
+    assert body.decode("utf-8") == vec["raw_body"]
+    ref_secret = "sk_live_airlock_reference_vector_secret_do_not_use"
+    signature = sign(
+        ref_secret,
+        timestamp=vec["timestamp"],
+        method="POST",
+        path_with_query="/api/v1/approvals",
+        raw_body=body,
+    )
+    assert signature == vec["signature"]
 
 
 def test_send_is_idempotent_200_and_201_both_accepted() -> None:
@@ -420,6 +492,28 @@ def test_fetch_decision_rejected_maps_and_undecided_is_none() -> None:
     decision = transport.fetch_decision(receipt.approval_id)
     assert decision is not None and decision.decision is HumanDecision.REJECTED
     assert decision.reason == "too risky"
+
+
+def test_wait_parses_reason_code_out_of_the_decision_response() -> None:
+    """A rejection carrying reason_code (P3.9) is parsed onto the ApprovalDecision."""
+    cp = FakeControlPlane()
+    clock = _StepClock()
+    transport = _transport(cp, clock)
+    ref = _pause_request().approval_ref
+    transport.send(_pause_request())
+    cp.decide(ref, "rejected", reason="please attach the invoice", reason_code="needs_more_info")
+    decision = transport.wait(ref, timeout=10.0)
+    assert decision is not None and decision.decision is HumanDecision.REJECTED
+    assert decision.reason_code == "needs_more_info"  # the chosen structured code
+    assert decision.reason == "please attach the invoice"  # and the free-text note
+    # An approval with no code leaves reason_code None.
+    cp2 = FakeControlPlane()
+    t2 = _transport(cp2)
+    receipt = t2.send(_pause_request())
+    assert receipt.approval_id is not None
+    cp2.decide(_pause_request().approval_ref, "approved")
+    approved = t2.fetch_decision(receipt.approval_id)
+    assert approved is not None and approved.reason_code is None
 
 
 # ===========================================================================

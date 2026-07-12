@@ -16,9 +16,10 @@ from __future__ import annotations
 import os
 import tempfile
 
+from crewai.tools import tool
+
 import airlock
 from airlock import Decision, Effect, Money, Policy, Rule
-from crewai.tools import tool
 
 # The real side effect we are protecting: each call appends one refund.
 charged: list[str] = []

@@ -17,9 +17,10 @@ from __future__ import annotations
 import os
 import tempfile
 
+from agents import function_tool
+
 import airlock
 from airlock import Decision, Effect, Money, Policy, Rule
-from agents import function_tool
 
 # The real side effect we are protecting: each call appends one refund.
 charged: list[str] = []

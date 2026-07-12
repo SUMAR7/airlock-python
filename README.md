@@ -251,6 +251,159 @@ deploy, with the same `approval_ref`.
 
 ---
 
+## What the human sees on a gate — reviewer context
+
+A reviewer can only make a good decision if they can *see* what they are
+approving. So `@guard` lets you attach two integrator-authored, human-facing
+fields to a gate:
+
+- **`summary`** — a one-line description the reviewer reads first ("Refund
+  $5,000 to acme@co for charge ch_9"), a plain string or a callable of the tool
+  args.
+- **`context`** — a small, curated key/value panel shown alongside it
+  (`{"customer": "acme@co", "charge": "ch_9", "amount": "$5,000.00"}`).
+
+The point is control: **raw tool args never auto-transit.** A card number, a PII
+blob, or a full request body passed to your tool does *not* leak to the approval
+inbox — the reviewer sees only what you deliberately put in `summary` / `context`.
+That is a security boundary, not a formatting nicety (it is the same
+data-plane/control-plane line the wire contract enforces in [`/contracts`](contracts)).
+
+<!-- airlock:test id=reviewer_context -->
+```python
+import io
+import airlock
+from airlock import Decision, Effect, Money, Policy, Reversibility, Rule
+from airlock.transport.console import ConsoleApprovalTransport
+
+@airlock.guard(
+    "payment.refund",
+    cost=Money(amount="5000.00", currency="USD"),
+    reversibility=Reversibility.IRREVERSIBLE,
+    effect=Effect(key_param="idempotency_key"),
+    # What the human READS — an integrator-authored one-liner (of the tool args):
+    summary=lambda charge_id, amount_cents, **_: (
+        f"Refund ${amount_cents / 100:,.2f} for charge {charge_id}"
+    ),
+    # ...and a curated context panel. YOU pick what the reviewer sees; the raw
+    # tool args (here the card number) never auto-transit — that is the boundary.
+    context=lambda charge_id, amount_cents, **_: {
+        "customer": "acme@example.com",
+        "charge": charge_id,
+        "amount": f"${amount_cents / 100:,.2f}",
+    },
+)
+def issue_refund(charge_id, amount_cents, *, card_number, idempotency_key=None):
+    return {"charge_id": charge_id}
+
+# Capture what the transport actually delivers to the human:
+seen_by_reviewer = io.StringIO()
+transport = ConsoleApprovalTransport("approvals.jsonl", out=seen_by_reviewer)
+app = airlock.init(
+    policy=Policy(rules=[Rule(match="payment.*", decision=Decision.GATE)]),
+    transport=transport,
+    gate_wait=False,  # deliver + durably pause; don't block this example
+)
+
+try:
+    issue_refund("ch_9", 500_000, card_number="4111-1111-1111-1111")
+except airlock.ActionPending:
+    pass  # durably paused, awaiting a human — as expected
+
+shown = seen_by_reviewer.getvalue()
+assert "Refund $5,000.00 for charge ch_9" in shown   # the summary the human reads
+assert "customer: acme@example.com" in shown          # the curated context panel
+assert "charge: ch_9" in shown
+assert "4111-1111-1111-1111" not in shown  # the raw card arg NEVER auto-transits
+app.store.close()
+```
+
+Both fields are **strings-only and size-capped** at the wire boundary (`summary`
+≤ 500 chars; `context` ≤ 20 keys, key ≤ 64, value ≤ 500) — an over-limit or
+non-string value raises there and *nothing* is sent, so a gate can never quietly
+smuggle a payload past the boundary.
+
+---
+
+## A rejection is control flow, not a dead end — reason codes
+
+When a human rejects a gated action, the agent shouldn't just fail — it should
+*react*. `@guard(reject_reasons=...)` declares the structured codes this action
+offers a reviewer (`code -> human label`). The reviewer picks one, and the chosen
+code comes back on `ApprovalRejected.reason_code` so the calling agent can branch
+on it — retry with more detail, escalate, or give up, deterministically.
+
+<!-- airlock:test id=reject_reasons -->
+```python
+import airlock
+from airlock import Decision, Money, Policy, Reversibility, Rule
+from airlock.transport.console import ConsoleApprovalTransport
+
+charged = []  # so we can prove the side effect never ran on a rejection
+
+@airlock.guard(
+    "payment.charge",
+    cost=Money(amount="900.00", currency="USD"),
+    reversibility=Reversibility.IRREVERSIBLE,
+    # The codes THIS action offers a reviewer who rejects (code -> human label):
+    reject_reasons={
+        "suspected_fraud": "Suspected fraud",
+        "needs_more_info": "Needs more information",
+        "over_limit": "Over the customer's limit",
+    },
+)
+def charge_card(customer_id, amount_cents):
+    charged.append(customer_id)  # the money-moving side effect
+    return {"customer_id": customer_id, "amount_cents": amount_cents}
+
+transport = ConsoleApprovalTransport("approvals.jsonl")
+app = airlock.init(
+    policy=Policy(rules=[Rule(match="payment.*", decision=Decision.GATE)]),
+    transport=transport,
+    gate_wait=True,
+    gate_timeout=0.0,  # scan the approvals file once, never block (deterministic)
+)
+
+# 1) The agent calls the tool; with no decision yet, it durably pauses.
+try:
+    charge_card("cus_42", 90_000)
+except airlock.ActionPending as pending:
+    ref = pending.approval_ref  # the resume handle
+
+# 2) A human reviews it and REJECTS, picking one of the offered codes + a note.
+#    (Scripted here by appending to the console approvals file.)
+transport.record_decision(
+    ref, "rejected", reason_code="suspected_fraud", reason="card reported stolen"
+)
+
+# 3) The agent retries the SAME action. It re-attaches to the paused run, sees
+#    the decision, and the rejection comes back as CONTROL FLOW, not a dead end:
+handled = None
+try:
+    charge_card("cus_42", 90_000)
+except airlock.ApprovalRejected as rej:
+    if rej.reason_code == "needs_more_info":
+        handled = "resubmit with more detail"
+    elif rej.reason_code == "suspected_fraud":
+        handled = "escalate to the fraud team"  # branch on the coded reason
+    else:
+        handled = "give up"
+    note = rej.reason  # the optional free-text the reviewer left
+
+assert handled == "escalate to the fraud team"
+assert note == "card reported stolen"
+assert charged == []  # the card was NEVER charged — the effect stayed fenced
+app.store.close()
+```
+
+The codes are **your** vocabulary — Airlock never invents or validates them, it
+just carries the reviewer's choice back verbatim. Because the code is persisted
+on the paused run, a *fresh-process* resume (a webhook, a reconciler sweep) still
+surfaces the same `reason_code`, not only the inline path. Like `context`,
+`reject_reasons` is integrator-authored only and never populated from tool args.
+
+---
+
 ## Exactly-once, or honest about it
 
 Airlock can only *guarantee* exactly-once when the downstream effect is either

@@ -727,8 +727,14 @@ def _durable_pause(
         run = _reload_run(runtime, run.approval_ref)
 
     return _deliver_and_wait(
-        runtime, spec, run, ledger_key, resolved_cost, resolved_blast,
-        resolved_summary, resolved_context,
+        runtime,
+        spec,
+        run,
+        ledger_key,
+        resolved_cost,
+        resolved_blast,
+        resolved_summary,
+        resolved_context,
     )
 
 

@@ -29,7 +29,7 @@ import pytest
 
 from airlock import guard, init
 from airlock.errors import ActionPending
-from airlock.policy import Decision, Policy
+from airlock.policy import Policy
 from airlock.transport import PauseRequest, SendReceipt
 from airlock.transport.http import (
     MAX_REVIEW_CONTEXT_KEY_CHARS,
@@ -38,10 +38,11 @@ from airlock.transport.http import (
     WIRE_ALLOWLIST,
     ApprovalRequestWire,
 )
-from airlock.types import BlastRadius, Money, Reversibility
+from airlock.types import BlastRadius, Decision, Money, Reversibility
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
+    from pathlib import Path
 
 pytestmark = pytest.mark.usefixtures("guard_isolation")
 
@@ -66,21 +67,21 @@ class _CapturingTransport:
 
 
 @pytest.fixture
-def gate(tmp_path: object) -> Iterator[_CapturingTransport]:
+def gate(tmp_path: Path) -> Iterator[_CapturingTransport]:
     """Wire an @guard runtime whose GATE path captures its PauseRequest."""
     from airlock.store.sqlite import SqliteStore
 
-    store = SqliteStore(str(tmp_path) + "/airlock.db")  # type: ignore[operator]
+    store = SqliteStore(str(tmp_path / "airlock.db"))
     store.ensure_schema()
     transport = _CapturingTransport()
     init(store=store, policy=Policy(default=Decision.GATE), transport=transport, gate_wait=False)
     yield transport
 
 
-def _gate_call(fn: object, *args: object, **kwargs: object) -> PauseRequest:
+def _gate_call(fn: Callable[..., object], *args: object, **kwargs: object) -> None:
     """Invoke a gated tool (which raises ActionPending under gate_wait=False)."""
     with pytest.raises(ActionPending):
-        fn(*args, **kwargs)  # type: ignore[operator]
+        fn(*args, **kwargs)
 
 
 # ===========================================================================
@@ -237,9 +238,7 @@ def test_boundary_refuses_non_string_key() -> None:
 def test_boundary_refuses_too_many_keys() -> None:
     too_many = {f"k{i}": "v" for i in range(MAX_REVIEW_CONTEXT_KEYS + 1)}
     with pytest.raises(ValueError, match="exceeding the cap"):
-        ApprovalRequestWire.from_pause_request(
-            _pause(review_context=too_many), sdk_version="0.0.1"
-        )
+        ApprovalRequestWire.from_pause_request(_pause(review_context=too_many), sdk_version="0.0.1")
     # Exactly at the cap is allowed.
     at_cap = {f"k{i}": "v" for i in range(MAX_REVIEW_CONTEXT_KEYS)}
     wire = ApprovalRequestWire.from_pause_request(

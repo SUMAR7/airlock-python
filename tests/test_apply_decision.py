@@ -302,6 +302,75 @@ def test_duplicate_reject_returns_recorded_outcome_without_second_event(
     verify_chain(store)
 
 
+REJECT_WITH_CODE = ApprovalDecision(
+    decision=HumanDecision.REJECTED,
+    decided_by="usr_no",
+    reason="please attach the signed invoice",
+    reason_code="needs_more_info",
+)
+
+
+def test_reject_with_code_persists_reason_code_and_surfaces_it(
+    store: PostgresStore, db: Engine, effects: EffectsLog
+) -> None:
+    """A rejection carrying reason_code (P3.9) is persisted on the row AND
+    surfaced on the DecisionOutcome (the whole inbound path)."""
+    key = "k-apply-rej-code"
+    ref = _persist_pause(store, key=key)
+    outcome = apply_decision(store, ref, REJECT_WITH_CODE, registry=_registry(effects, key))
+
+    assert outcome.status is PauseStatus.ABORTED
+    assert outcome.human_decision is HumanDecision.REJECTED
+    # Surfaced on the outcome (→ ApprovalRejected.reason_code in @guard).
+    assert outcome.reason_code == "needs_more_info"
+    assert outcome.reason == "please attach the signed invoice"
+    # Persisted on the paused_runs row (not only in memory).
+    run = store.load_paused_by_ref(ref)
+    assert run is not None
+    assert run.reason_code == "needs_more_info"
+    assert run.reason == "please attach the signed invoice"
+    verify_chain(store)
+
+
+def test_approval_leaves_reason_code_none(
+    store: PostgresStore, effects: EffectsLog
+) -> None:
+    """An approval (no rejection) carries no reason_code — it stays None."""
+    key = "k-apply-appr-nocode"
+    ref = _persist_pause(store, key=key)
+    outcome = apply_decision(store, ref, APPROVE, registry=_registry(effects, key))
+    assert outcome.status is PauseStatus.COMMITTED
+    assert outcome.reason_code is None
+    assert outcome.reason is None
+    run = store.load_paused_by_ref(ref)
+    assert run is not None and run.reason_code is None and run.reason is None
+
+
+def test_fresh_process_resume_surfaces_persisted_reason_code(
+    store: PostgresStore, backend: Any, effects: EffectsLog
+) -> None:
+    """A FRESH process (new store over the same DB) that rehydrates by
+    approval_ref still surfaces the persisted reason_code — it does not live
+    only in the in-memory ApprovalDecision (P3.9)."""
+    key = "k-apply-rej-code-resume"
+    ref = _persist_pause(store, key=key)
+    # "Process 1" records the rejection (persists reason_code on the row).
+    apply_decision(store, ref, REJECT_WITH_CODE, registry=_registry(effects, key))
+
+    # "Process 2": a brand-new store object over the same database, driving the
+    # already-recorded decision home with NO fresh decision (redelivery / sweep).
+    fresh = backend.make_store()
+    try:
+        outcome = apply_decision(fresh, ref, None, registry=_registry(effects, key))
+    finally:
+        fresh.close()
+    assert outcome.status is PauseStatus.ABORTED
+    assert outcome.human_decision is HumanDecision.REJECTED
+    assert outcome.reason_code == "needs_more_info"  # surfaced from the row, fresh process
+    assert outcome.reason == "please attach the signed invoice"
+    assert not outcome.applied  # the terminal outcome was merely read back
+
+
 def test_conflicting_decisions_first_writer_wins(store: PostgresStore, effects: EffectsLog) -> None:
     """Approve lands first; a late reject cannot flip it — it returns the
     recorded committed outcome (the ADR-4 DAG has no approved->rejected edge)."""

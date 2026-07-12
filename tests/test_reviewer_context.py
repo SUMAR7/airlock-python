@@ -32,6 +32,9 @@ from airlock.errors import ActionPending
 from airlock.policy import Policy
 from airlock.transport import PauseRequest, SendReceipt
 from airlock.transport.http import (
+    MAX_REJECT_REASON_CODE_CHARS,
+    MAX_REJECT_REASON_DESC_CHARS,
+    MAX_REJECT_REASONS,
     MAX_REVIEW_CONTEXT_KEY_CHARS,
     MAX_REVIEW_CONTEXT_KEYS,
     MAX_REVIEW_CONTEXT_VALUE_CHARS,
@@ -195,6 +198,7 @@ def _pause(
     *,
     summary: str = "Refund invoice inv_42",
     review_context: object = None,
+    reject_reasons: object = None,
 ) -> PauseRequest:
     return PauseRequest(
         approval_ref="3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b",
@@ -206,6 +210,7 @@ def _pause(
         reversibility=Reversibility.IRREVERSIBLE,
         blast_radius_estimate=BlastRadius.LOW,
         review_context=review_context,  # type: ignore[arg-type]  # deliberately loose
+        reject_reasons=reject_reasons,  # type: ignore[arg-type]  # deliberately loose
     )
 
 
@@ -279,9 +284,161 @@ def test_boundary_accepts_a_flat_string_map() -> None:
 def test_wire_allowlist_includes_review_context_and_forbids_payloads() -> None:
     assert set(ApprovalRequestWire.model_fields) == set(WIRE_ALLOWLIST)
     assert "review_context" in WIRE_ALLOWLIST
+    assert "reject_reasons" in WIRE_ALLOWLIST
     # The never-transits fields still have NO field on the wire model.
     for forbidden in ("idempotency_key", "downstream_key", "args", "payload", "result_json"):
         assert forbidden not in WIRE_ALLOWLIST
+
+
+# ===========================================================================
+# P3.9 — reject_reasons (OFFERED codes) onto the reject_reasons wire field.
+# ===========================================================================
+
+
+def test_reject_reasons_dict_populates_the_wire_field(gate: _CapturingTransport) -> None:
+    reasons = {"needs_more_info": "Needs more information", "not_authorized": "Not authorized"}
+
+    @guard("refund.create", reject_reasons=reasons)
+    def refund(invoice: str) -> str:  # pragma: no cover
+        return "ok"
+
+    _gate_call(refund, "inv_42")
+    request = gate.requests[-1]
+    assert request.reject_reasons == reasons
+    wire = ApprovalRequestWire.from_pause_request(request, sdk_version="0.0.1")
+    assert wire.reject_reasons == reasons
+
+
+def test_reject_reasons_callable_populates_the_wire_field(gate: _CapturingTransport) -> None:
+    @guard(
+        "refund.create",
+        reject_reasons=lambda invoice: {"duplicate": f"{invoice} looks like a duplicate"},
+    )
+    def refund(invoice: str) -> str:  # pragma: no cover
+        return "ok"
+
+    _gate_call(refund, "inv_77")
+    assert gate.requests[-1].reject_reasons == {"duplicate": "inv_77 looks like a duplicate"}
+
+
+def test_reject_reasons_none_omits_the_field_on_the_wire(gate: _CapturingTransport) -> None:
+    @guard("refund.create")
+    def refund(invoice: str) -> str:  # pragma: no cover
+        return "ok"
+
+    _gate_call(refund, "inv_1")
+    request = gate.requests[-1]
+    assert request.reject_reasons is None
+    wire = ApprovalRequestWire.from_pause_request(request, sdk_version="0.0.1")
+    assert wire.reject_reasons is None
+    # ...and the field is OMITTED entirely from the serialized wire body.
+    assert b"reject_reasons" not in wire.to_json_bytes()
+
+
+def test_reject_reasons_is_never_auto_populated_from_args(gate: _CapturingTransport) -> None:
+    """Like review_context: raw args NEVER become reject_reasons (PLAN.md 6.1)."""
+
+    @guard("refund.create")
+    def refund(invoice: str, card_number: str) -> str:  # pragma: no cover
+        return "ok"
+
+    _gate_call(refund, "inv_42", "4111111111111111")
+    request = gate.requests[-1]
+    assert request.reject_reasons is None  # args did NOT leak into reject_reasons
+    wire = ApprovalRequestWire.from_pause_request(request, sdk_version="0.0.1")
+    body = wire.to_json_bytes()
+    assert b"4111111111111111" not in body
+    assert b"card_number" not in body
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        1250,  # a smuggled number
+        12.5,  # a smuggled float
+        True,  # a bool (int subclass) — must NOT count as a string
+        {"card": "4111"},  # a smuggled nested payload object
+        ["a", "b"],  # a smuggled list
+        None,  # a null value (not a string)
+    ],
+    ids=["int", "float", "bool", "nested_dict", "list", "null"],
+)
+def test_reject_reasons_boundary_refuses_non_string_value(bad_value: object) -> None:
+    with pytest.raises(ValueError, match="reject_reasons"):
+        ApprovalRequestWire.from_pause_request(
+            _pause(reject_reasons={"code": bad_value}), sdk_version="0.0.1"
+        )
+
+
+def test_reject_reasons_boundary_refuses_non_string_code() -> None:
+    with pytest.raises(ValueError, match="codes must be strings"):
+        ApprovalRequestWire.from_pause_request(
+            _pause(reject_reasons={123: "value"}), sdk_version="0.0.1"
+        )
+
+
+def test_reject_reasons_boundary_refuses_too_many_codes() -> None:
+    too_many = {f"c{i}": "v" for i in range(MAX_REJECT_REASONS + 1)}
+    with pytest.raises(ValueError, match="exceeding the cap"):
+        ApprovalRequestWire.from_pause_request(_pause(reject_reasons=too_many), sdk_version="0.0.1")
+    # Exactly at the cap is allowed.
+    at_cap = {f"c{i}": "v" for i in range(MAX_REJECT_REASONS)}
+    wire = ApprovalRequestWire.from_pause_request(
+        _pause(reject_reasons=at_cap), sdk_version="0.0.1"
+    )
+    assert wire.reject_reasons is not None and len(wire.reject_reasons) == MAX_REJECT_REASONS
+
+
+def test_reject_reasons_boundary_refuses_over_length_code() -> None:
+    with pytest.raises(ValueError, match="exceeding the cap"):
+        ApprovalRequestWire.from_pause_request(
+            _pause(reject_reasons={"c" * (MAX_REJECT_REASON_CODE_CHARS + 1): "v"}),
+            sdk_version="0.0.1",
+        )
+
+
+def test_reject_reasons_boundary_refuses_over_length_description() -> None:
+    with pytest.raises(ValueError, match="exceeding the cap"):
+        ApprovalRequestWire.from_pause_request(
+            _pause(reject_reasons={"c": "v" * (MAX_REJECT_REASON_DESC_CHARS + 1)}),
+            sdk_version="0.0.1",
+        )
+    # Exactly at the cap is allowed (the description cap is 200, distinct from
+    # review_context's 500 — a mutation that reuses 500 here reddens this).
+    wire = ApprovalRequestWire.from_pause_request(
+        _pause(reject_reasons={"c": "v" * MAX_REJECT_REASON_DESC_CHARS}), sdk_version="0.0.1"
+    )
+    assert wire.reject_reasons == {"c": "v" * MAX_REJECT_REASON_DESC_CHARS}
+
+
+def test_reject_reasons_boundary_accepts_a_flat_string_map() -> None:
+    wire = ApprovalRequestWire.from_pause_request(
+        _pause(reject_reasons={"needs_more_info": "Needs more information"}),
+        sdk_version="0.0.1",
+    )
+    assert wire.reject_reasons == {"needs_more_info": "Needs more information"}
+
+
+def test_reject_reasons_and_review_context_coexist_on_the_wire(gate: _CapturingTransport) -> None:
+    """Both optional metadata fields can be present together; order is context then
+    reject_reasons (reject_reasons last), so byte-stability holds for each alone."""
+
+    @guard(
+        "refund.create",
+        context={"customer": "acme@co"},
+        reject_reasons={"not_authorized": "Not authorized"},
+    )
+    def refund(invoice: str) -> str:  # pragma: no cover
+        return "ok"
+
+    _gate_call(refund, "inv_42")
+    request = gate.requests[-1]
+    wire = ApprovalRequestWire.from_pause_request(request, sdk_version="0.0.1")
+    body = wire.to_json_bytes()
+    assert wire.review_context == {"customer": "acme@co"}
+    assert wire.reject_reasons == {"not_authorized": "Not authorized"}
+    # Field order: review_context precedes reject_reasons in the serialized bytes.
+    assert body.index(b"review_context") < body.index(b"reject_reasons")
 
 
 def test_wire_model_still_forbids_a_smuggled_extra_field() -> None:

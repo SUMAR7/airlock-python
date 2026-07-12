@@ -50,13 +50,29 @@ class _AutoDecideTransport(ConsoleApprovalTransport):
     the real console file read path with no threads and no sleeping.
     """
 
-    def __init__(self, path: Path, decision: HumanDecision, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        path: Path,
+        decision: HumanDecision,
+        *,
+        reason: str | None = None,
+        reason_code: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(path, out=io.StringIO(), **kwargs)
         self._decision = decision
+        self._reason = reason
+        self._reason_code = reason_code
 
     def send(self, request: Any) -> Any:
         receipt = super().send(request)
-        self.record_decision(request.approval_ref, self._decision, decided_by="usr_auto")
+        self.record_decision(
+            request.approval_ref,
+            self._decision,
+            decided_by="usr_auto",
+            reason=self._reason,
+            reason_code=self._reason_code,
+        )
         return receipt
 
 
@@ -134,6 +150,45 @@ def test_gate_inline_reject_raises_and_runs_nothing(
             text("SELECT count(*) FROM commit_records WHERE action_type = 'gate.refund'")
         ).scalar_one()
     assert ledger == 0
+
+
+def test_gate_inline_reject_surfaces_reason_code_on_the_exception(
+    store: PostgresStore, effects: EffectsLog, db: Engine, tmp_path: Path
+) -> None:
+    """The reviewer's chosen code flows all the way through: wire/transport →
+    ApprovalDecision → persisted on paused_runs → ApprovalRejected.reason_code
+    (P3.9). The offered reject_reasons are integrator-authored on @guard."""
+    transport = _AutoDecideTransport(
+        tmp_path / "ap.jsonl",
+        HumanDecision.REJECTED,
+        reason="please attach the signed invoice",
+        reason_code="needs_more_info",
+    )
+    init(store=store, transport=transport)
+
+    @guard(
+        "gate.refund",
+        cost=Money(amount="120.00", currency="USD"),
+        reversibility=Reversibility.IRREVERSIBLE,
+        effect=Effect(key_param="idempotency_key"),
+        reject_reasons={
+            "needs_more_info": "Needs more information",
+            "not_authorized": "Not authorized for this amount",
+        },
+    )
+    def do_refund(invoice: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        effects.log(invoice)  # pragma: no cover — gated, rejected, never runs
+        return {"refunded": invoice}
+
+    with pytest.raises(ApprovalRejected) as excinfo:
+        do_refund("inv_rc")
+    assert excinfo.value.reason_code == "needs_more_info"
+    assert excinfo.value.reason == "please attach the signed invoice"
+    assert excinfo.value.decided_by == "usr_auto"
+    assert effects.count("inv_rc") == 0
+    # And it is durably on the row (a fresh-process resume would surface it too).
+    run = store.load_paused_by_ref(excinfo.value.approval_ref)
+    assert run is not None and run.reason_code == "needs_more_info"
 
 
 def test_gate_inline_dedupes_a_retry(

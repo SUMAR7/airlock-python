@@ -92,6 +92,7 @@ WIRE_ALLOWLIST = frozenset(
         "requested_at",
         "sdk_version",
         "review_context",
+        "reject_reasons",
     }
 )
 
@@ -105,6 +106,14 @@ MAX_ACTION_SUMMARY_CHARS = 500
 MAX_REVIEW_CONTEXT_KEYS = 20
 MAX_REVIEW_CONTEXT_KEY_CHARS = 64
 MAX_REVIEW_CONTEXT_VALUE_CHARS = 500
+
+#: ``reject_reasons`` size caps (P3.9 / openapi.yaml CreateApprovalRequest). The
+#: OFFERED rejection codes are curated metadata (code -> short human
+#: description), never a payload channel — so the map stays small, the code keys
+#: short, and each description one human-readable line.
+MAX_REJECT_REASONS = 20
+MAX_REJECT_REASON_CODE_CHARS = 64
+MAX_REJECT_REASON_DESC_CHARS = 200
 
 
 class ApprovalTransportError(AirlockError):
@@ -189,6 +198,69 @@ def _validate_review_context(
     return validated
 
 
+def _validate_reject_reasons(
+    reasons: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    """Validate integrator ``reject_reasons`` into a flat ``dict[str, str]`` — the boundary.
+
+    THE structural chokepoint for the OFFERED rejection codes (P3.9), the exact
+    twin of :func:`_validate_review_context`: ``reject_reasons`` is metadata-only
+    (a ``code -> short human description`` map), so it MUST be a flat
+    string→string map within the size caps, and this is the single place that
+    guarantee is enforced. Anything else — a non-string key/code, a non-string
+    value (an int, a nested dict, a list — a smuggled payload object), a bool
+    masquerading as a string, or an over-limit map/code/description — raises a
+    ``ValueError`` at BUILD TIME, before the wire body exists, so a bad shape can
+    NEVER be signed or sent. ``None`` passes through as ``None`` (the field is
+    omitted from the wire).
+
+    Caps (documented in openapi.yaml CreateApprovalRequest): ≤
+    :data:`MAX_REJECT_REASONS` codes, each code key ≤
+    :data:`MAX_REJECT_REASON_CODE_CHARS` chars, each description value ≤
+    :data:`MAX_REJECT_REASON_DESC_CHARS` chars.
+    """
+    if reasons is None:
+        return None
+    if not isinstance(reasons, Mapping):
+        raise ValueError(
+            f"reject_reasons must be a flat Mapping[str, str], got {type(reasons).__name__}"
+        )
+    if len(reasons) > MAX_REJECT_REASONS:
+        raise ValueError(
+            f"reject_reasons has {len(reasons)} codes, exceeding the cap of "
+            f"{MAX_REJECT_REASONS}; it is the offered-code set, not a payload channel."
+        )
+    validated: dict[str, str] = {}
+    for key, value in reasons.items():
+        # bool is an int subclass; require EXACT str for both the code and its
+        # description — no coercion, no smuggling.
+        if not isinstance(key, str):
+            raise ValueError(
+                f"reject_reasons codes must be strings; got a "
+                f"{type(key).__name__} code ({key!r}). reject_reasons is strings-only "
+                "(no numbers, no nested objects) — that is the metadata-only boundary."
+            )
+        if not isinstance(value, str):
+            raise ValueError(
+                f"reject_reasons[{key!r}] must be a string description; got "
+                f"{type(value).__name__} ({value!r}). reject_reasons is strings-only — a "
+                "nested object, list, or number is a payload and must NOT cross the "
+                "boundary (PLAN.md 6.1)."
+            )
+        if len(key) > MAX_REJECT_REASON_CODE_CHARS:
+            raise ValueError(
+                f"reject_reasons code {key!r} is {len(key)} chars, exceeding the cap of "
+                f"{MAX_REJECT_REASON_CODE_CHARS}."
+            )
+        if len(value) > MAX_REJECT_REASON_DESC_CHARS:
+            raise ValueError(
+                f"reject_reasons[{key!r}] is {len(value)} chars, exceeding the cap of "
+                f"{MAX_REJECT_REASON_DESC_CHARS}."
+            )
+        validated[key] = value
+    return validated
+
+
 class ApprovalRequestWire(BaseModel):
     """The ``POST /api/v1/approvals`` body — EXACTLY the frozen allowlist.
 
@@ -220,6 +292,12 @@ class ApprovalRequestWire(BaseModel):
     # excluded when absent (to_json_bytes) — a create with no review_context
     # serializes byte-for-byte as it did pre-P3.6 (the frozen signing vector).
     review_context: dict[str, str] | None = None
+    # OPTIONAL, and LAST after review_context (P3.9) so the field order is
+    # base... , review_context, reject_reasons — each appended only when present
+    # and excluded when absent (to_json_bytes). A create with neither is
+    # byte-identical to the frozen pre-P3.6 vector; a create with only
+    # review_context is byte-identical to the frozen with-context vector.
+    reject_reasons: dict[str, str] | None = None
 
     @classmethod
     def from_pause_request(cls, request: PauseRequest, *, sdk_version: str) -> ApprovalRequestWire:
@@ -232,14 +310,15 @@ class ApprovalRequestWire(BaseModel):
         enum has no null); ``requested_at`` is formatted as the airlock-canon-1
         RFC 3339 string.
 
-        ``review_context`` is the ONE place the strings-only + size-cap boundary
-        is enforced (:func:`_validate_review_context`): the loose
-        ``PauseRequest.review_context`` mapping is validated into a flat
+        ``review_context`` and ``reject_reasons`` are the TWO places the
+        strings-only + size-cap boundary is enforced
+        (:func:`_validate_review_context` / :func:`_validate_reject_reasons`):
+        each loose ``PauseRequest`` mapping is validated into a flat
         ``dict[str, str]`` here, so a smuggled non-string / oversized entry
         raises at BUILD TIME and nothing transits (PLAN.md 6.1 / SPEC.md 3).
         There is no branch that could copy an arg, a key, or a result — those do
-        not exist on ``PauseRequest``, and ``review_context`` is integrator-
-        authored, never derived from args.
+        not exist on ``PauseRequest``, and both fields are integrator-authored,
+        never derived from args.
         """
         return cls(
             approval_ref=request.approval_ref,
@@ -256,17 +335,24 @@ class ApprovalRequestWire(BaseModel):
             requested_at=rfc3339_utc(request.requested_at),
             sdk_version=sdk_version,
             review_context=_validate_review_context(request.review_context),
+            reject_reasons=_validate_reject_reasons(request.reject_reasons),
         )
 
     def to_json_bytes(self) -> bytes:
         """The exact request-body bytes to sign and send (compact, ordered).
 
-        ``review_context`` is EXCLUDED when ``None`` so a create without it is
-        byte-identical to the pre-P3.6 body (the frozen signing vector); when
-        present it is appended last (the field order). The bytes signed are the
+        Each optional field (``review_context``, then ``reject_reasons``) is
+        EXCLUDED when ``None``, so a create carrying neither is byte-identical to
+        the pre-P3.6 body (the frozen signing vector) and one carrying only
+        ``review_context`` is byte-identical to the frozen with-context vector;
+        a present field is appended in field order. The bytes signed are the
         bytes sent (signing.md §2).
         """
-        exclude = {"review_context"} if self.review_context is None else None
+        exclude = {
+            name
+            for name in ("review_context", "reject_reasons")
+            if getattr(self, name) is None
+        } or None
         return self.model_dump_json(exclude=exclude).encode("utf-8")
 
 
@@ -462,6 +548,9 @@ class HttpApprovalTransport:
             decided_at=_parse_rfc3339(data.get("decided_at")),
             decision_latency_ms=_opt_int(data.get("decision_latency_ms")),
             reason=_opt_str(data.get("reason")),
+            # The structured code the human CHOSE from the offered set (P3.9),
+            # carried VERBATIM alongside the free-text reason.
+            reason_code=_opt_str(data.get("reason_code")),
         )
 
     @staticmethod
@@ -734,6 +823,7 @@ def _parse_webhook(raw_body: bytes) -> tuple[str, ApprovalDecision] | None:
         decided_at=_parse_rfc3339(data.get("decided_at")),
         decision_latency_ms=_opt_int(data.get("decision_latency_ms")),
         reason=_opt_str(data.get("reason")),
+        reason_code=_opt_str(data.get("reason_code")),
     )
     return approval_ref, decision
 

@@ -231,11 +231,27 @@ class ApprovalRejected(AirlockError):
     (collide-and-dedupe, PLAN.md 4.3) — a deliberate second attempt needs a
     distinguishing arg or a ``key`` override.
 
+    The reviewer's structured CHOICE flows back here (P3.9): ``reason_code`` is
+    the code the human picked from the set the action OFFERED
+    (``@guard(reject_reasons=...)``), so the calling agent can branch on it
+    (``except ApprovalRejected as rej: if rej.reason_code == "needs_more_info":
+    ...``); ``reason`` is the optional free-text note. Both are ``None`` when the
+    reviewer chose no code / left no note, or when the transport carried neither.
+    They originate from the ``ApprovalDecision`` the transport returned, are
+    persisted on the ``paused_runs`` row when the decision is applied, and are
+    surfaced from there — so a FRESH-process resume (a redelivery / reconciler
+    sweep that rehydrates by ``approval_ref``) surfaces the same code, not only
+    the in-memory path.
+
     Attributes:
         action_type: the rejected action.
         run_id: the paused run.
         approval_ref: the approval reference the rejection resolved.
         decided_by: the opaque actor id that rejected, if recorded.
+        reason_code: the structured code the human chose from the offered set,
+            or ``None``. Opaque here — the SDK never re-validates it against the
+            offered set (the control plane owns that).
+        reason: the optional free-text reason the human gave, or ``None``.
     """
 
     def __init__(
@@ -246,12 +262,16 @@ class ApprovalRejected(AirlockError):
         run_id: str,
         approval_ref: str,
         decided_by: str | None = None,
+        reason_code: str | None = None,
+        reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.action_type = action_type
         self.run_id = run_id
         self.approval_ref = approval_ref
         self.decided_by = decided_by
+        self.reason_code = reason_code
+        self.reason = reason
 
 
 class UnknownApprovalRef(AirlockError):

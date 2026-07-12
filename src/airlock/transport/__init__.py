@@ -65,6 +65,15 @@ class PauseRequest:
     (``from_pause_request``), so a smuggled non-string / oversized value can
     never reach the wire (PLAN.md 6.1 / SPEC.md 3). It is integrator-authored
     ONLY: ``@guard`` never populates it from the tool args.
+
+    ``reject_reasons`` is the OPTIONAL integrator-authored set of structured
+    rejection CODES the action OFFERS a human (``{"needs_more_info": "Needs
+    more information", "not_authorized": "Not authorized"}`` — code → short
+    human description, P3.9). A human who REJECTS picks one, and the chosen code
+    flows back on the decision (``ApprovalRejected.reason_code``). Same boundary
+    posture as ``review_context``: a LOOSE ``Mapping`` here, validated
+    strings-only + size-capped once, structurally, at ``from_pause_request``. It
+    is integrator-authored ONLY: ``@guard`` never populates it from the args.
     """
 
     approval_ref: str
@@ -76,6 +85,7 @@ class PauseRequest:
     reversibility: Reversibility | None = None
     blast_radius_estimate: BlastRadius | None = None
     review_context: Mapping[str, str] | None = None
+    reject_reasons: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)

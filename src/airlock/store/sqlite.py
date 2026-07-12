@@ -255,6 +255,8 @@ def _row_to_paused(row: sqlite3.Row) -> PausedRun:
         decided_by_display=row["decided_by_display"],
         decided_at=sqlite_text_to_dt(row["decided_at"]),
         decision_latency_ms=row["decision_latency_ms"],
+        reason=row["reason"],
+        reason_code=row["reason_code"],
         created_at=_require_dt(row["created_at"]),
         resolved_at=sqlite_text_to_dt(row["resolved_at"]),
     )
@@ -376,7 +378,9 @@ def _transition_paused_sql(with_decision: bool) -> str:
                decided_by = :decided_by,
                decided_by_display = :decided_by_display,
                decided_at = :decided_at,
-               decision_latency_ms = :decision_latency_ms"""
+               decision_latency_ms = :decision_latency_ms,
+               reason = :reason,
+               reason_code = :reason_code"""
         if with_decision
         else ""
     )
@@ -727,6 +731,8 @@ class SqliteStore:
                     "decided_by_display": decision.decided_by_display,
                     "decided_at": sqlite_dt_to_text(decided_at),
                     "decision_latency_ms": decision.decision_latency_ms,
+                    "reason": decision.reason,
+                    "reason_code": decision.reason_code,
                 }
             )
             sql = _TRANSITION_PAUSED_WITH_DECISION_SQL

@@ -1,0 +1,16 @@
+{
+  "approval_ref": "3f8b1c2a-9d4e-4f6a-8b1c-2a9d4e4f6a8b",
+  "run_id": "run_9d1f2e3a4b5c6d7e8f9a0b1c2d3e4f50",
+  "action_type": "refund.create",
+  "action_summary": "Refund invoice inv_42 (12.50 EUR) to customer cus_8xq",
+  "cost": {"amount": "12.5", "currency": "EUR"},
+  "reversibility": "irreversible",
+  "blast_radius_estimate": "low",
+  "requested_at": "2026-07-11T03:59:20.000000Z",
+  "sdk_version": "0.0.1",
+  "review_context": {
+    "customer": "acme@co",
+    "order": "#1832",
+    "reason": "item defective, refund approved by support"
+  }
+}

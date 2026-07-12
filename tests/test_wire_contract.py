@@ -44,8 +44,10 @@ DOC: dict[str, Any] = yaml.safe_load(OPENAPI_PATH.read_text())
 
 # --- THE FROZEN ALLOWLIST (mirrors PLAN.md 6.1) ----------------------------
 # The exact set of keys the SDK may put on the wire in the create request.
-# Changing this set is a boundary change and needs a CONTRACT VERSION BUMP
-# (/api/v2), never an in-place edit — it is the compliance surface itself.
+# Changing this set is a boundary change: REMOVING/renaming a key needs a
+# CONTRACT VERSION BUMP (/api/v2); ADDING an OPTIONAL key is a backward-
+# compatible v1 widening (review_context, v1.1.0/P3.6). It is the compliance
+# surface itself.
 FROZEN_REQUEST_ALLOWLIST = frozenset(
     {
         "approval_ref",
@@ -57,8 +59,13 @@ FROZEN_REQUEST_ALLOWLIST = frozenset(
         "blast_radius_estimate",
         "requested_at",
         "sdk_version",
+        "review_context",
     }
 )
+
+# The REQUIRED subset (every allowlisted key except the sole optional one,
+# review_context). A pre-1.1.0 create body carries exactly these.
+FROZEN_REQUEST_REQUIRED = FROZEN_REQUEST_ALLOWLIST - {"review_context"}
 
 # Field names that must NEVER appear structurally in any request schema
 # (PLAN.md 6.1 never-transits list). Checked against property/required KEYS
@@ -124,7 +131,7 @@ def _all_property_names(node: Any) -> set[str]:
 
 def test_openapi_parses_and_is_3_1() -> None:
     assert DOC["openapi"].startswith("3.1")
-    assert DOC["info"]["version"] == "1.0.0"
+    assert DOC["info"]["version"] == "1.1.0"
 
 
 def test_exactly_the_three_calls_are_present() -> None:
@@ -157,8 +164,42 @@ def test_all_three_calls_require_the_signing_headers() -> None:
 
 def test_create_request_is_exactly_the_frozen_allowlist() -> None:
     req = _SCHEMAS["CreateApprovalRequest"]
+    # Every allowlisted key is a declared property; ONLY review_context is
+    # optional — everything else is still required (no accidental relaxation).
     assert set(req["properties"]) == set(FROZEN_REQUEST_ALLOWLIST)
-    assert set(req["required"]) == set(FROZEN_REQUEST_ALLOWLIST)
+    assert set(req["required"]) == set(FROZEN_REQUEST_REQUIRED)
+    assert "review_context" not in req["required"]
+
+
+def test_review_context_is_strings_only_and_size_capped() -> None:
+    """review_context is metadata-only: flat str->str, size-capped (PLAN.md 6.1)."""
+    rc = _SCHEMAS["CreateApprovalRequest"]["properties"]["review_context"]
+    assert rc["type"] == "object"
+    # values are strings (never a nested object/list/number) and capped
+    assert rc["additionalProperties"]["type"] == "string"
+    assert rc["additionalProperties"]["maxLength"] == 500
+    # at most 20 keys, each key <= 64 chars
+    assert rc["maxProperties"] == 20
+    assert rc["propertyNames"]["maxLength"] == 64
+
+
+def test_create_request_schema_rejects_non_string_review_context_value() -> None:
+    """A smuggled non-string review_context value fails the schema (strings-only)."""
+    good = json.loads((EXAMPLES / "create_approval.request.with_context.json").read_text())
+    validator = _validator_for("CreateApprovalRequest")
+    validator.validate(good)  # the honest all-strings body is valid
+    # An int value (a smuggled number) is rejected.
+    smuggled_num = copy.deepcopy(good)
+    smuggled_num["review_context"] = {"amount": 1250}
+    assert not validator.is_valid(smuggled_num)
+    # A nested object (a smuggled payload) is rejected.
+    smuggled_obj = copy.deepcopy(good)
+    smuggled_obj["review_context"] = {"payload": {"card": "4111"}}
+    assert not validator.is_valid(smuggled_obj)
+    # A list value is rejected.
+    smuggled_list = copy.deepcopy(good)
+    smuggled_list["review_context"] = {"items": ["a", "b"]}
+    assert not validator.is_valid(smuggled_list)
 
 
 def test_request_schemas_are_strict_egress() -> None:
@@ -233,6 +274,7 @@ def test_actor_id_is_opaque_never_email() -> None:
 
 EXAMPLE_TO_SCHEMA = {
     "create_approval.request.json": "CreateApprovalRequest",
+    "create_approval.request.with_context.json": "CreateApprovalRequest",
     "create_approval.response.json": "CreateApprovalResponse",
     "get_approval.response.json": "GetApprovalResponse",
     "approval_decided.webhook.json": "ApprovalDecidedWebhook",
@@ -254,8 +296,17 @@ def test_signed_vector_bodies_validate_against_request_schemas() -> None:
     _validator_for("CreateApprovalRequest").validate(create)
     webhook = json.loads(by_name["webhook_decided_post"]["raw_body"])
     _validator_for("ApprovalDecidedWebhook").validate(webhook)
-    # And the create body carries EXACTLY the allowlist keys, nothing more.
-    assert set(create) == set(FROZEN_REQUEST_ALLOWLIST)
+    # The no-context create body carries EXACTLY the required keys (no
+    # review_context) — byte-identical to the pre-1.1.0 body.
+    assert set(create) == set(FROZEN_REQUEST_REQUIRED)
+
+    # The with-context vector validates and carries ONLY allowlisted keys,
+    # including review_context — nothing outside the frozen allowlist transits.
+    create_ctx = json.loads(by_name["create_approval_with_context_post"]["raw_body"])
+    _validator_for("CreateApprovalRequest").validate(create_ctx)
+    assert set(create_ctx) <= set(FROZEN_REQUEST_ALLOWLIST)
+    assert "review_context" in create_ctx
+    assert all(isinstance(v, str) for v in create_ctx["review_context"].values())
 
 
 def test_create_request_rejects_a_forbidden_field() -> None:

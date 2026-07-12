@@ -380,6 +380,8 @@ class _GuardSpec:
     key_ignore: tuple[str, ...]
     effect: Effect
     preconditions: Callable[..., bool] | None
+    summary: str | Callable[..., str] | None
+    context: Mapping[str, str] | Callable[..., Mapping[str, str]] | None
 
 
 def guard(
@@ -392,6 +394,8 @@ def guard(
     key_ignore: tuple[str, ...] = (),
     effect: Effect | None = None,
     preconditions: Callable[..., bool] | None = None,
+    summary: str | Callable[..., str] | None = None,
+    context: Mapping[str, str] | Callable[..., Mapping[str, str]] | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorate a tool fn: decide auto/gate/deny per call, commit AUTO once.
 
@@ -424,6 +428,24 @@ def guard(
         preconditions: re-checked after the claim on the AUTO path and on
             reconciler retry (SPEC.md scenario 8); called with the canonical
             arg_map as kwargs.
+        summary: the integrator-authored one-line human summary the reviewer
+            reads (the ``action_summary`` wire field, PLAN.md 6.1). A plain
+            ``str`` or a callable of the SAME args as the tool returning one
+            (resolved per call on the GATE path ONLY — never on auto/deny, and
+            never seen by the pure policy). ``None`` keeps the default: the
+            ``action_type``. It is INTEGRATOR-authored, never ``repr(args)``;
+            capped at 500 chars at the wire boundary (over-length raises).
+        context: integrator-authored labeled key/values the reviewer sees
+            alongside the summary — e.g. ``{"customer": "acme@co", "order":
+            "#1832"}`` — surfaced as the ``review_context`` wire field. A flat
+            ``Mapping[str, str]`` or a callable of the args returning one
+            (resolved per call on the GATE path ONLY). STRINGS-ONLY and
+            size-capped (≤20 keys, key ≤64 chars, value ≤500 chars), enforced at
+            the ``ApprovalRequestWire`` boundary — a non-string or over-limit
+            entry raises there and NOTHING is sent (PLAN.md 6.1 / SPEC.md 3).
+            It is INTEGRATOR-authored ONLY: never auto-populated from the tool
+            args — the reviewer sees only what the developer chose to expose.
+            ``None`` omits the field entirely.
 
     Returns:
         A decorator that returns a wrapper with the same call signature; the
@@ -452,6 +474,8 @@ def guard(
             key_ignore=key_ignore,
             effect=resolved_effect,
             preconditions=preconditions,
+            summary=summary,
+            context=context,
         )
         # The ONLY decoration side effect: register recovery wiring (PLAN.md
         # 3.3 / the P1.3 registry). execute/preconditions are adapted to the
@@ -644,6 +668,14 @@ def _durable_pause(
     ``proposed`` run re-delivers and waits again. A deliberate second attempt
     needs a distinguishing arg or a ``key`` override (PLAN.md 4.3).
     """
+    # Resolve the reviewer-facing summary/context HERE — on the GATE path only,
+    # never on auto/deny and never before the pure policy (they are not policy
+    # inputs; PLAN.md 6.1's reviewer context). They are sent on the wire at
+    # send-time and are NOT persisted in serialized_state (a fresh-process
+    # resume never re-sends — it only drives the recorded decision home).
+    resolved_summary = _resolve(spec.summary, args, kwargs, "summary", str)
+    resolved_context = _resolve_context(spec.context, args, kwargs)
+
     arg_map = _arg_map(spec, args, kwargs)
     ledger_key = _ledger_key(spec, args, kwargs, arg_map)
     snapshot = _precondition_snapshot(spec, args, kwargs, runtime.now_fn)
@@ -694,7 +726,16 @@ def _durable_pause(
         # Still open (proposed/approved-not-yet-committed): re-deliver + wait.
         run = _reload_run(runtime, run.approval_ref)
 
-    return _deliver_and_wait(runtime, spec, run, ledger_key, resolved_cost, resolved_blast)
+    return _deliver_and_wait(
+        runtime,
+        spec,
+        run,
+        ledger_key,
+        resolved_cost,
+        resolved_blast,
+        resolved_summary,
+        resolved_context,
+    )
 
 
 def _deliver_and_wait(
@@ -704,6 +745,8 @@ def _deliver_and_wait(
     ledger_key: str,
     resolved_cost: Money | None,
     resolved_blast: BlastRadius | None,
+    resolved_summary: str | None,
+    resolved_context: Mapping[str, str] | None,
 ) -> Any:
     """``transport.send`` then, if ``gate_wait``, ``wait`` -> ``apply_decision``."""
     assert runtime.transport is not None  # narrowed by the caller
@@ -711,11 +754,14 @@ def _deliver_and_wait(
         approval_ref=run.approval_ref,
         run_id=run.run_id,
         action_type=spec.action_type,
-        summary=spec.action_type,
+        # summary=None falls back to the action_type (the pre-P3.6 default);
+        # never repr(args). The wire boundary caps it at 500 chars.
+        summary=resolved_summary if resolved_summary is not None else spec.action_type,
         requested_at=run.created_at,
         cost=resolved_cost,
         reversibility=spec.reversibility,
         blast_radius_estimate=resolved_blast,
+        review_context=resolved_context,
     )
     receipt = runtime.transport.send(request)
     # Persist the hosted approval_id (P3.4): a control-plane transport returns
@@ -1091,3 +1137,31 @@ def _resolve[T](
             f"got {type(value).__name__}"
         )
     return value
+
+
+def _resolve_context(
+    value: Mapping[str, str] | Callable[..., Mapping[str, str]] | None,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+) -> Mapping[str, str] | None:
+    """Resolve the static-or-callable ``context=`` arg against the call args.
+
+    A plain mapping is returned as-is; a callable is invoked with the tool's
+    ``*args, **kwargs`` and must return a mapping. Only the mapping SHAPE is
+    checked here — the strings-only + size-cap enforcement is deliberately
+    deferred to the ``ApprovalRequestWire`` boundary (``from_pause_request``),
+    the single structural chokepoint through which nothing bad can reach the
+    wire (PLAN.md 6.1). Resolution happens on the GATE path only.
+    """
+    if value is None:
+        return None
+    if callable(value) and not isinstance(value, Mapping):
+        produced = value(*args, **dict(kwargs))
+    else:
+        produced = value
+    if not isinstance(produced, Mapping):
+        raise TypeError(
+            f"context for a guarded action must be a Mapping[str, str] (or a callable "
+            f"returning one), got {type(produced).__name__}"
+        )
+    return produced

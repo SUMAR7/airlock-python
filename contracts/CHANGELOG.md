@@ -24,6 +24,34 @@ Versioning rules by artifact:
   (`idempotency.md`): any rule change is a new domain (`airlock-canon-2`,
   `airlock/v2`) — never in place (it would fork every key and audit hash).
 
+## v1.1.0 — reviewer context (P3.6)
+
+- Add `review_context` to `CreateApprovalRequest` (`openapi.yaml`): an OPTIONAL,
+  integrator-authored labeled-metadata map the human reviewer sees alongside
+  `action_summary` (e.g. `{"customer": "acme@co", "order": "#1832"}`).
+  **Backward-compatible additive widening within v1** (not a `/api/v2`): the
+  field may be absent, and every pre-1.1.0 create body stays valid forever
+  (the frozen `create_approval.request.json` example and the
+  `create_approval_post` signing vector are UNCHANGED — the SDK omits the field
+  from the wire when it is not set, so those bytes are byte-identical).
+- **Server-deploys-first (PLAN.md 6.2 versioning rule).** `review_context` is on
+  the frozen egress allowlist and the request body is still
+  `additionalProperties: false`, so a server that does not yet know the field
+  would 400 it. `airlock-cloud` MUST re-pin this contract and accept (store +
+  render) `review_context` BEFORE any SDK is configured to send it.
+- **Boundary (compliance-critical, SPEC.md 3 / PLAN.md 6.1).** `review_context`
+  is STRINGS-ONLY — `additionalProperties.type: string`, both keys and values
+  strings; no nested objects, lists, or numbers can transit through it — and
+  size-capped (≤ 20 keys, key ≤ 64 chars, value ≤ 500 chars). It is
+  integrator-authored ONLY, never auto-populated from tool args. The SDK
+  enforces the shape + caps structurally at the `ApprovalRequestWire` boundary
+  (`from_pause_request` → `_validate_review_context`), so a smuggled non-string
+  or over-limit value raises at build time and never reaches the wire.
+- New pinned example: `examples/create_approval.request.with_context.json` (a
+  create body carrying `review_context`), validated against the schema. A new
+  frozen signing vector `create_approval_with_context_post` pins the exact
+  with-context wire bytes + signature (generated from the reference impl).
+
 ## v1 — initial (P3.1)
 
 - Widen `CreateApprovalResponse.status` from `RequestedStatus` to `ApprovalStatus` (`requested|approved|rejected`): an idempotent replay (200) returns the run's current status, as the endpoint description already stated. Backward-compatible (response enum widening; clients parse tolerantly).

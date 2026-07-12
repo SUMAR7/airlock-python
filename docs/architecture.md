@@ -61,6 +61,19 @@ allowlisted `PauseRequest` shape (raw payloads have no code path to it), and bot
 sides test pinned fixtures. The wire contract is open in
 [`/contracts`](../contracts) so anyone can verify what transits.
 
+What a gate *does* carry is **integrator-curated, never auto-populated**: the
+`action_summary`, the optional `review_context` panel, and the optional
+`reject_reasons` code set (`@guard(summary=…, context=…, reject_reasons=…)`) — all
+strings-only and size-capped at the `ApprovalRequestWire` boundary, all authored
+by the developer, so no tool arg reaches the inbox unless it was deliberately put
+there. On the way back, the reviewer's decision returns only minimal metadata:
+`human_decision`, `decided_by` (an opaque `usr_…` id), and — when the reviewer
+rejects — the chosen `reason_code`, surfaced on `ApprovalRejected.reason_code`
+(see [`api.md`](api.md#reviewer-context-and-reject-reasons-the-gate-path)). The
+wire fields are versioned additively in
+[`contracts/openapi.yaml`](../contracts/openapi.yaml) (`review_context` v1.1.0,
+`reject_reasons` / `reason_code` v1.2.0).
+
 ## The ADRs (SPEC §4 — locked)
 
 The seven Architecture Decision Records are locked in the spec. In brief:

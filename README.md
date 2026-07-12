@@ -45,9 +45,6 @@ one script, zero infrastructure, under a minute. Run it first.
 pip install airlock-sdk        # the import name is `airlock`
 ```
 
-> Pre-release: until the first PyPI publish lands you can install from TestPyPI —
-> `pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ airlock-sdk`.
-
 The smallest thing that shows exactly-once — no database to set up, no cloud
 account. `airlock.init()` with no store uses a local SQLite file (`./airlock.db`):
 

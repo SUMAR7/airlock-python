@@ -7,9 +7,7 @@ without Airlock the customer is refunded twice; with Airlock, exactly once.
 ## Run it
 
 ```bash
-pip install airlock
-# (until the PyPI release lands, install from TestPyPI:)
-# pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ airlock
+pip install airlock-sdk        # the import name is `airlock`
 
 python demo.py
 ```

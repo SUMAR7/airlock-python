@@ -113,6 +113,10 @@ __all__ = ["Airlock", "current_runtime", "guard", "init"]
 
 P = ParamSpec("P")
 R = TypeVar("R")
+#: Resolution target for _resolve (a static value or a callable returning one).
+#: Spelled classically rather than with PEP-695 syntax so the SDK still imports
+#: on Python 3.11.
+T = TypeVar("T")
 
 # The reversibility default matches PLAN.md 3.3: an unclassified guarded action
 # is treated as irreversible (the conservative posture).
@@ -481,6 +485,22 @@ def guard(
     resolved_effect = effect if effect is not None else Effect()
 
     def decorate(fn: Callable[P, R]) -> Callable[P, R]:
+        # Fail LOUDLY at decoration, not confusingly at call time. commit_once,
+        # the durable pause and the audit chain are synchronous: an `async def`
+        # would hand the wrapper an un-awaited coroutine, which it would try to
+        # commit AS the result — so the side effect would never run and the
+        # user would see "Object of type coroutine is not JSON serializable".
+        # An unsupported shape must say so in its own words (SPEC.md 1).
+        if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
+            raise TypeError(
+                f"@guard does not support async functions yet: {fn.__qualname__} is "
+                "'async def'. Airlock's commit ledger, durable pause and audit chain "
+                "are synchronous, so the coroutine would be committed as the result "
+                "without ever being awaited — the effect would not run. Guard the "
+                "SYNCHRONOUS core of the action instead (and call it from your async "
+                "code), until async support lands."
+            )
+
         spec = _GuardSpec(
             fn=fn,
             action_type=action_type,
@@ -1133,7 +1153,7 @@ def _registry_preconditions(spec: _GuardSpec) -> Callable[..., bool] | None:
     return preconditions
 
 
-def _resolve[T](
+def _resolve(
     value: T | Callable[..., T] | None,
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],

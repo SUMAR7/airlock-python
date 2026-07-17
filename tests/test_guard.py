@@ -38,6 +38,8 @@ from airlock.registry import registry as default_registry
 from airlock.types import BlastRadius, Decision, LedgerState, Money, Reversibility
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from sqlalchemy.engine import Engine
 
     from airlock.store.postgres import PostgresStore
@@ -512,6 +514,28 @@ def test_empty_action_type_rejected() -> None:
 
         @guard("")
         def tool() -> None: ...
+
+
+def test_async_function_rejected_at_decoration() -> None:
+    """An `async def` tool must fail LOUDLY at decoration.
+
+    The ledger/pause/audit path is synchronous: without this fence the wrapper
+    would receive an un-awaited coroutine and try to COMMIT it as the result —
+    the effect would never run, and the user would get an opaque "Object of type
+    coroutine is not JSON serializable". Unsupported must say so in its own words.
+    """
+    with pytest.raises(TypeError, match="does not support async"):
+
+        @guard("payment.refund")
+        async def tool(charge_id: str) -> None: ...
+
+
+def test_async_generator_rejected_at_decoration() -> None:
+    with pytest.raises(TypeError, match="does not support async"):
+
+        @guard("payment.stream")
+        async def tool(charge_id: str) -> AsyncIterator[int]:
+            yield 1
 
 
 def test_at_most_once_auto_still_commits_with_warning(

@@ -9,12 +9,12 @@ build-backend = "hatchling.build"
 # until after this PR merges — this file only sets launch-quality metadata.
 [project]
 name = "airlock-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agent-action safety SDK: gate irreversible actions, commit exactly once, tamper-evident audit."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 authors = [{ name = "Airlock" }]
 keywords = [
     "agent",
@@ -35,6 +35,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3 :: Only",
@@ -86,7 +87,7 @@ dev = [
 packages = ["src/airlock"]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
 
@@ -103,7 +104,7 @@ select = [
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.11"
 strict = true
 warn_unreachable = true
 

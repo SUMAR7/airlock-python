@@ -12,6 +12,29 @@ The distribution is published as **`airlock-sdk`**; the import name is
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-13
+
+### Added
+
+- **Python 3.11 support** (`requires-python = ">=3.11"`). The only thing that
+  forced 3.12 was a single PEP-695 generic (`def _resolve[T]`); it is now spelled
+  with a classic `TypeVar`. Verified: the full SQLite suite passes on 3.11.
+  3.10 is deliberately **not** supported — it reaches end-of-life in October 2026,
+  and the `StrEnum` shim it would need changes `str()` semantics for values that
+  are stamped durably onto ledger rows and into the hash-chained audit trail.
+  A compatibility shim is not worth a correctness risk in the audit path.
+
+### Changed
+
+- **`@guard` now rejects `async def` (and async-generator) tools loudly at
+  decoration time**, with a `TypeError` that says so in its own words. Previously
+  an async tool failed at call time with an opaque
+  `Object of type coroutine is not JSON serializable`, because the wrapper
+  received an un-awaited coroutine and tried to commit it *as the result* — the
+  side effect never ran. Nothing was ever mis-committed (the failure was safe),
+  but the diagnosis was hidden. Async support is not implemented yet; guard the
+  synchronous core of the action and call it from your async code.
+
 ## [0.1.0] — 2026-07-12
 
 The first coherent release: the entire local SDK works end to end, and the

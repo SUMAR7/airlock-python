@@ -51,10 +51,15 @@ object — sink failures are isolated and can never perturb the guarded call
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import functools
 import inspect
+import os
+import threading
 import uuid
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -63,6 +68,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
 from pydantic import JsonValue
 
+from airlock import _async
 from airlock.audit import rfc3339_utc
 from airlock.effects import Effect
 from airlock.errors import (
@@ -110,6 +116,33 @@ if TYPE_CHECKING:
     from airlock.types import CommitOutcome
 
 __all__ = ["Airlock", "current_runtime", "guard", "init"]
+
+#: The DEDICATED pool the async wrapper runs the sync commit core on
+#: (ASYNC-DESIGN.md D2). Never asyncio's shared default executor: sharing it with
+#: user code is how you deadlock. Threads here mostly WAIT on the bridged
+#: coroutine rather than compute, so the default is I/O-shaped (generous), not
+#: CPU-shaped — an undersized pool shows up to a user as an unexplained hang,
+#: which is a new problem rather than a solved one.
+_EXECUTOR_LOCK = threading.Lock()
+_EXECUTOR: ThreadPoolExecutor | None = None
+_EXECUTOR_WORKERS: int | None = None
+
+
+def _default_workers() -> int:
+    return max(32, (os.cpu_count() or 4) * 4)
+
+
+def _executor() -> ThreadPoolExecutor:
+    """The process-wide async worker pool, created on first async guarded call."""
+    global _EXECUTOR
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is None:
+            _EXECUTOR = ThreadPoolExecutor(
+                max_workers=_EXECUTOR_WORKERS or _default_workers(),
+                thread_name_prefix="airlock-async",
+            )
+        return _EXECUTOR
+
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -485,21 +518,16 @@ def guard(
     resolved_effect = effect if effect is not None else Effect()
 
     def decorate(fn: Callable[P, R]) -> Callable[P, R]:
-        # Fail LOUDLY at decoration, not confusingly at call time. commit_once,
-        # the durable pause and the audit chain are synchronous: an `async def`
-        # would hand the wrapper an un-awaited coroutine, which it would try to
-        # commit AS the result — so the side effect would never run and the
-        # user would see "Object of type coroutine is not JSON serializable".
-        # An unsupported shape must say so in its own words (SPEC.md 1).
-        if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
+        # An async GENERATOR is refused permanently: a stream has no single
+        # result to commit exactly once, so the ledger has nothing to record and
+        # "exactly once" would be a claim we cannot keep (ASYNC-DESIGN.md §6).
+        if inspect.isasyncgenfunction(fn):
             raise TypeError(
-                f"@guard does not support async functions yet: {fn.__qualname__} is "
-                "'async def'. Airlock's commit ledger, durable pause and audit chain "
-                "are synchronous, so the coroutine would be committed as the result "
-                "without ever being awaited — the effect would not run. Guard the "
-                "SYNCHRONOUS core of the action instead (and call it from your async "
-                "code), until async support lands."
+                f"@guard does not support async generators: {fn.__qualname__} streams "
+                "its results, so there is no single outcome to commit exactly once. "
+                "Guard the function that performs the side effect instead."
             )
+        is_async = inspect.iscoroutinefunction(fn)
 
         spec = _GuardSpec(
             fn=fn,
@@ -525,6 +553,24 @@ def guard(
             _registry_execute(spec),
             _registry_preconditions(spec),
         )
+
+        if is_async:
+            # The sync core runs on a worker thread; the tool's coroutine is
+            # bridged back to THIS loop (ASYNC-DESIGN.md §4.1). The loop is never
+            # blocked — which is exactly why the bridge cannot deadlock: the loop
+            # stays free to run the coroutine the worker is waiting on.
+            @functools.wraps(fn)
+            async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+                loop = asyncio.get_running_loop()
+                context = contextvars.copy_context()
+
+                def _run_sync_core() -> Any:
+                    with _async.bridge_loop(loop):
+                        return context.run(_invoke, spec, args, kwargs)
+
+                return cast(R, await loop.run_in_executor(_executor(), _run_sync_core))
+
+            return cast("Callable[P, R]", async_wrapper)
 
         @functools.wraps(fn)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
@@ -1051,7 +1097,7 @@ def _call_tool_live(
     key_param = spec.effect.key_param
     if key_param is not None and downstream_key is not None:
         call_kwargs[key_param] = downstream_key
-    return spec.fn(*args, **call_kwargs)
+    return _resolve_effect_result(spec.fn(*args, **call_kwargs))
 
 
 def _call_tool_from_map(
@@ -1073,7 +1119,20 @@ def _call_tool_from_map(
     if key_param is not None and downstream_key is not None:
         call_kwargs[key_param] = downstream_key
     bound = _bind_from_map(spec.fn, call_kwargs)
-    return spec.fn(*bound.args, **bound.kwargs)
+    return _resolve_effect_result(spec.fn(*bound.args, **bound.kwargs))
+
+
+def _resolve_effect_result(result: Any) -> Any:
+    """Await an async tool's coroutine; pass a sync tool's result straight through.
+
+    This single line is what makes the async promise hold at ALL THREE effect
+    call sites — live AUTO, resume-after-approval, and crash reconcile — because
+    the recovery paths funnel through :func:`_call_tool_from_map` and the live
+    path through :func:`_call_tool_live`. See ASYNC-DESIGN.md §4.2.
+    """
+    if _async.is_awaitable(result):
+        return _async.run_coro_blocking(result)
+    return result
 
 
 def _bind_from_map(

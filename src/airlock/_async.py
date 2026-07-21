@@ -53,7 +53,7 @@ def is_awaitable(value: Any) -> bool:
     return asyncio.iscoroutine(value) or isinstance(value, asyncio.Future)
 
 
-class bridge_loop:  # noqa: N801 - a context manager used like a lowercase verb
+class bridge_loop:
     """Bind this worker thread to ``loop`` for the duration of the block.
 
     Entered by the async guard wrapper on the worker thread it dispatches the

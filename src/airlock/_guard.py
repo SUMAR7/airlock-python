@@ -59,10 +59,10 @@ import os
 import threading
 import uuid
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
@@ -109,6 +109,7 @@ from airlock.types import (
     PausedRun,
     PauseStatus,
     Reversibility,
+    Verification,
 )
 
 if TYPE_CHECKING:
@@ -515,7 +516,7 @@ def guard(
             f"action_type {action_type!r} must not contain ':' (it is the namespace "
             "delimiter for key overrides; see contracts/idempotency.md §4)"
         )
-    resolved_effect = effect if effect is not None else Effect()
+    resolved_effect = _bridge_async_verify(effect if effect is not None else Effect())
 
     def decorate(fn: Callable[P, R]) -> Callable[P, R]:
         # An async GENERATOR is refused permanently: a stream has no single
@@ -954,7 +955,7 @@ def _precondition_snapshot(
     if spec.preconditions is None:
         return None
     try:
-        held = bool(spec.preconditions(*args, **dict(kwargs)))
+        held = _call_precondition(spec.preconditions, *args, **dict(kwargs))
     except Exception as exc:
         return {
             "held": False,
@@ -1004,7 +1005,7 @@ def _commit_auto(
         precond = spec.preconditions
 
         def preconditions() -> bool:
-            return bool(precond(*args, **dict(kwargs)))
+            return _call_precondition(precond, *args, **dict(kwargs))
 
     outcome: CommitOutcome = commit_once(
         runtime.store,
@@ -1200,14 +1201,61 @@ def _registry_execute(spec: _GuardSpec) -> Callable[..., JsonValue]:
     return execute
 
 
+def _call_precondition(precond: Callable[..., Any], *args: Any, **kwargs: Any) -> bool:
+    """Invoke a precondition, awaiting it through the bridge if it is async.
+
+    The SINGLE funnel for every precondition call site (live AUTO, the AUTO
+    fast-check, and the registry adapter used by resume/reconcile), so an async
+    precondition is handled identically everywhere. Without this, ``bool(coro)``
+    is always ``True`` — a blocking async precondition would silently PASS, which
+    is exactly the kind of quiet correctness hole this project refuses.
+    """
+    result = precond(*args, **kwargs)
+    if _async.is_awaitable(result):
+        result = _async.run_coro_blocking(result)
+    return bool(result)
+
+
+def _bridge_async_verify(effect: Effect) -> Effect:
+    """Wrap an ``async`` ``Effect.verify`` probe so the sync core never sees a
+    coroutine (ASYNC-DESIGN.md D1/G9).
+
+    ``commit_once`` and the reconciler call ``effect.verify(**args)`` and unpack a
+    ``(Verification, evidence)`` tuple directly. If the probe is ``async`` the
+    call returns ONE coroutine wrapping the whole tuple, so it must be resolved
+    BEFORE the unpack — done here, in a sync shim, so ``commit.py``/``reconcile.py``
+    stay byte-for-byte unchanged. The probe runs at post-verify time, inside the
+    same worker thread as the commit, so the bridge is active; on the sync
+    recovery paths it owns a private loop. Returns the effect unchanged when the
+    probe is sync or absent (frozen dataclass ⇒ a fresh Effect via ``replace``).
+    """
+    probe = effect.verify
+    if probe is None or not inspect.iscoroutinefunction(probe):
+        return effect
+
+    @functools.wraps(probe)
+    def _sync_verify(**arg_map: Any) -> tuple[Verification, Any | None]:
+        return cast("tuple[Verification, Any | None]", _async.run_coro_blocking(probe(**arg_map)))
+
+    return replace(effect, verify=_sync_verify)
+
+
 def _registry_preconditions(spec: _GuardSpec) -> Callable[..., bool] | None:
-    """The registry adapter for preconditions: ``preconditions(**arg_map)``."""
+    """The registry adapter for preconditions: ``preconditions(**arg_map)``.
+
+    Preconditions may be ``async`` (ASYNC-DESIGN.md D1): they re-validate the
+    call AFTER the claim, often against the same async API the tool uses, so
+    forcing them sync would push async users into the very footgun 0.2.0 fenced.
+    An awaitable result is driven through the bridge — sync on the AUTO path (the
+    worker thread has the caller's loop), and via a private loop on the sync
+    recovery paths (resume/reconcile). Sync preconditions are unchanged.
+    """
     if spec.preconditions is None:
         return None
     precond = spec.preconditions
 
     def preconditions(**arg_map: JsonValue) -> bool:
-        return bool(precond(**dict(arg_map)))
+        return _call_precondition(precond, **dict(arg_map))
 
     return preconditions
 

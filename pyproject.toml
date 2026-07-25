@@ -109,6 +109,13 @@ python_version = "3.11"
 strict = true
 warn_unreachable = true
 
+# The agent-framework E2E tests (tests/test_async_frameworks_e2e.py) import
+# langgraph / mcp, which are deliberately NOT dev dependencies: they are heavy and
+# the tests skip without them. Their absence must not fail the type gate.
+[[tool.mypy.overrides]]
+module = ["langgraph.*", "langchain_core.*", "mcp.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

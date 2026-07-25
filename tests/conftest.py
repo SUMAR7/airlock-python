@@ -356,10 +356,34 @@ def db(backend: _Backend) -> Any:
     return backend.engine
 
 
+def drain_async_pool() -> None:
+    """Wait for every in-flight guarded ASYNC call to finish, then drop the pool.
+
+    An async guarded call runs the sync commit core on a worker thread. Cancelling
+    (or failing) the caller does NOT stop that worker — it keeps going and still
+    writes to the ledger, by design. So a test that cancels and returns can leave a
+    worker mid-write; if the store is closed underneath it, SQLite is torn down
+    while another thread holds an active statement and the interpreter segfaults.
+
+    Draining here (not in each test) fixes the whole class of races by
+    construction, because ``store`` closes only after this returns. The pool is
+    process-wide and lazily rebuilt, so dropping it costs a test nothing.
+    """
+    from airlock import _guard
+
+    with _guard._EXECUTOR_LOCK:  # take the reference under the lock...
+        pool = _guard._EXECUTOR
+        _guard._EXECUTOR = None
+    if pool is not None:
+        # ...but shut down OUTSIDE it: a finishing worker takes the same lock.
+        pool.shutdown(wait=True)
+
+
 @pytest.fixture
 def store(backend: _Backend) -> Iterator[Any]:
     st = backend.make_store()
     yield st
+    drain_async_pool()  # no worker may be mid-write when the store closes
     st.close()
 
 

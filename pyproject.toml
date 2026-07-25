@@ -65,6 +65,7 @@ http = [
 [dependency-groups]
 dev = [
     "pytest",
+    "pytest-asyncio",
     "pytest-xdist",
     "hypothesis",
     "ruff",
@@ -111,6 +112,7 @@ warn_unreachable = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+asyncio_mode = "auto"
 markers = [
     "concurrency: multi-process barrier tests hammering one idempotency key (SPEC section 9)",
     "crash: subprocess crash-injection tests (os._exit / SIGKILL mid-flight) (SPEC section 9)",

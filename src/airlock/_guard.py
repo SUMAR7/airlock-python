@@ -59,10 +59,10 @@ import os
 import threading
 import uuid
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
@@ -109,7 +109,6 @@ from airlock.types import (
     PausedRun,
     PauseStatus,
     Reversibility,
-    Verification,
 )
 
 if TYPE_CHECKING:
@@ -144,6 +143,9 @@ def _executor() -> ThreadPoolExecutor:
             )
         return _EXECUTOR
 
+
+#: A gate-path mapping callable may be sync or async (ASYNC-DESIGN.md D1/G11).
+MappingOrAwaitable = Mapping[str, str] | Awaitable[Mapping[str, str]]
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -417,10 +419,10 @@ class _GuardSpec:
     key: Callable[..., str] | None
     key_ignore: tuple[str, ...]
     effect: Effect
-    preconditions: Callable[..., bool] | None
-    summary: str | Callable[..., str] | None
-    context: Mapping[str, str] | Callable[..., Mapping[str, str]] | None
-    reject_reasons: Mapping[str, str] | Callable[..., Mapping[str, str]] | None
+    preconditions: Callable[..., bool | Awaitable[bool]] | None
+    summary: str | Callable[..., str | Awaitable[str]] | None
+    context: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None
+    reject_reasons: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None
 
 
 def guard(
@@ -432,10 +434,10 @@ def guard(
     key: Callable[..., str] | None = None,
     key_ignore: tuple[str, ...] = (),
     effect: Effect | None = None,
-    preconditions: Callable[..., bool] | None = None,
-    summary: str | Callable[..., str] | None = None,
-    context: Mapping[str, str] | Callable[..., Mapping[str, str]] | None = None,
-    reject_reasons: Mapping[str, str] | Callable[..., Mapping[str, str]] | None = None,
+    preconditions: Callable[..., bool | Awaitable[bool]] | None = None,
+    summary: str | Callable[..., str | Awaitable[str]] | None = None,
+    context: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None = None,
+    reject_reasons: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorate a tool fn: decide auto/gate/deny per call, commit AUTO once.
 
@@ -516,7 +518,24 @@ def guard(
             f"action_type {action_type!r} must not contain ':' (it is the namespace "
             "delimiter for key overrides; see contracts/idempotency.md §4)"
         )
-    resolved_effect = _bridge_async_verify(effect if effect is not None else Effect())
+    # The auto/deny decision is taken on a PURE, I/O-free hot path (SPEC.md 3 /
+    # ADR-3) and cost/blast_radius are resolved BEFORE the policy sees them, on
+    # EVERY call. An async one would put I/O on that path, so it is refused here
+    # rather than failing later with a puzzling "returned coroutine, expected
+    # Money" (ASYNC-DESIGN.md G11). The GATE-path inputs — summary, context,
+    # reject_reasons — MAY be async: they resolve only when pausing, where a
+    # human is already the latency floor.
+    for _label, _value in (("cost", cost), ("blast_radius", blast_radius)):
+        if inspect.iscoroutinefunction(_value):
+            raise TypeError(
+                f"@guard does not support an async {_label}= callable: it is resolved on "
+                "the I/O-free hot path taken by EVERY call, before the auto/deny decision "
+                "(SPEC.md 3). Compute it synchronously from the call args. (An async "
+                "summary=/context=/reject_reasons= IS supported — those resolve only when "
+                "the action pauses for a human.)"
+            )
+
+    resolved_effect = effect if effect is not None else Effect()
 
     def decorate(fn: Callable[P, R]) -> Callable[P, R]:
         # An async GENERATOR is refused permanently: a stream has no single
@@ -1216,30 +1235,6 @@ def _call_precondition(precond: Callable[..., Any], *args: Any, **kwargs: Any) -
     return bool(result)
 
 
-def _bridge_async_verify(effect: Effect) -> Effect:
-    """Wrap an ``async`` ``Effect.verify`` probe so the sync core never sees a
-    coroutine (ASYNC-DESIGN.md D1/G9).
-
-    ``commit_once`` and the reconciler call ``effect.verify(**args)`` and unpack a
-    ``(Verification, evidence)`` tuple directly. If the probe is ``async`` the
-    call returns ONE coroutine wrapping the whole tuple, so it must be resolved
-    BEFORE the unpack — done here, in a sync shim, so ``commit.py``/``reconcile.py``
-    stay byte-for-byte unchanged. The probe runs at post-verify time, inside the
-    same worker thread as the commit, so the bridge is active; on the sync
-    recovery paths it owns a private loop. Returns the effect unchanged when the
-    probe is sync or absent (frozen dataclass ⇒ a fresh Effect via ``replace``).
-    """
-    probe = effect.verify
-    if probe is None or not inspect.iscoroutinefunction(probe):
-        return effect
-
-    @functools.wraps(probe)
-    def _sync_verify(**arg_map: Any) -> tuple[Verification, Any | None]:
-        return cast("tuple[Verification, Any | None]", _async.run_coro_blocking(probe(**arg_map)))
-
-    return replace(effect, verify=_sync_verify)
-
-
 def _registry_preconditions(spec: _GuardSpec) -> Callable[..., bool] | None:
     """The registry adapter for preconditions: ``preconditions(**arg_map)``.
 
@@ -1261,7 +1256,7 @@ def _registry_preconditions(spec: _GuardSpec) -> Callable[..., bool] | None:
 
 
 def _resolve(
-    value: T | Callable[..., T] | None,
+    value: T | Callable[..., T | Awaitable[T]] | None,
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],
     label: str,
@@ -1278,6 +1273,12 @@ def _resolve(
         return None
     if callable(value) and not isinstance(value, expected):
         produced = value(*args, **dict(kwargs))
+        if _async.is_awaitable(produced):
+            # Only reachable for the GATE-path input (summary): the hot-path ones
+            # (cost / blast_radius) are fenced at decoration, so an awaitable here
+            # always belongs to a gate-only callable, where a human is already the
+            # latency floor (ASYNC-DESIGN.md G11).
+            produced = _async.run_coro_blocking(produced)
         if not isinstance(produced, expected):
             raise TypeError(
                 f"{label} callable for a guarded action returned {type(produced).__name__}, "
@@ -1293,7 +1294,7 @@ def _resolve(
 
 
 def _resolve_str_mapping(
-    value: Mapping[str, str] | Callable[..., Mapping[str, str]] | None,
+    value: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None,
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],
     label: str,
@@ -1312,6 +1313,10 @@ def _resolve_str_mapping(
         return None
     if callable(value) and not isinstance(value, Mapping):
         produced = value(*args, **dict(kwargs))
+        if _async.is_awaitable(produced):
+            # GATE-path only, so an async lookup here costs nothing on the
+            # I/O-free hot path (ASYNC-DESIGN.md G11).
+            produced = _async.run_coro_blocking(produced)
     else:
         produced = value
     if not isinstance(produced, Mapping):

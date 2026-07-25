@@ -1266,7 +1266,12 @@ def _probe(effect: Effect, arg_map: Mapping[str, JsonValue]) -> tuple[Verificati
     if effect.verify is None:
         return Verification.UNKNOWN, None
     try:
-        answer, evidence = effect.verify(**dict(arg_map))
+        from airlock._async import is_awaitable, run_coro_blocking
+
+        produced: Any = effect.verify(**dict(arg_map))
+        if is_awaitable(produced):  # an async probe (ASYNC-DESIGN.md G9)
+            produced = run_coro_blocking(produced)
+        answer, evidence = produced
         return Verification(answer), evidence
     except Exception:
         return Verification.UNKNOWN, None

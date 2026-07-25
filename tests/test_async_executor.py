@@ -41,7 +41,9 @@ def _reset_pool() -> None:
     from airlock import _guard
 
     if _guard._EXECUTOR is not None:
-        _guard._EXECUTOR.shutdown(wait=False)
+        # wait=True: a worker still writing to the ledger must finish before the
+        # store fixture closes underneath it (see conftest.drain_async_pool).
+        _guard._EXECUTOR.shutdown(wait=True)
     _guard._EXECUTOR = None
     _guard._EXECUTOR_WORKERS = None
     _guard._INFLIGHT = 0

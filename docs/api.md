@@ -35,6 +35,7 @@ def init(
     execute_timeout: timedelta | None = None,
     gate_wait: bool = True,                 # block on approval inline, else raise ActionPending
     gate_timeout: float = 30.0,             # seconds the inline gate wait polls
+    async_workers: int | None = None,       # size of the async worker pool (async tools)
     now_fn: Callable[[], datetime] = ...,   # injectable clock (deterministic tests)
 ) -> Airlock: ...
 ```
@@ -55,6 +56,12 @@ you the file-backed `ConsoleApprovalTransport`.
   for up to `gate_timeout` seconds; when `False` (or on timeout) it persists the
   pause, delivers it, and raises `ActionPending` for an async
   [`resume`](#airlockresume).
+- `async_workers`: how many guarded **async** calls may be in flight at once.
+  Default is generous and I/O-shaped (those threads mostly wait), and only the
+  guarded calls themselves use it. Set it BEFORE the first async guarded call;
+  resizing a live pool raises rather than being silently ignored. Exceeding it
+  is safe — calls queue and still commit exactly once — but Airlock warns once
+  with `AsyncPoolSaturated` so queueing never looks like a hang.
 - `reconcile_after` / `execute_timeout`: the recovery knobs forwarded to the
   commit path (`execute_timeout` must be `< reconcile_after`; see
   [architecture](architecture.md)). Leave both unset for the simple inline
@@ -100,6 +107,38 @@ Decoration itself is side-effect-free apart from one registration (into the
 shared `Registry`) so a reconciler or a resumed run can reconstruct the call from
 a bare ledger row. `action_type` must be non-empty and must not contain `:` (the
 namespace delimiter for `key` overrides).
+
+### Async tools
+
+`@guard` works on `async def` tools — `await` the call, everything else is
+identical. The ledger work runs on a worker pool so **your event loop is never
+blocked**, and the durable-pause / crash-recovery guarantees hold verbatim: a
+gated async action can be resumed later by an ordinary **synchronous** webhook
+receiver or cron reconciler, in a different process, and still commits once.
+
+Which callables may be `async`:
+
+| Parameter | `async` allowed? | Why |
+|---|---|---|
+| the tool itself | ✅ | it is the effect |
+| `Effect(verify=...)` | ✅ | the probe does the same I/O the tool does |
+| `preconditions=` | ✅ | re-checked at commit time, off the hot path |
+| `summary=` / `context=` / `reject_reasons=` | ✅ | resolved only when pausing — a human is already the latency floor |
+| `cost=` / `blast_radius=` | ❌ refused at decoration | resolved on **every** call before the auto/gate/deny decision, and that path is deliberately I/O-free (SPEC §3) |
+
+An `async` generator tool is refused permanently: a stream has no single outcome
+to commit exactly once.
+
+Two things worth knowing:
+
+- Calling a **synchronous** entry point (`Airlock.resume`, the reconciler) from
+  inside a running event loop, for an `async` tool, raises rather than
+  deadlocking — run it in a worker thread (`await asyncio.to_thread(...)`) or
+  use the async path.
+- On `execute_timeout` the coroutine is cancelled, but the ledger row is still
+  left for the verify-first reconciler: a cancelled `await` may already have sent
+  the request, so cancellation is **not** proof the effect did not land.
+
 
 - `cost` / `reversibility` / `blast_radius`: the risk inputs the policy filters
   on. `reversibility` defaults to `irreversible` (conservative). `cost` and
@@ -226,6 +265,8 @@ class Effect:
     key_param: str | None = None            # kwarg the tool accepts a downstream key on
     map_key: Callable[[str], str] | None = None    # transform for downstream length/charset
     verify: Callable[..., tuple[Verification, Any]] | None = None  # "did this happen?" probe
+    # verify may be `async def` — it is awaited wherever it runs, including
+    # inside a synchronous reconciler with no event loop of its own.
 ```
 
 `Effect` declares how ADR-2 exactly-once is achievable for an action, and its
@@ -401,6 +442,11 @@ All Airlock errors subclass `AirlockError`. The ones a `@guard` caller sees:
 `AtMostOnceWarning` (a `UserWarning`, **not** an error) fires once per action
 type when an AUTO effect runs with `guarantee='none'`. Escalate it in strict
 environments with `-W error::airlock.AtMostOnceWarning`.
+
+`AsyncPoolSaturated` (also a `UserWarning`) fires once per process when more
+guarded async calls are in flight than there are workers, so they are queueing.
+Correctness is unaffected; it exists so a latency cliff is never silent. Raise
+`init(async_workers=N)`.
 
 `ApprovalRejected` carries the reviewer's **structured choice** so a rejection is
 control flow, not a dead end: `.reason_code` is the code the human picked from the

@@ -11,7 +11,10 @@ uses the zero-config SQLite store — no Postgres, no cloud account required).
   transit), and structured **reject reason codes** the agent branches on. Shows
   both paths: approve → commit exactly once; reject with a code → no effect, the
   code surfaced on `ApprovalRejected`.
-
+- [`async_agent/`](async_agent/) — **async tools**. Most agent code is async;
+  an `async def` tool needs nothing special. Shows a retried call refunding once,
+  the event loop staying responsive during a guarded call, and five concurrent
+  identical calls collapsing to one effect.
 - [`integrations/`](integrations/) — drop Airlock into the agent framework you
   already use. One-line `@guard` under the framework's tool decorator makes a
   tool call exactly-once. Runnable, no-API-key demos for **LangChain**, the

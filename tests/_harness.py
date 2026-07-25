@@ -145,6 +145,11 @@ class EffectLogger:
     def log(self, key: str) -> None:
         self._effects.log(key)
 
+    def count(self, key: str) -> int:
+        """How many times this effect has landed — ground truth for an in-process
+        probe (an ``Effect.verify`` asking "did this already happen?")."""
+        return self._effects.count(key)
+
     def dispose(self) -> None:
         self._effects.dispose()
 

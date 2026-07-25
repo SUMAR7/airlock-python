@@ -171,22 +171,43 @@ async def test_execute_timeout_surfaces_on_an_async_effect(
 ) -> None:
     """G2: an overrunning async effect raises ExecuteTimeout instead of hanging.
     The row is deliberately left for the reconciler — a cancelled ``await`` may
-    already have sent the request, so cancellation proves nothing."""
+    already have sent the request, so cancellation proves nothing.
+
+    On overrun the owner ABANDONS the worker (it cannot interrupt work already in
+    flight; see ``commit.py::_run_execute``), so that worker keeps running and
+    will still write to the store. This test therefore waits for the abandoned
+    work to DRAIN before returning: otherwise the fixture closes the store while
+    that thread is mid-write, and closing a SQLite connection under an active
+    statement on another thread crashes the interpreter. Real deployments keep
+    the store open for the process lifetime, but a test must not race its own
+    teardown.
+    """
     init(
         store=store,
         policy=_policy(),
-        execute_timeout=timedelta(seconds=0.3),
+        execute_timeout=timedelta(seconds=0.1),
         reconcile_after=timedelta(seconds=60),
     )
+    drained = asyncio.Event()
 
     @guard("edge.overrun", effect=Effect(key_param="idempotency_key"))
     async def overrun(x: str, *, idempotency_key: str | None = None) -> str:
-        await asyncio.sleep(5)
-        effects.log(x)
-        return x
+        try:
+            await asyncio.sleep(0.3)  # longer than execute_timeout -> abandoned
+            effects.log(x)
+            return x
+        finally:
+            drained.set()  # runs on the test's loop; signals the abandoned work is done
 
     with pytest.raises(ExecuteTimeout):
         await asyncio.wait_for(overrun("a"), timeout=20)
+
+    # Let the abandoned effect finish and its worker complete its store writes.
+    await asyncio.wait_for(drained.wait(), timeout=20)
+    for _ in range(200):  # yield until the worker's trailing ledger write lands
+        await asyncio.sleep(0.01)
+        if effects.total() >= 1:
+            break
 
 
 async def test_sync_resume_from_inside_a_running_loop_refuses_loudly(

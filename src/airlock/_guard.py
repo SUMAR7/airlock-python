@@ -76,6 +76,7 @@ from airlock.errors import (
     ActionPending,
     AirlockError,
     ApprovalRejected,
+    AsyncPoolSaturated,
     CommitFailed,
     GateNotSupported,
     PreconditionFailed,
@@ -126,6 +127,9 @@ __all__ = ["Airlock", "current_runtime", "guard", "init"]
 _EXECUTOR_LOCK = threading.Lock()
 _EXECUTOR: ThreadPoolExecutor | None = None
 _EXECUTOR_WORKERS: int | None = None
+#: Guarded-async calls currently occupying (or queued for) a worker.
+_INFLIGHT = 0
+_SATURATION_WARNED = False
 
 
 def _default_workers() -> int:
@@ -142,6 +146,58 @@ def _executor() -> ThreadPoolExecutor:
                 thread_name_prefix="airlock-async",
             )
         return _EXECUTOR
+
+
+def _configure_async_workers(workers: int) -> None:
+    """Set the async pool size (``airlock.init(async_workers=N)``).
+
+    Raises if the pool already exists with a different size: silently ignoring
+    the request would leave the caller believing they had tuned something they
+    had not — the same class of quiet lie as a silent double-commit.
+    """
+    global _EXECUTOR_WORKERS
+    if workers < 1:
+        raise ValueError(f"async_workers must be >= 1, got {workers}")
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is not None and workers != _EXECUTOR_WORKERS:
+            raise AirlockError(
+                f"async_workers={workers} cannot be applied: the async worker pool is already "
+                f"running with {_EXECUTOR_WORKERS or _default_workers()} workers. Call "
+                "airlock.init(async_workers=...) BEFORE the first async guarded call."
+            )
+        _EXECUTOR_WORKERS = workers
+
+
+def _enter_async_slot() -> None:
+    """Count an in-flight guarded async call and WARN if the pool is saturated.
+
+    An exhausted pool does not fail — calls queue — so from the outside it looks
+    like the agent simply stopped. Silence there is as dishonest as a silent
+    double-commit, so it says so once, and names the knob (ASYNC-DESIGN.md D2/G3).
+    """
+    global _INFLIGHT, _SATURATION_WARNED
+    with _EXECUTOR_LOCK:
+        _INFLIGHT += 1
+        limit = _EXECUTOR_WORKERS or _default_workers()
+        saturated = limit < _INFLIGHT and not _SATURATION_WARNED
+        if saturated:
+            _SATURATION_WARNED = True
+    if saturated:
+        warnings.warn(
+            f"Airlock's async worker pool is saturated: {_INFLIGHT} guarded async calls are "
+            f"in flight but only {limit} workers exist, so calls are now QUEUEING (they will "
+            "still complete, and exactly-once is unaffected — but latency will look like a "
+            f"stall). Raise it with airlock.init(async_workers=N) before the first async "
+            "guarded call. This warning fires once per process.",
+            AsyncPoolSaturated,
+            stacklevel=4,
+        )
+
+
+def _leave_async_slot() -> None:
+    global _INFLIGHT
+    with _EXECUTOR_LOCK:
+        _INFLIGHT -= 1
 
 
 #: A gate-path mapping callable may be sync or async (ASYNC-DESIGN.md D1/G11).
@@ -323,6 +379,7 @@ def init(
     execute_timeout: timedelta | None = None,
     gate_wait: bool = True,
     gate_timeout: float = 30.0,
+    async_workers: int | None = None,
     now_fn: Callable[[], datetime] = _utcnow,
 ) -> Airlock:
     """Wire the ambient runtime for ``@guard`` and return an :class:`Airlock`.
@@ -394,6 +451,8 @@ def init(
         gate_timeout=gate_timeout,
         now_fn=now_fn,
     )
+    if async_workers is not None:
+        _configure_async_workers(async_workers)
     _runtime_var.set(runtime)
     return Airlock(_runtime=runtime)
 
@@ -588,7 +647,11 @@ def guard(
                     with _async.bridge_loop(loop):
                         return context.run(_invoke, spec, args, kwargs)
 
-                return cast(R, await loop.run_in_executor(_executor(), _run_sync_core))
+                _enter_async_slot()
+                try:
+                    return cast(R, await loop.run_in_executor(_executor(), _run_sync_core))
+                finally:
+                    _leave_async_slot()
 
             return cast("Callable[P, R]", async_wrapper)
 

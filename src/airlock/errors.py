@@ -49,6 +49,17 @@ class CanonicalizationError(AirlockError, ValueError):
     """
 
 
+class AsyncPoolSaturated(UserWarning):
+    """Every async worker is busy, so guarded async calls are QUEUEING.
+
+    Emitted once per process by the async ``@guard`` path (ASYNC-DESIGN.md D2).
+    Nothing is broken and exactly-once is unaffected — the calls still complete —
+    but from the outside a saturated pool looks like the agent stalled, and a
+    silent stall is as dishonest as a silent double-commit. Raise the ceiling with
+    ``airlock.init(async_workers=N)`` before the first async guarded call.
+    """
+
+
 class AtMostOnceWarning(UserWarning):
     """An action is running in at-most-once mode (ADR-2 degradation).
 

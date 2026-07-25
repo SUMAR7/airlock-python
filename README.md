@@ -447,6 +447,76 @@ strict environments with `-W error::airlock.AtMostOnceWarning`.
 
 ---
 
+## Async agents — `async def` tools just work
+
+Most agent code is async (LangGraph, MCP, the OpenAI Agents SDK, LangChain's
+`ainvoke`). So make the tool `async def` and `await` it. Nothing else changes —
+same decorator, same guarantees:
+
+<!-- airlock:test id=async_quickstart -->
+```python
+import asyncio
+import airlock
+from airlock import Decision, Effect, Policy, Rule
+
+charged = []  # stand-in for the real payment API
+
+@airlock.guard("demo.refund", effect=Effect(key_param="idempotency_key"))
+async def refund(charge_id, amount_cents, *, idempotency_key=None):
+    await asyncio.sleep(0)          # your real network call
+    charged.append(charge_id)
+    return {"charge": charge_id}
+
+async def main():
+    airlock.init(policy=Policy(rules=[Rule(match="demo.*", decision=Decision.AUTO)]))
+    first = await refund("ch_1", 5000)
+    retry = await refund("ch_1", 5000)   # the agent retries the same call
+    assert retry == first                # same result...
+    assert len(charged) == 1             # ...and the customer was charged ONCE
+
+asyncio.run(main())
+```
+
+**Your event loop is never blocked.** Airlock's ledger work runs on its own
+worker threads while your coroutine stays on your loop, so other tasks keep
+running during a guarded call.
+
+**Everything else holds identically.** A gated async action pauses durably and
+can be resumed later by an ordinary **synchronous** webhook receiver or cron
+reconciler — even in a different process after a restart — and still commits
+exactly once. That matters because the process that started the action is
+usually gone by the time a human clicks approve.
+
+### Which of your callables may be `async`?
+
+One rule:
+
+> Anything that does **I/O on your behalf** may be `async` — the tool itself,
+> `Effect(verify=...)`, `preconditions=`, and the gate-only `summary=`,
+> `context=`, `reject_reasons=`.
+>
+> The two **hot-path** inputs — `cost=` and `blast_radius=` — may not. They are
+> resolved on every single call, before the auto/gate/deny decision, and that
+> path is deliberately I/O-free. Making one `async` is refused at decoration
+> with a message that says so.
+
+Async **generators** are refused too, permanently: a stream has no single
+outcome to commit exactly once.
+
+### Concurrency
+
+Guarded async calls run on a dedicated worker pool (never asyncio's shared
+executor). The default is generous, because those threads mostly wait. If you
+run more concurrent guarded calls than there are workers they simply queue —
+correctness is unaffected — and Airlock warns once with `AsyncPoolSaturated`
+rather than letting it look like a stall. Raise it before your first async call:
+
+```python
+airlock.init(store="postgresql://…", async_workers=128)
+```
+
+---
+
 ## Postgres for production, SQLite for quickstart
 
 Both backends enforce the **same** exactly-once / durable-pause / audit-chain

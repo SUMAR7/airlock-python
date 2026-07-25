@@ -51,11 +51,16 @@ object — sink failures are isolated and can never perturb the guarded call
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import functools
 import inspect
+import os
+import threading
 import uuid
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -63,6 +68,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
 from pydantic import JsonValue
 
+from airlock import _async
 from airlock.audit import rfc3339_utc
 from airlock.effects import Effect
 from airlock.errors import (
@@ -70,6 +76,7 @@ from airlock.errors import (
     ActionPending,
     AirlockError,
     ApprovalRejected,
+    AsyncPoolSaturated,
     CommitFailed,
     GateNotSupported,
     PreconditionFailed,
@@ -110,6 +117,91 @@ if TYPE_CHECKING:
     from airlock.types import CommitOutcome
 
 __all__ = ["Airlock", "current_runtime", "guard", "init"]
+
+#: The DEDICATED pool the async wrapper runs the sync commit core on
+#: (ASYNC-DESIGN.md D2). Never asyncio's shared default executor: sharing it with
+#: user code is how you deadlock. Threads here mostly WAIT on the bridged
+#: coroutine rather than compute, so the default is I/O-shaped (generous), not
+#: CPU-shaped — an undersized pool shows up to a user as an unexplained hang,
+#: which is a new problem rather than a solved one.
+_EXECUTOR_LOCK = threading.Lock()
+_EXECUTOR: ThreadPoolExecutor | None = None
+_EXECUTOR_WORKERS: int | None = None
+#: Guarded-async calls currently occupying (or queued for) a worker.
+_INFLIGHT = 0
+_SATURATION_WARNED = False
+
+
+def _default_workers() -> int:
+    return max(32, (os.cpu_count() or 4) * 4)
+
+
+def _executor() -> ThreadPoolExecutor:
+    """The process-wide async worker pool, created on first async guarded call."""
+    global _EXECUTOR
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is None:
+            _EXECUTOR = ThreadPoolExecutor(
+                max_workers=_EXECUTOR_WORKERS or _default_workers(),
+                thread_name_prefix="airlock-async",
+            )
+        return _EXECUTOR
+
+
+def _configure_async_workers(workers: int) -> None:
+    """Set the async pool size (``airlock.init(async_workers=N)``).
+
+    Raises if the pool already exists with a different size: silently ignoring
+    the request would leave the caller believing they had tuned something they
+    had not — the same class of quiet lie as a silent double-commit.
+    """
+    global _EXECUTOR_WORKERS
+    if workers < 1:
+        raise ValueError(f"async_workers must be >= 1, got {workers}")
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is not None and workers != _EXECUTOR_WORKERS:
+            raise AirlockError(
+                f"async_workers={workers} cannot be applied: the async worker pool is already "
+                f"running with {_EXECUTOR_WORKERS or _default_workers()} workers. Call "
+                "airlock.init(async_workers=...) BEFORE the first async guarded call."
+            )
+        _EXECUTOR_WORKERS = workers
+
+
+def _enter_async_slot() -> None:
+    """Count an in-flight guarded async call and WARN if the pool is saturated.
+
+    An exhausted pool does not fail — calls queue — so from the outside it looks
+    like the agent simply stopped. Silence there is as dishonest as a silent
+    double-commit, so it says so once, and names the knob (ASYNC-DESIGN.md D2/G3).
+    """
+    global _INFLIGHT, _SATURATION_WARNED
+    with _EXECUTOR_LOCK:
+        _INFLIGHT += 1
+        limit = _EXECUTOR_WORKERS or _default_workers()
+        saturated = limit < _INFLIGHT and not _SATURATION_WARNED
+        if saturated:
+            _SATURATION_WARNED = True
+    if saturated:
+        warnings.warn(
+            f"Airlock's async worker pool is saturated: {_INFLIGHT} guarded async calls are "
+            f"in flight but only {limit} workers exist, so calls are now QUEUEING (they will "
+            "still complete, and exactly-once is unaffected — but latency will look like a "
+            f"stall). Raise it with airlock.init(async_workers=N) before the first async "
+            "guarded call. This warning fires once per process.",
+            AsyncPoolSaturated,
+            stacklevel=4,
+        )
+
+
+def _leave_async_slot() -> None:
+    global _INFLIGHT
+    with _EXECUTOR_LOCK:
+        _INFLIGHT -= 1
+
+
+#: A gate-path mapping callable may be sync or async (ASYNC-DESIGN.md D1/G11).
+MappingOrAwaitable = Mapping[str, str] | Awaitable[Mapping[str, str]]
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -287,6 +379,7 @@ def init(
     execute_timeout: timedelta | None = None,
     gate_wait: bool = True,
     gate_timeout: float = 30.0,
+    async_workers: int | None = None,
     now_fn: Callable[[], datetime] = _utcnow,
 ) -> Airlock:
     """Wire the ambient runtime for ``@guard`` and return an :class:`Airlock`.
@@ -358,6 +451,8 @@ def init(
         gate_timeout=gate_timeout,
         now_fn=now_fn,
     )
+    if async_workers is not None:
+        _configure_async_workers(async_workers)
     _runtime_var.set(runtime)
     return Airlock(_runtime=runtime)
 
@@ -383,10 +478,10 @@ class _GuardSpec:
     key: Callable[..., str] | None
     key_ignore: tuple[str, ...]
     effect: Effect
-    preconditions: Callable[..., bool] | None
-    summary: str | Callable[..., str] | None
-    context: Mapping[str, str] | Callable[..., Mapping[str, str]] | None
-    reject_reasons: Mapping[str, str] | Callable[..., Mapping[str, str]] | None
+    preconditions: Callable[..., bool | Awaitable[bool]] | None
+    summary: str | Callable[..., str | Awaitable[str]] | None
+    context: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None
+    reject_reasons: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None
 
 
 def guard(
@@ -398,10 +493,10 @@ def guard(
     key: Callable[..., str] | None = None,
     key_ignore: tuple[str, ...] = (),
     effect: Effect | None = None,
-    preconditions: Callable[..., bool] | None = None,
-    summary: str | Callable[..., str] | None = None,
-    context: Mapping[str, str] | Callable[..., Mapping[str, str]] | None = None,
-    reject_reasons: Mapping[str, str] | Callable[..., Mapping[str, str]] | None = None,
+    preconditions: Callable[..., bool | Awaitable[bool]] | None = None,
+    summary: str | Callable[..., str | Awaitable[str]] | None = None,
+    context: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None = None,
+    reject_reasons: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorate a tool fn: decide auto/gate/deny per call, commit AUTO once.
 
@@ -482,24 +577,36 @@ def guard(
             f"action_type {action_type!r} must not contain ':' (it is the namespace "
             "delimiter for key overrides; see contracts/idempotency.md §4)"
         )
+    # The auto/deny decision is taken on a PURE, I/O-free hot path (SPEC.md 3 /
+    # ADR-3) and cost/blast_radius are resolved BEFORE the policy sees them, on
+    # EVERY call. An async one would put I/O on that path, so it is refused here
+    # rather than failing later with a puzzling "returned coroutine, expected
+    # Money" (ASYNC-DESIGN.md G11). The GATE-path inputs — summary, context,
+    # reject_reasons — MAY be async: they resolve only when pausing, where a
+    # human is already the latency floor.
+    for _label, _value in (("cost", cost), ("blast_radius", blast_radius)):
+        if inspect.iscoroutinefunction(_value):
+            raise TypeError(
+                f"@guard does not support an async {_label}= callable: it is resolved on "
+                "the I/O-free hot path taken by EVERY call, before the auto/deny decision "
+                "(SPEC.md 3). Compute it synchronously from the call args. (An async "
+                "summary=/context=/reject_reasons= IS supported — those resolve only when "
+                "the action pauses for a human.)"
+            )
+
     resolved_effect = effect if effect is not None else Effect()
 
     def decorate(fn: Callable[P, R]) -> Callable[P, R]:
-        # Fail LOUDLY at decoration, not confusingly at call time. commit_once,
-        # the durable pause and the audit chain are synchronous: an `async def`
-        # would hand the wrapper an un-awaited coroutine, which it would try to
-        # commit AS the result — so the side effect would never run and the
-        # user would see "Object of type coroutine is not JSON serializable".
-        # An unsupported shape must say so in its own words (SPEC.md 1).
-        if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
+        # An async GENERATOR is refused permanently: a stream has no single
+        # result to commit exactly once, so the ledger has nothing to record and
+        # "exactly once" would be a claim we cannot keep (ASYNC-DESIGN.md §6).
+        if inspect.isasyncgenfunction(fn):
             raise TypeError(
-                f"@guard does not support async functions yet: {fn.__qualname__} is "
-                "'async def'. Airlock's commit ledger, durable pause and audit chain "
-                "are synchronous, so the coroutine would be committed as the result "
-                "without ever being awaited — the effect would not run. Guard the "
-                "SYNCHRONOUS core of the action instead (and call it from your async "
-                "code), until async support lands."
+                f"@guard does not support async generators: {fn.__qualname__} streams "
+                "its results, so there is no single outcome to commit exactly once. "
+                "Guard the function that performs the side effect instead."
             )
+        is_async = inspect.iscoroutinefunction(fn)
 
         spec = _GuardSpec(
             fn=fn,
@@ -525,6 +632,28 @@ def guard(
             _registry_execute(spec),
             _registry_preconditions(spec),
         )
+
+        if is_async:
+            # The sync core runs on a worker thread; the tool's coroutine is
+            # bridged back to THIS loop (ASYNC-DESIGN.md §4.1). The loop is never
+            # blocked — which is exactly why the bridge cannot deadlock: the loop
+            # stays free to run the coroutine the worker is waiting on.
+            @functools.wraps(fn)
+            async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+                loop = asyncio.get_running_loop()
+                context = contextvars.copy_context()
+
+                def _run_sync_core() -> Any:
+                    with _async.bridge_loop(loop):
+                        return context.run(_invoke, spec, args, kwargs)
+
+                _enter_async_slot()
+                try:
+                    return cast(R, await loop.run_in_executor(_executor(), _run_sync_core))
+                finally:
+                    _leave_async_slot()
+
+            return cast("Callable[P, R]", async_wrapper)
 
         @functools.wraps(fn)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
@@ -908,7 +1037,7 @@ def _precondition_snapshot(
     if spec.preconditions is None:
         return None
     try:
-        held = bool(spec.preconditions(*args, **dict(kwargs)))
+        held = _call_precondition(spec.preconditions, *args, **dict(kwargs))
     except Exception as exc:
         return {
             "held": False,
@@ -958,7 +1087,7 @@ def _commit_auto(
         precond = spec.preconditions
 
         def preconditions() -> bool:
-            return bool(precond(*args, **dict(kwargs)))
+            return _call_precondition(precond, *args, **dict(kwargs))
 
     outcome: CommitOutcome = commit_once(
         runtime.store,
@@ -1051,7 +1180,7 @@ def _call_tool_live(
     key_param = spec.effect.key_param
     if key_param is not None and downstream_key is not None:
         call_kwargs[key_param] = downstream_key
-    return spec.fn(*args, **call_kwargs)
+    return _resolve_effect_result(spec.fn(*args, **call_kwargs))
 
 
 def _call_tool_from_map(
@@ -1073,7 +1202,20 @@ def _call_tool_from_map(
     if key_param is not None and downstream_key is not None:
         call_kwargs[key_param] = downstream_key
     bound = _bind_from_map(spec.fn, call_kwargs)
-    return spec.fn(*bound.args, **bound.kwargs)
+    return _resolve_effect_result(spec.fn(*bound.args, **bound.kwargs))
+
+
+def _resolve_effect_result(result: Any) -> Any:
+    """Await an async tool's coroutine; pass a sync tool's result straight through.
+
+    This single line is what makes the async promise hold at ALL THREE effect
+    call sites — live AUTO, resume-after-approval, and crash reconcile — because
+    the recovery paths funnel through :func:`_call_tool_from_map` and the live
+    path through :func:`_call_tool_live`. See ASYNC-DESIGN.md §4.2.
+    """
+    if _async.is_awaitable(result):
+        return _async.run_coro_blocking(result)
+    return result
 
 
 def _bind_from_map(
@@ -1141,20 +1283,43 @@ def _registry_execute(spec: _GuardSpec) -> Callable[..., JsonValue]:
     return execute
 
 
+def _call_precondition(precond: Callable[..., Any], *args: Any, **kwargs: Any) -> bool:
+    """Invoke a precondition, awaiting it through the bridge if it is async.
+
+    The SINGLE funnel for every precondition call site (live AUTO, the AUTO
+    fast-check, and the registry adapter used by resume/reconcile), so an async
+    precondition is handled identically everywhere. Without this, ``bool(coro)``
+    is always ``True`` — a blocking async precondition would silently PASS, which
+    is exactly the kind of quiet correctness hole this project refuses.
+    """
+    result = precond(*args, **kwargs)
+    if _async.is_awaitable(result):
+        result = _async.run_coro_blocking(result)
+    return bool(result)
+
+
 def _registry_preconditions(spec: _GuardSpec) -> Callable[..., bool] | None:
-    """The registry adapter for preconditions: ``preconditions(**arg_map)``."""
+    """The registry adapter for preconditions: ``preconditions(**arg_map)``.
+
+    Preconditions may be ``async`` (ASYNC-DESIGN.md D1): they re-validate the
+    call AFTER the claim, often against the same async API the tool uses, so
+    forcing them sync would push async users into the very footgun 0.2.0 fenced.
+    An awaitable result is driven through the bridge — sync on the AUTO path (the
+    worker thread has the caller's loop), and via a private loop on the sync
+    recovery paths (resume/reconcile). Sync preconditions are unchanged.
+    """
     if spec.preconditions is None:
         return None
     precond = spec.preconditions
 
     def preconditions(**arg_map: JsonValue) -> bool:
-        return bool(precond(**dict(arg_map)))
+        return _call_precondition(precond, **dict(arg_map))
 
     return preconditions
 
 
 def _resolve(
-    value: T | Callable[..., T] | None,
+    value: T | Callable[..., T | Awaitable[T]] | None,
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],
     label: str,
@@ -1171,6 +1336,12 @@ def _resolve(
         return None
     if callable(value) and not isinstance(value, expected):
         produced = value(*args, **dict(kwargs))
+        if _async.is_awaitable(produced):
+            # Only reachable for the GATE-path input (summary): the hot-path ones
+            # (cost / blast_radius) are fenced at decoration, so an awaitable here
+            # always belongs to a gate-only callable, where a human is already the
+            # latency floor (ASYNC-DESIGN.md G11).
+            produced = _async.run_coro_blocking(produced)
         if not isinstance(produced, expected):
             raise TypeError(
                 f"{label} callable for a guarded action returned {type(produced).__name__}, "
@@ -1186,7 +1357,7 @@ def _resolve(
 
 
 def _resolve_str_mapping(
-    value: Mapping[str, str] | Callable[..., Mapping[str, str]] | None,
+    value: Mapping[str, str] | Callable[..., MappingOrAwaitable] | None,
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],
     label: str,
@@ -1205,6 +1376,10 @@ def _resolve_str_mapping(
         return None
     if callable(value) and not isinstance(value, Mapping):
         produced = value(*args, **dict(kwargs))
+        if _async.is_awaitable(produced):
+            # GATE-path only, so an async lookup here costs nothing on the
+            # I/O-free hot path (ASYNC-DESIGN.md G11).
+            produced = _async.run_coro_blocking(produced)
     else:
         produced = value
     if not isinstance(produced, Mapping):

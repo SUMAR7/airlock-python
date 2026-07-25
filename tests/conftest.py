@@ -414,6 +414,18 @@ class EffectsLog:
             ).scalar_one()
         return int(found)
 
+    def total(self) -> int:
+        """Every logged side effect, across all keys.
+
+        For tests that assert on the effect count of a whole BATCH (e.g. many
+        distinct keys in flight at once) rather than one known key.
+        """
+        from sqlalchemy import text
+
+        with self._engine.connect() as conn:
+            found = conn.execute(text("SELECT count(*) FROM effects_log")).scalar_one()
+        return int(found)
+
     def dispose(self) -> None:
         if self._owns_engine:
             self._engine.dispose()

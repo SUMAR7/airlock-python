@@ -17,7 +17,7 @@ This module is import-light by design: stdlib + ``airlock.types`` only.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -64,7 +64,10 @@ class Effect:
 
     key_param: str | None = None
     map_key: Callable[[str], str] | None = None
-    verify: Callable[..., tuple[Verification, Any | None]] | None = None
+    verify: (
+        Callable[..., tuple[Verification, Any | None] | Awaitable[tuple[Verification, Any | None]]]
+        | None
+    ) = None
 
     def __post_init__(self) -> None:
         if self.key_param is not None and not self.key_param:

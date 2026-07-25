@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from airlock.errors import ActionPending as ActionPending
     from airlock.errors import AirlockError as AirlockError
     from airlock.errors import ApprovalRejected as ApprovalRejected
+    from airlock.errors import AsyncPoolSaturated as AsyncPoolSaturated
     from airlock.errors import AtMostOnceWarning as AtMostOnceWarning
     from airlock.errors import AuditChainError as AuditChainError
     from airlock.errors import CanonicalizationError as CanonicalizationError
@@ -94,6 +95,7 @@ _EXPORTS: dict[str, str] = {
     "ActionPending": "airlock.errors",
     "AirlockError": "airlock.errors",
     "ApprovalRejected": "airlock.errors",
+    "AsyncPoolSaturated": "airlock.errors",
     "AtMostOnceWarning": "airlock.errors",
     "AuditChainError": "airlock.errors",
     "CanonicalizationError": "airlock.errors",

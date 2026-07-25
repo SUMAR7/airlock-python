@@ -118,6 +118,14 @@ jobs:
             uv run pytest -m concurrency -k postgres || exit 1
           done
 
+      - name: Async suite x10 (postgres, determinism)
+        run: |
+          for i in $(seq 1 10); do
+            echo "--- async run $i/10"
+            uv run pytest tests/test_guard_async.py tests/test_async_executor.py \
+              -k postgres || exit 1
+          done
+
       - name: Race suite x20 (postgres)
         run: |
           for i in $(seq 1 20); do
@@ -179,6 +187,14 @@ jobs:
           for i in $(seq 1 20); do
             echo "--- sqlite concurrency run $i/20"
             uv run pytest -m concurrency -k sqlite || exit 1
+          done
+
+      - name: Async suite x10 (sqlite, determinism)
+        run: |
+          for i in $(seq 1 10); do
+            echo "--- sqlite async run $i/10"
+            uv run pytest tests/test_guard_async.py tests/test_async_executor.py \
+              -k sqlite || exit 1
           done
 
       - name: Crash suite x20 (sqlite)

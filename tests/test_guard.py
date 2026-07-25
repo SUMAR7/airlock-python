@@ -516,22 +516,25 @@ def test_empty_action_type_rejected() -> None:
         def tool() -> None: ...
 
 
-def test_async_function_rejected_at_decoration() -> None:
-    """An `async def` tool must fail LOUDLY at decoration.
+def test_async_function_is_accepted_and_stays_awaitable() -> None:
+    """`async def` tools are SUPPORTED (ASYNC-DESIGN.md); the 0.2.0 fence is gone.
 
-    The ledger/pause/audit path is synchronous: without this fence the wrapper
-    would receive an un-awaited coroutine and try to COMMIT it as the result —
-    the effect would never run, and the user would get an opaque "Object of type
-    coroutine is not JSON serializable". Unsupported must say so in its own words.
+    Decoration must return an awaitable wrapper, not a plain function — if it
+    returned a sync callable the caller's ``await`` would fail, and if it silently
+    swallowed the coroutine the effect would never run. The behavioural proofs
+    (exactly-once, durable pause, crash recovery) live in tests/test_guard_async*.
     """
-    with pytest.raises(TypeError, match="does not support async"):
+    import asyncio
 
-        @guard("payment.refund")
-        async def tool(charge_id: str) -> None: ...
+    @guard("payment.refund_async")
+    async def tool(charge_id: str) -> None: ...
+
+    assert asyncio.iscoroutinefunction(tool)
 
 
 def test_async_generator_rejected_at_decoration() -> None:
-    with pytest.raises(TypeError, match="does not support async"):
+    """Still refused, permanently: a stream has no single result to commit once."""
+    with pytest.raises(TypeError, match="does not support async generators"):
 
         @guard("payment.stream")
         async def tool(charge_id: str) -> AsyncIterator[int]:

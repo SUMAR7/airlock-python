@@ -612,6 +612,15 @@ def _warn_at_most_once(action_type: str) -> None:
     _at_most_once_warned.add(action_type)
 
 
+def _resolve_probe(produced: Any) -> tuple[Any, Any]:
+    """Await an async ``Effect.verify`` result; pass a sync tuple through."""
+    from airlock._async import is_awaitable, run_coro_blocking
+
+    if is_awaitable(produced):
+        produced = run_coro_blocking(produced)
+    return cast("tuple[Any, Any]", produced)
+
+
 def _post_verify(
     store: Store,
     effect: Effect,
@@ -642,7 +651,11 @@ def _post_verify(
     probe_error: Exception | None = None
     evidence: Any | None = None
     try:
-        answer, evidence = effect.verify(**dict(args_json))
+        # An `async def` probe returns ONE coroutine wrapping the whole
+        # (answer, evidence) tuple, so it must be resolved BEFORE the unpack.
+        # Done here rather than only in @guard so a DIRECT commit_once caller
+        # (both are public API) gets async probes too (ASYNC-DESIGN.md G9).
+        answer, evidence = _resolve_probe(effect.verify(**dict(args_json)))
         verification = Verification(answer)
     except Exception as exc:  # a broken probe proves nothing => unknown
         verification = Verification.UNKNOWN

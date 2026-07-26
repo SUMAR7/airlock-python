@@ -92,6 +92,7 @@ import json
 import os
 import sqlite3
 import threading
+import warnings
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
@@ -136,6 +137,12 @@ DEFAULT_BUSY_TIMEOUT_MS = 5000
 #: alone almost always suffices; the retry is belt-and-braces for the 8-process
 #: barrier release where many writers arrive in the same instant.
 _BEGIN_IMMEDIATE_RETRIES = 8
+
+#: How long :meth:`SqliteStore.close` waits for in-flight ledger operations to
+#: finish before closing connections anyway (with a warning). Bounded so a wedged
+#: or abandoned writer can never hang shutdown; generous enough that an ordinary
+#: in-flight statement always completes first.
+_CLOSE_DRAIN_SECONDS = 10.0
 
 
 def _utcnow() -> datetime:
@@ -458,6 +465,16 @@ class SqliteStore:
         self._local = threading.local()
         self._all_conns: list[sqlite3.Connection] = []
         self._lock = threading.Lock()
+        # Close-vs-in-flight-writer gate. Closing a sqlite3 connection while
+        # ANOTHER thread is executing a statement on it corrupts memory and
+        # segfaults the interpreter (a Python-level exception is not the failure
+        # mode). That race is reachable in normal use: `execute_timeout`
+        # deliberately ABANDONS a worker that keeps writing, and cancelling a
+        # guarded async call likewise leaves its worker finishing the ledger
+        # write. So every operation registers here, and `close()` drains.
+        self._gate = threading.Condition()
+        self._active_ops = 0
+        self._closing = False
 
     # -- connection management (one connection per thread) --------------------
 
@@ -485,6 +502,32 @@ class SqliteStore:
         return conn
 
     @contextmanager
+    def _use(self) -> Iterator[sqlite3.Connection]:
+        """Yield this thread's connection while holding it open against ``close()``.
+
+        Every read and write goes through here, so ``close()`` can wait for real
+        in-flight statements instead of pulling the connection out from under one
+        (which segfaults rather than raising). Registration is a bare counter
+        increment — the cost next to a SQLite statement is noise.
+        """
+        with self._gate:
+            if self._closing:
+                raise AirlockError(
+                    "this SqliteStore is closed: a ledger operation was attempted after "
+                    "close(). If this came from a worker abandoned by execute_timeout or "
+                    "a cancelled async call, the row stays in-flight and the verify-first "
+                    "reconciler resolves it — nothing is silently lost."
+                )
+            self._active_ops += 1
+        try:
+            yield self._conn()
+        finally:
+            with self._gate:
+                self._active_ops -= 1
+                if self._active_ops == 0:
+                    self._gate.notify_all()
+
+    @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         """Run a mutating transaction under ``BEGIN IMMEDIATE`` (write lock up front).
 
@@ -495,7 +538,10 @@ class SqliteStore:
         writers arrive at once (the 8-process barrier). Commits on success,
         rolls back on any exception.
         """
-        conn = self._conn()
+        with self._use() as conn:
+            yield from self._write_on(conn)
+
+    def _write_on(self, conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         last_exc: sqlite3.OperationalError | None = None
         for _attempt in range(_BEGIN_IMMEDIATE_RETRIES):
             try:
@@ -529,14 +575,38 @@ class SqliteStore:
             ensure_sqlite_schema(conn)
 
     def close(self) -> None:
-        """Close every per-thread connection opened by this store."""
-        with self._lock:
-            conns = list(self._all_conns)
-            self._all_conns.clear()
-        for conn in conns:
-            with suppress(sqlite3.Error):  # best-effort teardown
-                conn.close()
-        self._local = threading.local()
+        """Close every per-thread connection, waiting for live statements first.
+
+        The ENTIRE teardown holds :attr:`_gate`, which is also what :meth:`_use`
+        must take to begin an operation. Draining alone is not enough: an op that
+        starts after the drain but while connections are being closed would be
+        handed one mid-``close()`` — the exact SIGSEGV this guards against. So
+        the sequence is: mark closing -> wait for in-flight ops -> close, all
+        without ever releasing the gate.
+        """
+        deadline_missed = False
+        with self._gate:
+            self._closing = True
+            while self._active_ops:
+                if not self._gate.wait(timeout=_CLOSE_DRAIN_SECONDS):
+                    deadline_missed = True
+                    break
+            # Still under the gate: no new operation can acquire a connection.
+            with self._lock:
+                conns = list(self._all_conns)
+                self._all_conns.clear()
+            for conn in conns:
+                with suppress(sqlite3.Error):  # best-effort teardown
+                    conn.close()
+            self._local = threading.local()
+        if deadline_missed:  # pragma: no cover - only a wedged/abandoned writer
+            warnings.warn(
+                f"SqliteStore.close() waited {_CLOSE_DRAIN_SECONDS}s for an in-flight "
+                "ledger operation and closed anyway. A worker abandoned by "
+                "execute_timeout (or a cancelled async call) may still have been writing.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     # -- ledger (ADR-1) -------------------------------------------------------
 
@@ -634,14 +704,14 @@ class SqliteStore:
         return rowcount == 1
 
     def load(self, key: str) -> CommitRecord | None:
-        conn = self._conn()
-        row = conn.execute(_LOAD_SQL, {"key": key}).fetchone()
+        with self._use() as conn:
+            row = conn.execute(_LOAD_SQL, {"key": key}).fetchone()
         return None if row is None else _row_to_record(row)
 
     def stale_inflight(self, older_than: timedelta) -> list[CommitRecord]:
         cutoff = sqlite_dt_to_text(self._now_fn() - older_than)
-        conn = self._conn()
-        rows = conn.execute(_STALE_INFLIGHT_SQL, {"cutoff": cutoff}).fetchall()
+        with self._use() as conn:
+            rows = conn.execute(_STALE_INFLIGHT_SQL, {"cutoff": cutoff}).fetchall()
         return [_row_to_record(row) for row in rows]
 
     def bump_epoch(self, key: str, older_than: timedelta) -> int | None:
@@ -697,8 +767,8 @@ class SqliteStore:
         return PauseClaim(created=False, run=_row_to_paused(existing))
 
     def load_paused_by_ref(self, approval_ref: str) -> PausedRun | None:
-        conn = self._conn()
-        row = conn.execute(_LOAD_PAUSED_BY_REF_SQL, {"approval_ref": approval_ref}).fetchone()
+        with self._use() as conn:
+            row = conn.execute(_LOAD_PAUSED_BY_REF_SQL, {"approval_ref": approval_ref}).fetchone()
         return None if row is None else _row_to_paused(row)
 
     def transition_paused(
@@ -754,8 +824,8 @@ class SqliteStore:
 
     def stale_approved_paused(self, older_than: timedelta) -> list[PausedRun]:
         cutoff = sqlite_dt_to_text(self._now_fn() - older_than)
-        conn = self._conn()
-        rows = conn.execute(_STALE_APPROVED_SQL, {"cutoff": cutoff}).fetchall()
+        with self._use() as conn:
+            rows = conn.execute(_STALE_APPROVED_SQL, {"cutoff": cutoff}).fetchall()
         return [_row_to_paused(row) for row in rows]
 
     def set_approval_id(self, run_id: str, approval_id: str) -> bool:
@@ -767,8 +837,8 @@ class SqliteStore:
 
     def stale_polled_paused(self, older_than: timedelta) -> list[PausedRun]:
         cutoff = sqlite_dt_to_text(self._now_fn() - older_than)
-        conn = self._conn()
-        rows = conn.execute(_STALE_POLLED_SQL, {"cutoff": cutoff}).fetchall()
+        with self._use() as conn:
+            rows = conn.execute(_STALE_POLLED_SQL, {"cutoff": cutoff}).fetchall()
         return [_row_to_paused(row) for row in rows]
 
     # -- audit (ADR-5) --------------------------------------------------------
@@ -823,8 +893,8 @@ class SqliteStore:
         return _row_to_audit(inserted)
 
     def audit_head(self) -> AuditHead | None:
-        conn = self._conn()
-        head = conn.execute(_AUDIT_HEAD_READ_SQL).fetchone()
+        with self._use() as conn:
+            head = conn.execute(_AUDIT_HEAD_READ_SQL).fetchone()
         if head is None:
             return None
         return AuditHead(seq=int(head["seq"]), row_hash=bytes(head["row_hash"]))

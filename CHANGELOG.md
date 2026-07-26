@@ -12,6 +12,51 @@ The distribution is published as **`airlock-sdk`**; the import name is
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-26
+
+### Added
+
+- **`async def` tools are supported.** Decorate an async tool with `@guard` and
+  `await` it; nothing else changes. Every guarantee holds verbatim, and your event
+  loop is never blocked — the ledger work runs on a dedicated worker pool while
+  the coroutine stays on your loop. Built as a facade over the ONE proven
+  synchronous commit core, deliberately not a second implementation of
+  exactly-once (see `ASYNC-DESIGN.md`).
+
+  Crucially this includes the paths a naive async port silently breaks: a gated
+  async action pauses durably and can be resumed by an ordinary **synchronous**
+  webhook receiver or cron reconciler — in a different process, after a restart —
+  and still commits exactly once. Same for crash recovery.
+
+- **Async `Effect(verify=...)`, `preconditions=`, and the gate-only `summary=` /
+  `context=` / `reject_reasons=`.** The rule: callables that do I/O on your behalf
+  may be `async`. The two hot-path policy inputs (`cost=`, `blast_radius=`) may
+  not — they are resolved on every call before the auto/gate/deny decision, and
+  that path is deliberately I/O-free — and saying so is a loud error at
+  decoration. Async generators are refused permanently: a stream has no single
+  outcome to commit exactly once.
+
+- **`init(async_workers=N)`** sizes the async worker pool (default is generous and
+  I/O-shaped). Exceeding it is safe — calls queue and still commit exactly once —
+  and a new **`AsyncPoolSaturated`** warning fires once so queueing never looks
+  like a stall. Resizing a live pool raises rather than being silently ignored.
+
+- Examples: `examples/async_agent/`, plus verified LangGraph and MCP integration
+  tests.
+
+### Fixed
+
+- **A SIGSEGV in `Store.close()`.** Closing a SQLite connection while another
+  thread executes a statement on it corrupts memory and kills the interpreter —
+  it is not a catchable exception. The race was reachable in ordinary use because
+  `execute_timeout` deliberately abandons a worker that keeps writing, and a
+  cancelled async call leaves its worker finishing the commit, so a graceful
+  shutdown could land exactly there. `close()` now waits for in-flight ledger
+  operations and holds that gate through the whole teardown; an operation
+  attempted after `close()` raises a clear error instead of quietly resurrecting a
+  connection (nothing is lost — the row stays in-flight for the verify-first
+  reconciler). **This predates async support and affected sync users too.**
+
 ## [0.2.0] — 2026-07-13
 
 ### Added
